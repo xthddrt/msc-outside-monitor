@@ -23,7 +23,7 @@ static NTSTATUS MsMonStartSession(PMSMON_SESSION_CONFIG Config)
     root.MaximumLength = root.Length;
     MsMonProcessStopSession();
     MsMonEventsStop();
-    status = MsMonEventsStart(Config->SessionId, Config->QueueRecords, Config->QueueBytes);
+    status = MsMonEventsStart(Config->SessionId, Config->QueueRecords, Config->QueueBytes, Config->PayloadMode);
     if (!NT_SUCCESS(status)) return status;
     status = MsMonProcessStartSession(&root);
     if (!NT_SUCCESS(status)) MsMonEventsStop();

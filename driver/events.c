@@ -11,20 +11,20 @@ typedef struct _MSMON_EVENT_QUEUE {
     KEVENT DataAvailable;
     ULONGLONG Sequence;
     ULONGLONG SessionId;
+    ULONGLONG OperationId;
     volatile LONG64 Dropped;
     volatile LONG Queued;
     volatile LONG64 QueuedBytes;
     ULONG QueueRecordLimit;
     ULONG QueueByteLimit;
+    volatile BOOLEAN PayloadEnabled;
 } MSMON_EVENT_QUEUE;
 
 static MSMON_EVENT_QUEUE gQueue;
 
 static USHORT MsMonStringBytes(PCUNICODE_STRING Value, PBOOLEAN Truncated)
 {
-    if (Value == NULL || Value->Buffer == NULL || Value->Length == 0) {
-        return 0;
-    }
+    if (Value == NULL || Value->Buffer == NULL || Value->Length == 0) return 0;
     if (Value->Length > MSMON_MAX_EVENT_STRING_BYTES) {
         *Truncated = TRUE;
         return MSMON_MAX_EVENT_STRING_BYTES;
@@ -51,20 +51,20 @@ NTSTATUS MsMonEventsInitialize(VOID)
     KeInitializeEvent(&gQueue.DataAvailable, SynchronizationEvent, FALSE);
     gQueue.Sequence = 0;
     gQueue.SessionId = 0;
+    gQueue.OperationId = 0;
     gQueue.Dropped = 0;
     gQueue.Queued = 0;
     gQueue.QueuedBytes = 0;
     gQueue.QueueRecordLimit = MSMON_DEFAULT_QUEUE_RECORDS;
     gQueue.QueueByteLimit = MSMON_DEFAULT_QUEUE_BYTES;
+    gQueue.PayloadEnabled = FALSE;
     return STATUS_SUCCESS;
 }
 
-NTSTATUS MsMonEventsStart(ULONGLONG SessionId, ULONG QueueRecords, ULONG QueueBytes)
+NTSTATUS MsMonEventsStart(ULONGLONG SessionId, ULONG QueueRecords, ULONG QueueBytes, ULONG PayloadMode)
 {
     KIRQL oldIrql;
-    if (SessionId == 0) {
-        return STATUS_INVALID_PARAMETER;
-    }
+    if (SessionId == 0) return STATUS_INVALID_PARAMETER;
     if (QueueRecords == 0) QueueRecords = MSMON_DEFAULT_QUEUE_RECORDS;
     if (QueueBytes == 0) QueueBytes = MSMON_DEFAULT_QUEUE_BYTES;
     QueueRecords = min(QueueRecords, MSMON_MAX_QUEUE_RECORDS);
@@ -74,10 +74,12 @@ NTSTATUS MsMonEventsStart(ULONGLONG SessionId, ULONG QueueRecords, ULONG QueueBy
     KeAcquireSpinLock(&gQueue.Lock, &oldIrql);
     MsMonClearQueueLocked();
     gQueue.Sequence = 0;
+    gQueue.OperationId = 0;
     gQueue.Dropped = 0;
     gQueue.SessionId = SessionId;
     gQueue.QueueRecordLimit = QueueRecords;
     gQueue.QueueByteLimit = QueueBytes;
+    gQueue.PayloadEnabled = PayloadMode != 0;
     KeReleaseSpinLock(&gQueue.Lock, oldIrql);
     return STATUS_SUCCESS;
 }
@@ -87,6 +89,7 @@ VOID MsMonEventsStop(VOID)
     KIRQL oldIrql;
     KeAcquireSpinLock(&gQueue.Lock, &oldIrql);
     gQueue.SessionId = 0;
+    gQueue.PayloadEnabled = FALSE;
     MsMonClearQueueLocked();
     KeReleaseSpinLock(&gQueue.Lock, oldIrql);
 }
@@ -96,21 +99,22 @@ VOID MsMonEventsUninitialize(VOID)
     MsMonEventsStop();
 }
 
-NTSTATUS MsMonLogEvent(
-    ULONG Type,
-    HANDLE ProcessId,
-    HANDLE ParentProcessId,
-    HANDLE ThreadId,
-    HANDLE TargetProcessId,
-    LONGLONG TargetProcessStartTime,
-    ULONG Flags,
-    NTSTATUS Status,
-    ULONG DesiredAccess,
-    ULONG Category,
-    ULONGLONG Value0,
-    ULONGLONG Value1,
-    PCUNICODE_STRING Text,
-    PCUNICODE_STRING Detail
+BOOLEAN MsMonPayloadEnabled(VOID)
+{
+    return gQueue.PayloadEnabled;
+}
+
+ULONGLONG MsMonNextOperationId(VOID)
+{
+    return (ULONGLONG)InterlockedIncrement64((volatile LONG64*)&gQueue.OperationId);
+}
+
+static NTSTATUS MsMonLogEventInternal(
+    ULONG Type, HANDLE ProcessId, HANDLE ParentProcessId, HANDLE ThreadId,
+    HANDLE TargetProcessId, LONGLONG TargetProcessStartTime, ULONG Flags,
+    NTSTATUS Status, ULONG DesiredAccess, ULONG Category,
+    ULONGLONG Value0, ULONGLONG Value1, PCUNICODE_STRING Text,
+    PCUNICODE_STRING Detail, ULONGLONG OperationId, const MSMON_PAYLOAD* Payload
 )
 {
     PMSMON_EVENT_BLOCK block;
@@ -121,12 +125,15 @@ NTSTATUS MsMonLogEvent(
     USHORT detailBytes = MsMonStringBytes(Detail, &truncated);
     ULONG textOffset = (sizeof(MSMON_EVENT_HEADER) + 7u) & ~7u;
     ULONG detailOffset = (textOffset + textBytes + (textBytes != 0 ? 2u : 0u) + 7u) & ~7u;
-    ULONG recordBytes = detailOffset + detailBytes + (detailBytes != 0 ? 2u : 0u);
+    ULONG payloadOffset = (detailOffset + detailBytes + (detailBytes != 0 ? 2u : 0u) + 7u) & ~7u;
+    ULONG payloadBytes = Payload != NULL ? Payload->ByteCount : 0;
+    ULONG recordBytes = payloadOffset + payloadBytes;
     ULONG allocationBytes = sizeof(LIST_ENTRY) + recordBytes;
     PWSTR destination;
 
-    if (recordBytes > MSMON_MAX_EVENT_RECORD_BYTES) {
-        return STATUS_INVALID_BUFFER_SIZE;
+    if (recordBytes > MSMON_MAX_EVENT_RECORD_BYTES ||
+        (Payload != NULL && Payload->ByteCount != 0 && Payload->Data == NULL)) {
+        return STATUS_INVALID_PARAMETER;
     }
     block = ExAllocatePool2(POOL_FLAG_NON_PAGED, allocationBytes, MSMON_POOL_TAG);
     if (block == NULL) {
@@ -153,6 +160,7 @@ NTSTATUS MsMonLogEvent(
     block->Event.Attribution = MsMonAttributionProcessOnly;
     block->Event.Value0 = Value0;
     block->Event.Value1 = Value1;
+    block->Event.OperationId = Payload != NULL ? Payload->OperationId : OperationId;
     KeQuerySystemTime(&timestamp);
     block->Event.Timestamp = (ULONGLONG)timestamp.QuadPart;
 
@@ -169,6 +177,21 @@ NTSTATUS MsMonLogEvent(
         destination = (PWSTR)((PUCHAR)&block->Event + detailOffset);
         RtlCopyMemory(destination, Detail->Buffer, detailBytes);
         destination[detailBytes / sizeof(WCHAR)] = L'\0';
+    }
+    if (Payload != NULL) {
+        block->Event.Flags |= MsMonFlagPayloadPresent;
+        if (Payload->ChunkIndex + 1 == Payload->ChunkCount) block->Event.Flags |= MsMonFlagPayloadFinalChunk;
+        if (Payload->ByteOffset + Payload->ByteCount < Payload->TotalBytes) block->Event.Flags |= MsMonFlagPayloadPartial;
+        block->Event.PayloadTotalBytes = Payload->TotalBytes;
+        block->Event.PayloadByteOffset = Payload->ByteOffset;
+        block->Event.PayloadChunkIndex = Payload->ChunkIndex;
+        block->Event.PayloadChunkCount = Payload->ChunkCount;
+        block->Event.PayloadKind = Payload->Kind;
+        block->Event.PayloadBytes = payloadBytes;
+        if (payloadBytes != 0) {
+            block->Event.PayloadOffset = payloadOffset;
+            RtlCopyMemory((PUCHAR)&block->Event + payloadOffset, Payload->Data, payloadBytes);
+        }
     }
 
     KeAcquireSpinLock(&gQueue.Lock, &oldIrql);
@@ -194,25 +217,88 @@ NTSTATUS MsMonLogEvent(
     return STATUS_SUCCESS;
 }
 
+NTSTATUS MsMonLogEventWithOperation(
+    ULONG Type, HANDLE ProcessId, HANDLE ThreadId, ULONG Flags, NTSTATUS Status,
+    ULONG Category, ULONGLONG Value0, ULONGLONG Value1,
+    PCUNICODE_STRING Text, PCUNICODE_STRING Detail, ULONGLONG OperationId
+)
+{
+    return MsMonLogEventInternal(Type, ProcessId, NULL, ThreadId, NULL, 0, Flags,
+                                 Status, 0, Category, Value0, Value1, Text, Detail,
+                                 OperationId, NULL);
+}
+
+NTSTATUS MsMonLogEvent(
+    ULONG Type, HANDLE ProcessId, HANDLE ParentProcessId, HANDLE ThreadId,
+    HANDLE TargetProcessId, LONGLONG TargetProcessStartTime, ULONG Flags,
+    NTSTATUS Status, ULONG DesiredAccess, ULONG Category,
+    ULONGLONG Value0, ULONGLONG Value1, PCUNICODE_STRING Text, PCUNICODE_STRING Detail
+)
+{
+    return MsMonLogEventInternal(Type, ProcessId, ParentProcessId, ThreadId,
+                                 TargetProcessId, TargetProcessStartTime, Flags,
+                                 Status, DesiredAccess, Category, Value0, Value1,
+                                 Text, Detail, 0, NULL);
+}
+
+NTSTATUS MsMonLogPayloadSeries(
+    ULONG Type, HANDLE ProcessId, HANDLE ThreadId, ULONG Flags, NTSTATUS Status,
+    ULONG Category, ULONGLONG Value0, ULONGLONG Value1,
+    PCUNICODE_STRING Text, PCUNICODE_STRING Detail,
+    ULONG PayloadKind, ULONGLONG OperationId, ULONGLONG TotalBytes,
+    const VOID* Payload, ULONG AvailableBytes
+)
+{
+    ULONGLONG chunkCount;
+    ULONGLONG offset = 0;
+    if (OperationId == 0) OperationId = MsMonNextOperationId();
+    if (AvailableBytes != 0 && Payload == NULL) return STATUS_INVALID_PARAMETER;
+    if (AvailableBytes > TotalBytes) return STATUS_INVALID_BUFFER_SIZE;
+    chunkCount = TotalBytes == 0 ? 1 : (TotalBytes + MSMON_PAYLOAD_CHUNK_BYTES - 1) / MSMON_PAYLOAD_CHUNK_BYTES;
+    if (chunkCount > MAXULONG || AvailableBytes > TotalBytes) return STATUS_INVALID_BUFFER_SIZE;
+
+    if (TotalBytes == 0) {
+        MSMON_PAYLOAD empty = {OperationId, 0, 0, 0, 1, PayloadKind, NULL, 0};
+        return MsMonLogEventInternal(Type, ProcessId, NULL, ThreadId, NULL, 0,
+                                     Flags, Status, 0, Category, Value0, Value1,
+                                     Text, Detail, OperationId, &empty);
+    }
+    while (offset < AvailableBytes) {
+        MSMON_PAYLOAD chunk;
+        ULONG remaining = AvailableBytes - (ULONG)offset;
+        ULONG bytes = min(remaining, MSMON_PAYLOAD_CHUNK_BYTES);
+        chunk.OperationId = OperationId;
+        chunk.TotalBytes = TotalBytes;
+        chunk.ByteOffset = offset;
+        chunk.ChunkIndex = (ULONG)(offset / MSMON_PAYLOAD_CHUNK_BYTES);
+        chunk.ChunkCount = (ULONG)chunkCount;
+        chunk.Kind = PayloadKind;
+        chunk.Data = (const UCHAR*)Payload + offset;
+        chunk.ByteCount = bytes;
+        NTSTATUS status = MsMonLogEventInternal(Type, ProcessId, NULL, ThreadId, NULL, 0,
+                                                Flags | (AvailableBytes < TotalBytes ? MsMonFlagPayloadPartial : 0),
+                                                Status, 0, Category, Value0, Value1,
+                                                Text, Detail, OperationId, &chunk);
+        if (!NT_SUCCESS(status)) return status;
+        offset += bytes;
+    }
+    return STATUS_SUCCESS;
+}
+
 NTSTATUS MsMonReadEvents(PVOID Output, ULONG MaximumBytes, ULONG TimeoutMilliseconds, PULONG BytesRead)
 {
     ULONG count = 0;
     LARGE_INTEGER timeout;
     KIRQL oldIrql;
-
     *BytesRead = 0;
-    if (Output == NULL || MaximumBytes < MSMON_MAX_EVENT_RECORD_BYTES) {
-        return STATUS_INVALID_PARAMETER;
-    }
+    if (Output == NULL || MaximumBytes < MSMON_MAX_EVENT_RECORD_BYTES) return STATUS_INVALID_PARAMETER;
     KeAcquireSpinLock(&gQueue.Lock, &oldIrql);
     if (IsListEmpty(&gQueue.Head)) KeResetEvent(&gQueue.DataAvailable);
     KeReleaseSpinLock(&gQueue.Lock, oldIrql);
-
     timeout.QuadPart = -((LONGLONG)TimeoutMilliseconds * 10000LL);
     if (TimeoutMilliseconds != 0) {
         (VOID)KeWaitForSingleObject(&gQueue.DataAvailable, Executive, KernelMode, FALSE, &timeout);
     }
-
     KeAcquireSpinLock(&gQueue.Lock, &oldIrql);
     while (!IsListEmpty(&gQueue.Head)) {
         PLIST_ENTRY entry = gQueue.Head.Flink;

@@ -210,7 +210,7 @@ static void Usage()
 {
     std::cout << "Usage: msmon-agent [--client DIRECTORY] [--output FILE] [--pid PID] "
                  "[--wait-ms N] [--max-file-mb N] [--queue-records N] [--queue-mb N] "
-                 "[--no-etw] [--once]\n";
+                 "[--no-etw] [--no-payloads] [--once]\n";
 }
 
 static bool ParseNumber(const wchar_t* text, uint64_t& value)
@@ -230,6 +230,7 @@ int wmain(int argc, wchar_t** argv)
     uint64_t queueBytes = MSMON_DEFAULT_QUEUE_BYTES;
     bool once = false;
     bool enableEtw = true;
+    bool capturePayloads = true;
     std::vector<DWORD> explicitPids;
 
     for (int index = 1; index < argc; index++) {
@@ -242,6 +243,8 @@ int wmain(int argc, wchar_t** argv)
             once = true;
         } else if (argument == L"--no-etw") {
             enableEtw = false;
+        } else if (argument == L"--no-payloads") {
+            capturePayloads = false;
         } else if (index + 1 < argc && argument == L"--client") {
             clientRoot = argv[++index];
         } else if (index + 1 < argc && argument == L"--output") {
@@ -296,6 +299,7 @@ int wmain(int argc, wchar_t** argv)
     config.SessionId = sessionId;
     config.QueueRecords = static_cast<ULONG>(queueRecords);
     config.QueueBytes = static_cast<ULONG>(queueBytes);
+    config.PayloadMode = capturePayloads ? 1u : 0u;
     if (clientNt.size() >= MSMON_CLIENT_PATH_CHARS) {
         std::cerr << "The client NT path is too long for the session configuration.\n";
         return 1;
@@ -355,13 +359,17 @@ int wmain(int argc, wchar_t** argv)
     };
 
     if (!writeCoverage(L"session_start", L"client_root=" + clientRoot)) return 1;
+    if (!writeCoverage(capturePayloads ? L"payload_capture_enabled" : L"payload_capture_disabled",
+                       capturePayloads ?
+                           L"Exact registry values and volume information will be logged; logs may contain hardware identifiers and registry secrets. WMI result rows, direct adapter-API results, file contents, and network contents remain unavailable" :
+                           L"Metadata-only mode; no registry value or volume payload capture")) return 1;
     if (!writeCoverage(L"coverage_limit",
                        L"Handle-less process/window snapshots, ALPC/COM payloads, brokered existing-browser launches, direct adapter APIs, protected processes, pre-start activity, and dropped events are not guaranteed")) return 1;
     if (!writeCoverage(L"static_hardware_boundary",
                        L"MachineIdLib.dll imports process/window enumeration, GetVolumeInformationA, and GetAdaptersInfo; static imports do not prove runtime invocation",
                        MsMonAttributionStaticEvidence)) return 1;
     if (enableEtw) {
-        etw = std::make_unique<EtwCollector>(scope, etwQueue, sessionId);
+        etw = std::make_unique<EtwCollector>(scope, etwQueue, sessionId, capturePayloads);
         if (!etw->Start(error)) {
             if (!writeCoverage(L"etw_unavailable", std::wstring(error.begin(), error.end()))) return 1;
             etw.reset();

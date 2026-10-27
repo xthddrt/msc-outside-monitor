@@ -10,6 +10,7 @@ typedef struct _MSMON_REGISTRY_CONTEXT {
     ULONG DesiredAccess;
     ULONGLONG Value0;
     ULONGLONG Value1;
+    ULONGLONG OperationId;
     UNICODE_STRING Path;
     UNICODE_STRING Detail;
 } MSMON_REGISTRY_CONTEXT, *PMSMON_REGISTRY_CONTEXT;
@@ -29,12 +30,8 @@ static USHORT MsMonContextStringLength(PCUNICODE_STRING Value)
 }
 
 static PMSMON_REGISTRY_CONTEXT MsMonCreateContext(
-    ULONG Type,
-    PCUNICODE_STRING Path,
-    PCUNICODE_STRING Detail,
-    ULONGLONG Value0,
-    ULONGLONG Value1,
-    ULONG DesiredAccess
+    ULONG Type, PCUNICODE_STRING Path, PCUNICODE_STRING Detail,
+    ULONGLONG Value0, ULONGLONG Value1, ULONG DesiredAccess
 )
 {
     USHORT pathBytes = MsMonContextStringLength(Path);
@@ -50,6 +47,7 @@ static PMSMON_REGISTRY_CONTEXT MsMonCreateContext(
     context->DesiredAccess = DesiredAccess;
     context->Value0 = Value0;
     context->Value1 = Value1;
+    context->OperationId = MsMonNextOperationId();
     cursor = (PUCHAR)(context + 1);
     if (pathBytes != 0) {
         RtlCopyMemory(cursor, Path->Buffer, pathBytes);
@@ -65,6 +63,34 @@ static PMSMON_REGISTRY_CONTEXT MsMonCreateContext(
         context->Detail.MaximumLength = detailBytes;
     }
     return context;
+}
+
+static VOID MsMonRegistryUnavailable(
+    PMSMON_REGISTRY_CONTEXT Context, NTSTATUS Status, PCWSTR Reason, ULONG ExtraFlags
+)
+{
+    WCHAR detail[512];
+    UNICODE_STRING detailString;
+    UNICODE_STRING empty;
+    RtlInitUnicodeString(&empty, L"");
+    (VOID)RtlStringCchPrintfW(detail, RTL_NUMBER_OF(detail), L"%ws;value=%wZ", Reason,
+                              Context->Detail.Buffer != NULL ? &Context->Detail : &empty);
+    RtlInitUnicodeString(&detailString, detail);
+    (VOID)MsMonLogEventWithOperation(Context->Type, Context->ProcessId, Context->ThreadId,
+                                     MsMonFlagPayloadUnavailable | ExtraFlags, Status,
+                                     MsMonCategoryRegistry, Context->Value0, Context->Value1,
+                                     Context->Path.Buffer != NULL ? &Context->Path : NULL,
+                                     &detailString, Context->OperationId);
+}
+
+static VOID MsMonRegistryMetadata(PMSMON_REGISTRY_CONTEXT Context, NTSTATUS Status)
+{
+    (VOID)MsMonLogEventWithOperation(Context->Type, Context->ProcessId, Context->ThreadId,
+                                     Context->Path.Buffer == NULL ? MsMonFlagMissingPath : 0,
+                                     Status, MsMonCategoryRegistry, Context->Value0, Context->Value1,
+                                     Context->Path.Buffer != NULL ? &Context->Path : NULL,
+                                     Context->Detail.Buffer != NULL ? &Context->Detail : NULL,
+                                     Context->OperationId);
 }
 
 static BOOLEAN MsMonIsPostOperation(REG_NOTIFY_CLASS Operation)
@@ -126,6 +152,148 @@ static VOID MsMonSetCallContext(REG_NOTIFY_CLASS Operation, PVOID Argument, PVOI
     }
 }
 
+static VOID MsMonLogRegistryValue(
+    PMSMON_REGISTRY_CONTEXT Context, NTSTATUS Status, ULONG Type,
+    const VOID* Data, ULONG DataBytes
+)
+{
+    (VOID)MsMonLogPayloadSeries(Context->Type, Context->ProcessId, Context->ThreadId,
+                                0, Status, MsMonCategoryRegistry,
+                                Context->Value0, Type,
+                                Context->Path.Buffer != NULL ? &Context->Path : NULL,
+                                Context->Detail.Buffer != NULL ? &Context->Detail : NULL,
+                                MsMonPayloadRegistryValue, Context->OperationId,
+                                DataBytes, Data, DataBytes);
+}
+
+static VOID MsMonCaptureSingleValue(
+    PMSMON_REGISTRY_CONTEXT Context, NTSTATUS Status, KEY_VALUE_INFORMATION_CLASS InformationClass,
+    PVOID Information, ULONG BufferLength, ULONG ReturnedLength
+)
+{
+    if (!NT_SUCCESS(Status)) {
+        MsMonRegistryUnavailable(Context, Status, L"query_failed", 0);
+        return;
+    }
+    if (Information == NULL || ReturnedLength > BufferLength) {
+        MsMonRegistryUnavailable(Context, Status, L"invalid_result_length", 0);
+        return;
+    }
+    switch (InformationClass) {
+    case KeyValuePartialInformation: {
+        PKEY_VALUE_PARTIAL_INFORMATION value = (PKEY_VALUE_PARTIAL_INFORMATION)Information;
+        ULONG offset = (ULONG)FIELD_OFFSET(KEY_VALUE_PARTIAL_INFORMATION, Data);
+        if (ReturnedLength < offset || value->DataLength > ReturnedLength - offset) {
+            MsMonRegistryUnavailable(Context, Status, L"partial_value_data", 0);
+            return;
+        }
+        MsMonLogRegistryValue(Context, Status, value->Type, value->Data, value->DataLength);
+        return;
+    }
+    case KeyValuePartialInformationAlign64: {
+        PKEY_VALUE_PARTIAL_INFORMATION_ALIGN64 value = (PKEY_VALUE_PARTIAL_INFORMATION_ALIGN64)Information;
+        ULONG offset = (ULONG)FIELD_OFFSET(KEY_VALUE_PARTIAL_INFORMATION_ALIGN64, Data);
+        if (ReturnedLength < offset || value->DataLength > ReturnedLength - offset) {
+            MsMonRegistryUnavailable(Context, Status, L"partial_value_data", 0);
+            return;
+        }
+        MsMonLogRegistryValue(Context, Status, value->Type, value->Data, value->DataLength);
+        return;
+    }
+    case KeyValueFullInformation:
+    case KeyValueFullInformationAlign64: {
+        PKEY_VALUE_FULL_INFORMATION value = (PKEY_VALUE_FULL_INFORMATION)Information;
+        if (value->DataOffset > ReturnedLength || value->DataLength > ReturnedLength - value->DataOffset) {
+            MsMonRegistryUnavailable(Context, Status, L"invalid_value_offset", 0);
+            return;
+        }
+        MsMonLogRegistryValue(Context, Status, value->Type,
+                              (const UCHAR*)Information + value->DataOffset, value->DataLength);
+        return;
+    }
+    case KeyValueBasicInformation:
+    case KeyValueLayerInformation:
+        MsMonRegistryMetadata(Context, Status);
+        return;
+    default:
+        MsMonRegistryUnavailable(Context, Status, L"unsupported_information_class", 0);
+        return;
+    }
+}
+
+static VOID MsMonCaptureMultipleValues(
+    PMSMON_REGISTRY_CONTEXT Context, NTSTATUS Status, PREG_QUERY_MULTIPLE_VALUE_KEY_INFORMATION Info
+)
+{
+    ULONG returned;
+    ULONG capacity;
+    ULONG index;
+    if (!NT_SUCCESS(Status)) {
+        MsMonRegistryUnavailable(Context, Status, L"multi_query_failed", 0);
+        return;
+    }
+    if (Info->ValueBuffer == NULL || Info->ValueEntries == NULL ||
+        Info->BufferLength == NULL || Info->RequiredBufferLength == NULL) {
+        MsMonRegistryUnavailable(Context, Status, L"missing_multi_result", 0);
+        return;
+    }
+    capacity = *Info->BufferLength;
+    returned = *Info->RequiredBufferLength;
+    if (returned > capacity) {
+        MsMonRegistryUnavailable(Context, Status, L"partial_multi_result", 0);
+        return;
+    }
+    for (index = 0; index < Info->EntryCount; index++) {
+        PKEY_VALUE_ENTRY entry = &Info->ValueEntries[index];
+        MSMON_REGISTRY_CONTEXT valueContext = *Context;
+        if (entry->DataOffset > returned || entry->DataLength > returned - entry->DataOffset) {
+            MsMonRegistryUnavailable(Context, Status, L"invalid_multi_value_offset", 0);
+            continue;
+        }
+        valueContext.OperationId = MsMonNextOperationId();
+        valueContext.Value0 = index;
+        valueContext.Value1 = entry->Type;
+        if (entry->ValueName != NULL) valueContext.Detail = *entry->ValueName;
+        MsMonLogRegistryValue(&valueContext, Status, entry->Type,
+                              (const UCHAR*)Info->ValueBuffer + entry->DataOffset,
+                              entry->DataLength);
+    }
+}
+
+static VOID MsMonCaptureRegistryResult(
+    REG_NOTIFY_CLASS Operation, PREG_POST_OPERATION_INFORMATION Post,
+    PMSMON_REGISTRY_CONTEXT Context
+)
+{
+    __try {
+        switch (Operation) {
+        case RegNtPostQueryValueKey: {
+            PREG_QUERY_VALUE_KEY_INFORMATION info = (PREG_QUERY_VALUE_KEY_INFORMATION)Post->PreInformation;
+            ULONG returned = info->ResultLength != NULL ? *info->ResultLength : info->Length;
+            MsMonCaptureSingleValue(Context, Post->Status, info->KeyValueInformationClass,
+                                    info->KeyValueInformation, info->Length, returned);
+            return;
+        }
+        case RegNtPostEnumerateValueKey: {
+            PREG_ENUMERATE_VALUE_KEY_INFORMATION info = (PREG_ENUMERATE_VALUE_KEY_INFORMATION)Post->PreInformation;
+            ULONG returned = info->ResultLength != NULL ? *info->ResultLength : info->Length;
+            MsMonCaptureSingleValue(Context, Post->Status, info->KeyValueInformationClass,
+                                    info->KeyValueInformation, info->Length, returned);
+            return;
+        }
+        case RegNtPostQueryMultipleValueKey:
+            MsMonCaptureMultipleValues(Context, Post->Status,
+                                       (PREG_QUERY_MULTIPLE_VALUE_KEY_INFORMATION)Post->PreInformation);
+            return;
+        default:
+            MsMonRegistryMetadata(Context, Post->Status);
+            return;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        MsMonRegistryUnavailable(Context, Post->Status, L"unsafe_result_buffer", 0);
+    }
+}
+
 static NTSTATUS MsMonRegistryCallback(PVOID CallbackContext, PVOID Argument1, PVOID Argument2)
 {
     REG_NOTIFY_CLASS operation = (REG_NOTIFY_CLASS)(ULONG_PTR)Argument1;
@@ -142,12 +310,13 @@ static NTSTATUS MsMonRegistryCallback(PVOID CallbackContext, PVOID Argument1, PV
         PREG_POST_OPERATION_INFORMATION post = (PREG_POST_OPERATION_INFORMATION)Argument2;
         context = (PMSMON_REGISTRY_CONTEXT)post->CallContext;
         if (context == NULL) return STATUS_SUCCESS;
-        (VOID)MsMonLogEvent(context->Type, context->ProcessId, NULL, context->ThreadId,
-                            NULL, 0, context->Path.Buffer == NULL ? MsMonFlagMissingPath : 0,
-                            post->Status, context->DesiredAccess, MsMonCategoryRegistry,
-                            context->Value0, context->Value1,
-                            context->Path.Buffer != NULL ? &context->Path : NULL,
-                            context->Detail.Buffer != NULL ? &context->Detail : NULL);
+        if (MsMonPayloadEnabled() &&
+            (operation == RegNtPostQueryValueKey || operation == RegNtPostEnumerateValueKey ||
+             operation == RegNtPostQueryMultipleValueKey)) {
+            MsMonCaptureRegistryResult(operation, post, context);
+        } else {
+            MsMonRegistryMetadata(context, post->Status);
+        }
         ExFreePoolWithTag(context, MSMON_POOL_TAG);
         return STATUS_SUCCESS;
     }
@@ -234,7 +403,23 @@ static NTSTATUS MsMonRegistryCallback(PVOID CallbackContext, PVOID Argument1, PV
     }
 
     context = MsMonCreateContext(type, path, detail, value0, value1, desiredAccess);
-    if (context != NULL) MsMonSetCallContext(operation, Argument2, context);
+    if (context != NULL) {
+        MsMonSetCallContext(operation, Argument2, context);
+        if (MsMonPayloadEnabled() && operation == RegNtPreSetValueKey) {
+            PREG_SET_VALUE_KEY_INFORMATION info = (PREG_SET_VALUE_KEY_INFORMATION)Argument2;
+            __try {
+                (VOID)MsMonLogPayloadSeries(MsMonRegistrySetValue, context->ProcessId, context->ThreadId,
+                                            MsMonFlagPayloadInput, STATUS_PENDING, MsMonCategoryRegistry,
+                                            context->Value0, context->Value1,
+                                            context->Path.Buffer != NULL ? &context->Path : NULL,
+                                            context->Detail.Buffer != NULL ? &context->Detail : NULL,
+                                            MsMonPayloadRegistryValue, context->OperationId,
+                                            info->DataSize, info->Data, info->DataSize);
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                MsMonRegistryUnavailable(context, STATUS_PENDING, L"unsafe_set_buffer", MsMonFlagPayloadInput);
+            }
+        }
+    }
     return STATUS_SUCCESS;
 }
 

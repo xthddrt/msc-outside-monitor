@@ -2,11 +2,11 @@
 
 ## Data path
 
-Protocol v2 uses self-delimiting `MSMON_EVENT_HEADER` records with bounded UTF-16 strings. Each string is capped at 2,048 bytes and each record at 8,192 bytes; truncation and missing-path flags are explicit. The collector rejects invalid sizes, versions, session IDs, string bounds, partial records, and non-increasing source sequences.
+Protocol v3 uses self-delimiting `MSMON_EVENT_HEADER` records with bounded UTF-16 metadata and optional raw payloads. Each text field is capped at 2,048 bytes, each record at 16,384 bytes, and each payload chunk at 8,192 bytes. Payload records include an operation ID, total byte length, byte offset, and chunk index/count. The collector validates all sizes, offsets, versions, session IDs, string/payload bounds, and source sequences.
 
-The driver assigns a session ID and source sequence and queues records in a bounded nonpaged list. Defaults are 16,384 records and 64 MiB, with maxima of 32,768 records and 128 MiB. The collector drains up to 1 MiB per IOCTL. ETW uses a separate bounded 32,768-record queue and source sequence. Allocation failure or a full queue increments drop counters; source gaps identify lost sequence ranges where possible. On Ctrl+C, the collector stops new driver tracking and drains the remaining queue before final statistics. This is not lossless capture.
+The driver assigns session, source-sequence, and operation IDs and queues records in a bounded nonpaged list. Defaults are 16,384 records and 64 MiB, with maxima of 32,768 records and 128 MiB. The collector drains up to 1 MiB per IOCTL. ETW uses a separate bounded queue and source sequence. Allocation failure or a full queue increments drop counters; missing chunks make payload operations incomplete. On Ctrl+C, the collector stops new driver tracking and drains the remaining queue before final statistics. This is not lossless capture.
 
-A single agent writer assigns consecutive record indexes and chains every JSON object with SHA-256. Rotated files continue the chain. The chain detects later modification only when the trusted final hash is retained separately; it does not stop a privileged attacker from rewriting the whole log.
+A single agent writer assigns consecutive record indexes and chains every JSON object with SHA-256. Rotated files continue the chain. Payloads are Base64 encoded, and complete operations can be reconstructed in chunk order. Friendly decodings are provided only when the entire value is present in one chunk. The chain detects later modification only when the trusted final hash is retained separately.
 
 ## Process scope and identity
 
@@ -17,7 +17,7 @@ The collector translates the configured DOS client root to an NT device path. Th
 - `NxOverlay\DwarfAxe.exe`
 - `CrashReportClient.exe`
 
-Children of tracked processes inherit tracking. At startup, the collector resolves full image paths and creation times, then registers matching processes and their descendants iteratively. Explicit `--pid` scope is separate. PID + creation time is the intended process key; metadata sources that provide only a PID still have weaker identity during PID reuse.
+Children of tracked processes inherit tracking. At startup, the collector resolves full image paths and creation times, then registers matching processes and descendants iteratively. Explicit `--pid` scope is separate. PID + creation time is the intended process key; PID-only metadata still has weaker identity during PID reuse.
 
 Root configuration and registration use a passive-level mutex. Event-time process lookups use a spin lock and bounded nonpaged entries. Basename matching alone is not treated as publisher identity, and no Authenticode claim is made for the modified private-server installation.
 
@@ -25,49 +25,46 @@ Root configuration and registration use a passive-level mutex. Event-time proces
 
 ### Object access
 
-`ObRegisterCallbacks` observes process and thread handle creation/duplication for tracked source processes. Events include target PID, target creation time/image where available, original desired access, granted access, and completion status. Self-handle noise is skipped. A handle-open event does not prove a later `ReadProcessMemory`, and handles opened before monitoring or through protected/brokered paths may be missed. No access bits are stripped.
+`ObRegisterCallbacks` observes process and thread handle creation/duplication for tracked source processes. Events include target PID, target creation time/image where available, original desired access, granted access, and completion status. A handle-open event does not prove a later `ReadProcessMemory`, and handles opened before monitoring or through protected/brokered paths may be missed. No access bits are stripped.
 
 ### Files and devices
 
-The minifilter logs create results and uses pre-operation cached name references for post-operation read/write, query/set information, directory control, cleanup, file-system control, device control, and volume-information results. Cache-only lookup avoids unsafe filesystem name queries in completion callbacks; a missing cache entry produces `MsMonFlagMissingPath` instead of a fabricated path.
+The minifilter logs create results and uses pre-operation cached name references for post-operation read/write, query/set information, directory control, cleanup, file-system control, device control, and volume-information results. Cache-only lookup avoids unsafe filesystem name queries; missing cache entries produce `MsMonFlagMissingPath`.
 
-Named-pipe device paths are classified as IPC. Volume-information and selected storage/device paths feed hardware-related classification. Arbitrary non-filesystem device IOCTLs are not all visible to a minifilter. No data buffers, file contents, volume serial values, or named-pipe payloads are copied.
+Named-pipe device paths are classified as IPC, but generic file and named-pipe contents are not captured in this Pareto-scoped version. Arbitrary non-filesystem device IOCTLs are not all visible to a minifilter.
+
+For `FileFsVolumeInformation`, the driver uses Filter Manager buffer decoding/locking at APC_LEVEL or below. It records the raw returned buffer when valid and the collector decodes `FILE_FS_VOLUME_INFORMATION`, including the exact volume serial number, creation time, and label. Failed queries, invalid lengths, and unsafe-IRQL cases produce `payload_unavailable` instead of unsafe access or fabricated values.
 
 ### Registry
 
-Pre-operation callbacks copy bounded key/value metadata into nonpaged call contexts. Post-operation callbacks emit the actual status and free those contexts. Set events include value type and data size; query/set events do not include value data. The callback covers open/create, query, multi-value query metadata, enumerate, set, delete, and rename operations registered by the configuration manager.
+Pre-operation callbacks copy bounded key/value metadata into nonpaged call contexts. Set-value input bytes are captured during their valid pre-operation window and linked to final status through an operation ID. Post-operation callbacks emit actual status and free contexts.
+
+Successful value queries and enumeration support Partial, Full, Align64, and multi-value layouts with checked offsets and lengths. Exact value bytes and types are retained. Failed, partial, unsupported, or unsafe results are marked unavailable rather than read beyond valid output. The collector adds friendly decoding for common string, multi-string, DWORD, and QWORD types while retaining Base64 for every value.
 
 ### Network
 
-WFP callouts cover ALE connect and receive/accept plus flow-established IPv4/IPv6 layers. Explicit field IDs select local/remote addresses, ports, and protocol; the implementation does not assume those fields are adjacent. Events carry flow IDs and packed protocol/ports. Associated flow contexts produce close events and are removed during teardown. Callouts permit traffic and never inspect packets or TLS plaintext.
+WFP callouts cover ALE connect and receive/accept plus flow-established IPv4/IPv6 layers. Events carry flow IDs, endpoints, protocol, and packed ports. Associated flow contexts produce close events and are removed during teardown. Callouts permit traffic and do not capture packet payloads or decrypt TLS.
 
 ### ETW and attribution
 
-The collector creates a uniquely named private real-time trace session with system-time timestamps. It enables WMI Activity, DNS Client, and RPC providers when available, and records coverage warnings for provider failures. It does not stop or modify other trace sessions.
+The collector creates a uniquely named private real-time trace session. It enables WMI Activity, DNS Client, and RPC providers when available and records provider failures as coverage warnings. It does not stop or modify other trace sessions.
 
-WMI can be correlated through `ClientProcessId` even when the event arrives from a service. Query string literals and numeric literals are redacted before logging. DNS query names and RPC endpoint/operation metadata remain potentially sensitive. RPC events without defensible client correlation are ignored.
+WMI can be correlated through `ClientProcessId` even when the event arrives from a service. Full-payload mode preserves the original query text; `--no-payloads` restores literal sanitization. WMI Activity does not supply result rows, and RPC/ALPC payloads are not available through these providers. DNS names and RPC endpoint metadata remain potentially sensitive.
 
-Where ETW supplies supported stack extended data, the collector resolves addresses against image-load ranges and records up to eight module paths. Attribution is labeled:
-
-- `stack_resolved`: at least one frame resolved to a module;
-- `service_correlated`: a service event names a tracked client PID;
-- `process_only`: only process identity is known;
-- `unknown`: no reliable attribution.
-
-Kernel callback context by itself does not identify the calling DLL. Module resolution is not symbol resolution and does not recover subroutine names.
+Where ETW supplies supported stack extended data, the collector resolves addresses against image-load ranges and records up to eight module paths. Attribution is labeled `stack_resolved`, `service_correlated`, `process_only`, or `unknown`. Kernel callback context alone does not identify the calling DLL, and module resolution is not symbol or subroutine resolution.
 
 ## Classification and summaries
 
-The classifier preserves raw metadata and adds `outside_client`, a category, and attribution. Hardware-related rules cover selected WMI classes/properties, registry key/value names, volume-information operations, and storage/device paths. These are heuristics: they identify a query surface, not the returned value or proof of exfiltration. Unknown remains unknown rather than being treated as safe.
+The classifier preserves raw metadata and adds `outside_client`, a category, and attribution. Hardware-related rules cover selected WMI classes/properties, registry key/value names, volume-information operations, and storage/device paths. Exact registry/volume values show what Windows returned, but still do not prove retention or transmission. Other hardware categories remain heuristics, and unknown remains unknown.
 
-The final observer summary groups events by category, PID, target PID, and resolved module, and includes source drops/gaps. It is intended as evidence for a later policy tool, not as an enforcement policy by itself.
+The final observer summary groups events by category, PID, target PID, and resolved module. It includes source drops/gaps, payload bytes, complete and incomplete payload operations, unavailable events, and duplicate chunks. It is evidence for a later policy tool, not an enforcement policy or proof of exfiltration.
 
 ## What full capture cannot mean
 
-The monitor does not capture every CPU instruction, function call, in-memory transition, process/window enumeration that does not open a handle, UI intent, or game-state semantic. It does not capture ALPC/COM payloads, all RPC associations, all browser-broker activity, raw packets, file/registry values, hardware-ID values, activity before monitor startup, or events lost under overload. Pre-existing browser interaction through Explorer or another broker may remain process-only or unattributed.
+The monitor does not capture every CPU instruction, function call, in-memory transition, process/window enumeration without a handle, UI intent, or game-state semantic. It does not capture generic file contents, named-pipe payloads, ALPC/COM payloads, all RPC associations, all browser-broker activity, packet payloads, WMI result rows, direct adapter-API return buffers, activity before monitor startup, or events lost under overload. Pre-existing browser interaction through Explorer or another broker may remain unattributed.
 
-Protected components and direct user-mode hardware APIs can lack a supported attributable event. Adding injection, SSDT hooks, client patching, or GRAP bypass would change the risk model and is outside this project. Server-side code is not needed to build the monitor, but server-dependent gameplay paths cannot be certified without a runnable environment.
+Protected components and direct user-mode hardware APIs can lack a supported attributable event. Adding injection, SSDT hooks, client patching, or GRAP bypass is outside this project. Server-side code is not needed to build the monitor, but server-dependent gameplay paths cannot be certified without a runnable environment.
 
 ## Reliability requirements
 
-The deliverable is a compiled development prototype. It has not been installed or runtime-tested. Before production use it needs isolated VM load/unload testing, Driver Verifier, stress and PID-reuse testing, WFP/minifilter coexistence checks, formal IRQL and lifetime review, independent security review, and a proper production signing/deployment process.
+The deliverable is a compiled development prototype. It has not been installed or runtime-tested. Before production use it needs isolated VM load/unload testing, Driver Verifier, payload and queue stress tests, buffer-failure tests, PID-reuse testing, WFP/minifilter coexistence checks, formal IRQL and lifetime review, independent security review, and a proper production signing/deployment process.

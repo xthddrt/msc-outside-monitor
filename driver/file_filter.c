@@ -9,6 +9,13 @@ NTSTATUS MsMonLogEvent(ULONG Type, HANDLE ProcessId, HANDLE ParentProcessId, HAN
                        NTSTATUS Status, ULONG DesiredAccess, ULONG Category,
                        ULONGLONG Value0, ULONGLONG Value1,
                        PCUNICODE_STRING Text, PCUNICODE_STRING Detail);
+NTSTATUS MsMonLogPayloadSeries(ULONG Type, HANDLE ProcessId, HANDLE ThreadId, ULONG Flags,
+                               NTSTATUS Status, ULONG Category, ULONGLONG Value0, ULONGLONG Value1,
+                               PCUNICODE_STRING Text, PCUNICODE_STRING Detail,
+                               ULONG PayloadKind, ULONGLONG OperationId, ULONGLONG TotalBytes,
+                               const VOID* Payload, ULONG AvailableBytes);
+BOOLEAN MsMonPayloadEnabled(VOID);
+ULONGLONG MsMonNextOperationId(VOID);
 
 static PFLT_FILTER gFilter;
 
@@ -86,6 +93,64 @@ static FLT_PREOP_CALLBACK_STATUS MsMonPreOperation(
     return FLT_PREOP_SUCCESS_WITH_CALLBACK;
 }
 
+static VOID MsMonVolumeUnavailable(
+    PFLT_CALLBACK_DATA Data, PCUNICODE_STRING Path, PCWSTR Reason
+)
+{
+    UNICODE_STRING detail;
+    ULONG category = MsMonEventValue(Data, FALSE) == 1 ? MsMonCategoryHardwareIdentity : MsMonFileCategory(Path);
+    RtlInitUnicodeString(&detail, Reason);
+    (VOID)MsMonLogEvent(MsMonFileQueryVolumeInformation, PsGetCurrentProcessId(), NULL,
+                        PsGetCurrentThreadId(), NULL, 0, MsMonFlagPayloadUnavailable,
+                        Data->IoStatus.Status, 0, category, MsMonEventValue(Data, FALSE),
+                        0, Path, &detail);
+}
+
+static VOID MsMonCaptureVolume(PFLT_CALLBACK_DATA Data, PCUNICODE_STRING Path)
+{
+    PMDL* mdlAddress = NULL;
+    PVOID* buffer = NULL;
+    PULONG length = NULL;
+    LOCK_OPERATION desiredAccess;
+    NTSTATUS status;
+    PVOID address = NULL;
+    ULONG category = MsMonEventValue(Data, FALSE) == 1 ? MsMonCategoryHardwareIdentity : MsMonFileCategory(Path);
+
+    if (!NT_SUCCESS(Data->IoStatus.Status)) {
+        MsMonVolumeUnavailable(Data, Path, L"volume_query_failed");
+        return;
+    }
+    if (KeGetCurrentIrql() > APC_LEVEL) {
+        MsMonVolumeUnavailable(Data, Path, L"unsafe_irql");
+        return;
+    }
+    status = FltDecodeParameters(Data, &mdlAddress, &buffer, &length, &desiredAccess);
+    if (!NT_SUCCESS(status) || length == NULL || Data->IoStatus.Information == 0 ||
+        Data->IoStatus.Information > (ULONGLONG)*length) {
+        MsMonVolumeUnavailable(Data, Path, L"invalid_volume_result");
+        return;
+    }
+    status = FltLockUserBuffer(Data);
+    if (!NT_SUCCESS(status)) {
+        MsMonVolumeUnavailable(Data, Path, L"buffer_lock_failed");
+        return;
+    }
+    if (mdlAddress != NULL && *mdlAddress != NULL) {
+        address = MmGetSystemAddressForMdlSafe(*mdlAddress, NormalPagePriority);
+    } else if (buffer != NULL) {
+        address = *buffer;
+    }
+    if (address == NULL) {
+        MsMonVolumeUnavailable(Data, Path, L"buffer_mapping_failed");
+        return;
+    }
+    (VOID)MsMonLogPayloadSeries(MsMonFileQueryVolumeInformation, PsGetCurrentProcessId(),
+                                PsGetCurrentThreadId(), 0, Data->IoStatus.Status, category,
+                                MsMonEventValue(Data, FALSE), 0, Path, NULL,
+                                MsMonPayloadVolumeInformation, MsMonNextOperationId(),
+                                Data->IoStatus.Information, address, (ULONG)Data->IoStatus.Information);
+}
+
 static FLT_POSTOP_CALLBACK_STATUS MsMonPostOperation(
     PFLT_CALLBACK_DATA Data,
     PCFLT_RELATED_OBJECTS FltObjects,
@@ -98,11 +163,15 @@ static FLT_POSTOP_CALLBACK_STATUS MsMonPostOperation(
     UNREFERENCED_PARAMETER(FltObjects);
     UNREFERENCED_PARAMETER(Flags);
     if (MsMonIsTracked(PsGetCurrentProcessId(), 0)) {
-        (VOID)MsMonLogEvent(MsMonEventType(Data->Iopb->MajorFunction),
-                            PsGetCurrentProcessId(), NULL, PsGetCurrentThreadId(), NULL, 0,
-                            path == NULL ? MsMonFlagMissingPath : 0, Data->IoStatus.Status, 0,
-                            MsMonFileCategory(path), MsMonEventValue(Data, FALSE),
-                            MsMonEventValue(Data, TRUE), path, NULL);
+        if (Data->Iopb->MajorFunction == IRP_MJ_QUERY_VOLUME_INFORMATION && MsMonPayloadEnabled()) {
+            MsMonCaptureVolume(Data, path);
+        } else {
+            (VOID)MsMonLogEvent(MsMonEventType(Data->Iopb->MajorFunction),
+                                PsGetCurrentProcessId(), NULL, PsGetCurrentThreadId(), NULL, 0,
+                                path == NULL ? MsMonFlagMissingPath : 0, Data->IoStatus.Status, 0,
+                                MsMonFileCategory(path), MsMonEventValue(Data, FALSE),
+                                MsMonEventValue(Data, TRUE), path, NULL);
+        }
     }
     if (nameInfo != NULL) FltReleaseFileNameInformation(nameInfo);
     return FLT_POSTOP_FINISHED_PROCESSING;

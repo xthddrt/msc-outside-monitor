@@ -19,22 +19,24 @@ msmon-agent.exe --client "C:\Nexon\Library\maplestorycw\appdata" --output C:\msm
 sc.exe stop msmon
 ```
 
-Stop the collector with Ctrl+C before stopping the driver. The collector stops new driver tracking, drains queued driver records, stops its private ETW session, writes final statistics, and ends the driver session during normal shutdown.
+Full registry/volume payload capture is enabled by default. Add `--no-payloads` for metadata-only collection and sanitized WMI queries. Stop the collector with Ctrl+C before stopping the driver so it can stop new tracking, drain queued records, and write final statistics.
 
 ## Validation checklist
 
 - Start the collector before the game. Verify exact-path root/helper registration, descendant inheritance, PID + creation-time identity, and no tracking of an unrelated same-named executable.
 - Confirm process/thread start/exit, image paths, module bases/sizes, and command lines when available.
-- From a controlled tracked process, open and duplicate handles to another process/thread. Verify target PID/image, requested/granted access, and result. Confirm the monitor does not change access.
-- Perform controlled file reads/writes, directory enumeration, rename/set-information, named-pipe, volume-information, and visible device-control operations. Verify paths, status, lengths/offsets, and missing-path flags. Do not use sensitive payloads.
-- Perform registry open/create/query/enumerate/set/delete/rename operations. Verify key/value names, type/size, and post-operation status without value-data capture.
-- Issue controlled WMI hardware and non-hardware queries. Verify client correlation, query-literal redaction, category, and any supported stack/module attribution. Confirm actual hardware-ID values are absent from the log.
-- Enable an isolated network and verify IPv4/IPv6 connect/accept and flow establish/close correlation. Confirm endpoints use the correct local/remote fields and the monitor does not change connection policy.
-- Launch an external URL/browser through the client or a controlled descendant. Distinguish direct child creation, handle access, and brokered/RPC evidence; do not assume an existing browser is wholly monitored.
-- Start/stop the collector and driver repeatedly, including with pending reads and active flows. Check for hangs, stale sessions, leaked flow contexts, and bugchecks.
-- Run Driver Verifier and controlled stress tests. Exceed both record and byte queue limits; verify source gaps and final drop statistics. Confirm ETW queue drops are also visible.
-- Exercise PID reuse and protected-process cases; review events with zero creation time or unknown attribution rather than treating them as strongly identified.
-- Validate logs with `python tools\verify_log.py <parts-in-order>` and retain the final chain separately as evidence.
-- Review logs for sensitive paths, command lines, DNS names, registry metadata, and sanitized WMI queries before sharing them.
+- From a controlled tracked process, open and duplicate handles to another process/thread. Verify target PID/image, requested/granted access, and result without changing access.
+- Perform controlled file reads/writes, directory enumeration, rename/set-information, named-pipe, and visible device-control operations. Verify paths, status, lengths/offsets, and missing-path flags. Generic file and named-pipe contents are intentionally not captured in this version.
+- Use synthetic registry strings, multi-strings, DWORD/QWORD values, binary data, and values larger than 8 KiB. Verify exact Base64 bytes, friendly decoded values, chunk ordering, and final operation status. Compare the values with the known inputs, not with real credentials or production identifiers.
+- Test failed, partial, and unsupported registry queries. Confirm they produce `payload_unavailable` and never claim complete values.
+- Issue a controlled volume-information request. Compare the logged raw result, exact serial number, creation time, and label with the VM's known values. Test buffer failures and confirm unavailable reasons.
+- Issue controlled WMI hardware and non-hardware queries. Verify original query text in full mode, sanitization with `--no-payloads`, client correlation, and module attribution. Confirm the log explicitly notes that WMI result rows are unavailable.
+- Enable an isolated network and verify IPv4/IPv6 connect/accept and flow establish/close correlation. Packet payloads and TLS plaintext remain outside this version's coverage.
+- Launch an external URL/browser through the client or a controlled descendant. Distinguish direct child creation, handle access, and brokered/RPC evidence.
+- Start/stop the collector and driver repeatedly, including with pending reads and active flows. Check for hangs, stale sessions, leaked contexts, and bugchecks.
+- Run Driver Verifier and controlled stress tests. Exceed record and byte queue limits; verify source gaps, incomplete payload operations, and final drop statistics. Test multi-megabyte values and unsafe-IRQL paths without using sensitive payloads.
+- Exercise PID reuse and protected-process cases; review zero creation times and unknown attribution rather than treating them as strong identity.
+- Validate logs with `python tools\verify_log.py <parts-in-order>`. Confirm malformed Base64, duplicate/missing/out-of-order chunks, incorrect decoded values, and hash-chain tampering are rejected or reported.
+- Review logs for exact registry values, hardware identifiers, paths, command lines, DNS names, and original WMI queries before sharing them. Never commit real payload logs.
 
-A successful compile is not evidence that kernel runtime behavior is safe. Production use requires the full checklist, independent driver review, and a production signing process. Without a runnable server environment, launch and local-access paths can be tested, but server-dependent gameplay behavior remains uncertified.
+A successful compile is not evidence that kernel runtime behavior is safe. Production use requires the full checklist, independent driver review, and a production signing process. Without a runnable server environment, server-dependent gameplay behavior remains uncertified.

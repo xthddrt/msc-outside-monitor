@@ -7,9 +7,10 @@ extern "C" {
 #define MSMON_DEVICE_NAME L"\\Device\\MsMon"
 #define MSMON_DOS_DEVICE_NAME L"\\DosDevices\\MsMon"
 #define MSMON_USER_DEVICE_PATH "\\\\.\\MsMon"
-#define MSMON_PROTOCOL_VERSION 2u
-#define MSMON_MAX_EVENT_RECORD_BYTES 8192u
+#define MSMON_PROTOCOL_VERSION 3u
+#define MSMON_MAX_EVENT_RECORD_BYTES 16384u
 #define MSMON_MAX_EVENT_STRING_BYTES 2048u
+#define MSMON_PAYLOAD_CHUNK_BYTES 8192u
 #define MSMON_READ_MAX_BYTES (1024u * 1024u)
 #define MSMON_DEFAULT_QUEUE_RECORDS 16384u
 #define MSMON_MAX_QUEUE_RECORDS 32768u
@@ -58,8 +59,19 @@ typedef enum _MSMON_EVENT_FLAGS {
     MsMonFlagTruncatedPath = 0x00000004u,
     MsMonFlagMissingPath = 0x00000008u,
     MsMonFlagServiceCorrelated = 0x00000010u,
-    MsMonFlagObserverRecord = 0x00000020u
+    MsMonFlagObserverRecord = 0x00000020u,
+    MsMonFlagPayloadPresent = 0x00000040u,
+    MsMonFlagPayloadUnavailable = 0x00000080u,
+    MsMonFlagPayloadFinalChunk = 0x00000100u,
+    MsMonFlagPayloadInput = 0x00000200u,
+    MsMonFlagPayloadPartial = 0x00000400u
 } MSMON_EVENT_FLAGS;
+
+typedef enum _MSMON_PAYLOAD_KIND {
+    MsMonPayloadNone = 0,
+    MsMonPayloadRegistryValue = 1,
+    MsMonPayloadVolumeInformation = 2
+} MSMON_PAYLOAD_KIND;
 
 typedef enum _MSMON_CATEGORY {
     MsMonCategoryUnknown = 0,
@@ -107,12 +119,34 @@ typedef struct _MSMON_EVENT_HEADER {
     unsigned short DetailBytes;
     unsigned __int64 Value0;
     unsigned __int64 Value1;
+    unsigned __int64 OperationId;
+    unsigned __int64 PayloadTotalBytes;
+    unsigned __int64 PayloadByteOffset;
+    unsigned long PayloadChunkIndex;
+    unsigned long PayloadChunkCount;
+    unsigned long PayloadKind;
+    unsigned long PayloadOffset;
+    unsigned long PayloadBytes;
+    unsigned long Reserved;
 } MSMON_EVENT_HEADER;
+
+typedef struct _MSMON_PAYLOAD {
+    unsigned __int64 OperationId;
+    unsigned __int64 TotalBytes;
+    unsigned __int64 ByteOffset;
+    unsigned long ChunkIndex;
+    unsigned long ChunkCount;
+    unsigned long Kind;
+    const VOID* Data;
+    unsigned long ByteCount;
+} MSMON_PAYLOAD;
 
 typedef struct _MSMON_SESSION_CONFIG {
     unsigned __int64 SessionId;
     unsigned long QueueRecords;
     unsigned long QueueBytes;
+    unsigned long PayloadMode;
+    unsigned long Reserved;
     wchar_t ClientRoot[MSMON_CLIENT_PATH_CHARS];
 } MSMON_SESSION_CONFIG;
 

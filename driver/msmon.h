@@ -12,8 +12,10 @@ DRIVER_UNLOAD MsMonDriverUnload;
 
 NTSTATUS MsMonEventsInitialize(VOID);
 VOID MsMonEventsUninitialize(VOID);
-NTSTATUS MsMonEventsStart(ULONGLONG SessionId, ULONG QueueRecords, ULONG QueueBytes);
+NTSTATUS MsMonEventsStart(ULONGLONG SessionId, ULONG QueueRecords, ULONG QueueBytes, ULONG PayloadMode);
 VOID MsMonEventsStop(VOID);
+BOOLEAN MsMonPayloadEnabled(VOID);
+ULONGLONG MsMonNextOperationId(VOID);
 NTSTATUS MsMonLogEvent(
     ULONG Type,
     HANDLE ProcessId,
@@ -29,6 +31,18 @@ NTSTATUS MsMonLogEvent(
     ULONGLONG Value1,
     PCUNICODE_STRING Text,
     PCUNICODE_STRING Detail
+);
+NTSTATUS MsMonLogEventWithOperation(
+    ULONG Type, HANDLE ProcessId, HANDLE ThreadId, ULONG Flags, NTSTATUS Status,
+    ULONG Category, ULONGLONG Value0, ULONGLONG Value1,
+    PCUNICODE_STRING Text, PCUNICODE_STRING Detail, ULONGLONG OperationId
+);
+NTSTATUS MsMonLogPayloadSeries(
+    ULONG Type, HANDLE ProcessId, HANDLE ThreadId, ULONG Flags, NTSTATUS Status,
+    ULONG Category, ULONGLONG Value0, ULONGLONG Value1,
+    PCUNICODE_STRING Text, PCUNICODE_STRING Detail,
+    ULONG PayloadKind, ULONGLONG OperationId, ULONGLONG TotalBytes,
+    const VOID* Payload, ULONG AvailableBytes
 );
 NTSTATUS MsMonReadEvents(PVOID Output, ULONG MaximumBytes, ULONG TimeoutMilliseconds, PULONG BytesRead);
 VOID MsMonGetStatistics(PMSMON_STATISTICS Statistics);

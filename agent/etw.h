@@ -7,7 +7,7 @@
 
 class EtwCollector {
 public:
-    EtwCollector(ProcessScope& scope, EventQueue& queue, uint64_t sessionId);
+    EtwCollector(ProcessScope& scope, EventQueue& queue, uint64_t sessionId, bool capturePayloads);
     ~EtwCollector();
     bool Start(std::string& error);
     void Stop();
@@ -20,6 +20,7 @@ private:
     ProcessScope& scope_;
     EventQueue& queue_;
     uint64_t sessionId_;
+    bool capturePayloads_ = true;
     TRACEHANDLE session_ = 0;
     TRACEHANDLE trace_ = 0;
     std::wstring loggerName_;

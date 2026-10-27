@@ -26,6 +26,15 @@ private:
     uint64_t events_ = 0;
     uint64_t outsideEvents_ = 0;
     uint64_t hardwareEvents_ = 0;
+    uint64_t payloadBytes_ = 0;
+    uint64_t payloadUnavailable_ = 0;
+    uint64_t payloadDuplicateChunks_ = 0;
+    struct PayloadProgress {
+        uint32_t chunkCount = 0;
+        bool invalid = false;
+        std::map<ULONG, bool> chunks;
+    };
+    std::map<uint64_t, PayloadProgress> payloadOperations_;
     std::map<std::string, uint64_t> categories_;
     std::map<DWORD, uint64_t> processes_;
     std::map<DWORD, uint64_t> targets_;

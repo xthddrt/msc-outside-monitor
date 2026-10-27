@@ -132,8 +132,8 @@ static void AppendField(std::wstring& target, const std::wstring& name, const st
     target += name + L"=" + value;
 }
 
-EtwCollector::EtwCollector(ProcessScope& scope, EventQueue& queue, uint64_t sessionId)
-    : scope_(scope), queue_(queue), sessionId_(sessionId) {}
+EtwCollector::EtwCollector(ProcessScope& scope, EventQueue& queue, uint64_t sessionId, bool capturePayloads)
+    : scope_(scope), queue_(queue), sessionId_(sessionId), capturePayloads_(capturePayloads) {}
 
 EtwCollector::~EtwCollector()
 {
@@ -264,7 +264,9 @@ void EtwCollector::OnRecord(PEVENT_RECORD record)
         PropertyString(record, info, L"NamespaceName", event.text);
         if (event.text.empty()) PropertyString(record, info, L"ProviderName", event.text);
         if (PropertyString(record, info, L"Operation", value)) AppendField(event.detail, L"operation", value);
-        if (PropertyString(record, info, L"Query", value)) AppendField(event.detail, L"query", SanitizeQuery(value));
+        if (PropertyString(record, info, L"Query", value)) {
+            AppendField(event.detail, L"query", capturePayloads_ ? value : SanitizeQuery(value));
+        }
         if (PropertyString(record, info, L"QueryLanguage", value)) AppendField(event.detail, L"language", value);
         if (PropertyNumber(record, info, L"OperationId", number)) event.header.Value1 = number;
         if (PropertyNumber(record, info, L"StatusCode", number)) event.header.Status = static_cast<LONG>(number);

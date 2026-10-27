@@ -92,6 +92,17 @@ void SessionSummary::Add(const TelemetryEvent& event)
     events_++;
     if (event.outsideClient) outsideEvents_++;
     if (event.header.Category == MsMonCategoryHardwareIdentity) hardwareEvents_++;
+    if ((event.header.Flags & MsMonFlagPayloadUnavailable) != 0) payloadUnavailable_++;
+    if ((event.header.Flags & MsMonFlagPayloadPresent) != 0) {
+        payloadBytes_ += event.header.PayloadBytes;
+        auto& operation = payloadOperations_[event.header.OperationId];
+        if (operation.chunkCount == 0) operation.chunkCount = event.header.PayloadChunkCount;
+        if (operation.chunkCount != event.header.PayloadChunkCount) operation.invalid = true;
+        if (!operation.chunks.emplace(event.header.PayloadChunkIndex, true).second) {
+            operation.invalid = true;
+            payloadDuplicateChunks_++;
+        }
+    }
     categories_[CategoryName(event.header.Category)]++;
     processes_[event.header.ProcessId]++;
     if (event.header.TargetProcessId != 0) targets_[event.header.TargetProcessId]++;
@@ -101,10 +112,24 @@ void SessionSummary::Add(const TelemetryEvent& event)
 std::string SessionSummary::Json(const MSMON_STATISTICS& statistics, uint64_t etwDropped,
                                  uint64_t driverGaps, uint64_t etwGaps) const
 {
+    uint64_t completePayloads = 0;
+    for (const auto& item : payloadOperations_) {
+        const auto& operation = item.second;
+        if (!operation.invalid && operation.chunkCount != 0 &&
+            operation.chunks.size() == operation.chunkCount &&
+            operation.chunks.begin()->first == 0 &&
+            operation.chunks.rbegin()->first == operation.chunkCount - 1) completePayloads++;
+    }
     std::ostringstream json;
     json << "{\"type\":\"observer_summary\",\"session_id\":" << statistics.SessionId
          << ",\"events\":" << events_ << ",\"outside_client_events\":" << outsideEvents_
          << ",\"hardware_identity_events\":" << hardwareEvents_
+         << ",\"payload_bytes\":" << payloadBytes_
+         << ",\"payload_operations\":" << payloadOperations_.size()
+         << ",\"complete_payload_operations\":" << completePayloads
+         << ",\"incomplete_payload_operations\":" << (payloadOperations_.size() - completePayloads)
+         << ",\"payload_unavailable_events\":" << payloadUnavailable_
+         << ",\"payload_duplicate_chunks\":" << payloadDuplicateChunks_
          << ",\"driver_dropped_events\":" << statistics.DroppedEvents
          << ",\"driver_queued_events\":" << statistics.QueuedEvents
          << ",\"driver_queued_bytes\":" << statistics.QueuedBytes

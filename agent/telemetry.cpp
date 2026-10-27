@@ -281,6 +281,110 @@ bool JsonlWriter::Write(const std::string& json)
     return static_cast<bool>(stream_);
 }
 
+static std::string Base64(const std::vector<BYTE>& data)
+{
+    static const char alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string output;
+    output.reserve((data.size() + 2) / 3 * 4);
+    for (size_t index = 0; index < data.size(); index += 3) {
+        uint32_t value = static_cast<uint32_t>(data[index]) << 16;
+        if (index + 1 < data.size()) value |= static_cast<uint32_t>(data[index + 1]) << 8;
+        if (index + 2 < data.size()) value |= data[index + 2];
+        output.push_back(alphabet[(value >> 18) & 63]);
+        output.push_back(alphabet[(value >> 12) & 63]);
+        output.push_back(index + 1 < data.size() ? alphabet[(value >> 6) & 63] : '=');
+        output.push_back(index + 2 < data.size() ? alphabet[value & 63] : '=');
+    }
+    return output;
+}
+
+static const char* PayloadKindName(ULONG kind)
+{
+    switch (kind) {
+    case MsMonPayloadRegistryValue: return "registry_value";
+    case MsMonPayloadVolumeInformation: return "volume_information";
+    default: return "unknown";
+    }
+}
+
+static std::wstring DecodeUtf16(const BYTE* data, size_t bytes)
+{
+    if ((bytes & 1) != 0) return {};
+    std::wstring output;
+    output.reserve(bytes / 2);
+    for (size_t offset = 0; offset < bytes; offset += 2) {
+        wchar_t c;
+        std::memcpy(&c, data + offset, sizeof(c));
+        output.push_back(c);
+    }
+    while (!output.empty() && output.back() == L'\0') output.pop_back();
+    return output;
+}
+
+static void AppendDecodedValue(std::ostringstream& json, const TelemetryEvent& event)
+{
+    const auto& header = event.header;
+    if (header.PayloadChunkCount != 1 || header.PayloadTotalBytes != event.payload.size()) return;
+    if (header.PayloadKind == MsMonPayloadRegistryValue) {
+        ULONG type = static_cast<ULONG>(header.Value1);
+        if (type == REG_SZ || type == REG_EXPAND_SZ || type == REG_LINK) {
+            json << ",\"decoded_value\":\"" << JsonEscape(WideToUtf8(DecodeUtf16(
+                event.payload.data(), event.payload.size()))) << "\"";
+        } else if (type == REG_MULTI_SZ) {
+            json << ",\"decoded_value\":[";
+            size_t offset = 0;
+            bool first = true;
+            while (offset + 1 < event.payload.size()) {
+                size_t end = offset;
+                while (end + 1 < event.payload.size()) {
+                    wchar_t c;
+                    std::memcpy(&c, event.payload.data() + end, sizeof(c));
+                    if (c == L'\0') break;
+                    end += 2;
+                }
+                if (end > offset) {
+                    if (!first) json << ',';
+                    first = false;
+                    json << '\"' << JsonEscape(WideToUtf8(DecodeUtf16(
+                        event.payload.data() + offset, end - offset))) << '\"';
+                }
+                if (end + 1 >= event.payload.size()) break;
+                offset = end + 2;
+                if (offset + 1 < event.payload.size()) {
+                    wchar_t c;
+                    std::memcpy(&c, event.payload.data() + offset, sizeof(c));
+                    if (c == L'\0') break;
+                }
+            }
+            json << "]";
+        } else if (type == REG_DWORD && event.payload.size() == sizeof(uint32_t)) {
+            uint32_t value;
+            std::memcpy(&value, event.payload.data(), sizeof(value));
+            json << ",\"decoded_value\":" << value;
+        } else if (type == REG_QWORD && event.payload.size() == sizeof(uint64_t)) {
+            uint64_t value;
+            std::memcpy(&value, event.payload.data(), sizeof(value));
+            json << ",\"decoded_value\":" << value;
+        }
+    } else if (header.PayloadKind == MsMonPayloadVolumeInformation && event.payload.size() >= 18) {
+        uint64_t created;
+        uint32_t serial;
+        uint32_t labelBytes;
+        std::memcpy(&created, event.payload.data(), sizeof(created));
+        std::memcpy(&serial, event.payload.data() + 8, sizeof(serial));
+        std::memcpy(&labelBytes, event.payload.data() + 12, sizeof(labelBytes));
+        if (labelBytes <= event.payload.size() - 18 && (labelBytes & 1) == 0) {
+            char serialHex[9];
+            snprintf(serialHex, sizeof(serialHex), "%08X", serial);
+            json << ",\"decoded_value\":{\"volume_serial_number\":" << serial
+                 << ",\"volume_serial_hex\":\"" << serialHex
+                 << "\",\"volume_creation_time\":\"" << Timestamp(created)
+                 << "\",\"volume_label\":\"" << JsonEscape(WideToUtf8(DecodeUtf16(
+                        event.payload.data() + 18, labelBytes))) << "\"}";
+        }
+    }
+}
+
 std::string TelemetryJson(const TelemetryEvent& event)
 {
     const auto& header = event.header;
@@ -306,9 +410,23 @@ std::string TelemetryJson(const TelemetryEvent& event)
          << ",\"attribution\":\"" << AttributionName(header.Attribution)
          << "\",\"value0\":" << header.Value0
          << ",\"value1\":" << header.Value1
+         << ",\"operation_id\":" << header.OperationId
          << ",\"text\":\"" << JsonEscape(WideToUtf8(event.text))
-         << "\",\"detail\":\"" << JsonEscape(WideToUtf8(event.detail))
-         << "\",\"modules\":[";
+         << "\",\"detail\":\"" << JsonEscape(WideToUtf8(event.detail)) << "\"";
+    if ((header.Flags & MsMonFlagPayloadPresent) != 0) {
+        json << ",\"payload\":{\"kind\":\"" << PayloadKindName(header.PayloadKind)
+             << "\",\"encoding\":\"base64\",\"data\":\"" << Base64(event.payload)
+             << "\",\"operation_id\":" << header.OperationId
+             << ",\"total_bytes\":" << header.PayloadTotalBytes
+             << ",\"byte_offset\":" << header.PayloadByteOffset
+             << ",\"chunk_index\":" << header.PayloadChunkIndex
+             << ",\"chunk_count\":" << header.PayloadChunkCount
+             << ",\"final_chunk\":" << ((header.Flags & MsMonFlagPayloadFinalChunk) != 0 ? "true" : "false")
+             << "}";
+        AppendDecodedValue(json, event);
+    }
+    if ((header.Flags & MsMonFlagPayloadUnavailable) != 0) json << ",\"payload_unavailable\":true";
+    json << ",\"modules\":[";
     for (size_t index = 0; index < event.modules.size(); index++) {
         if (index != 0) json << ',';
         json << '\"' << JsonEscape(WideToUtf8(event.modules[index])) << '\"';
@@ -343,6 +461,39 @@ bool DecodeDriverEvent(const BYTE* data, DWORD available, TelemetryEvent& event,
     if (!validString(header.TextOffset, header.TextBytes) ||
         !validString(header.DetailOffset, header.DetailBytes)) {
         error = "invalid event string bounds";
+        return false;
+    }
+    if ((header.Flags & MsMonFlagPayloadPresent) != 0) {
+        if ((header.Flags & MsMonFlagPayloadUnavailable) != 0 || header.OperationId == 0 ||
+            (header.PayloadKind != MsMonPayloadRegistryValue && header.PayloadKind != MsMonPayloadVolumeInformation) ||
+            header.PayloadChunkCount == 0 || header.PayloadChunkIndex >= header.PayloadChunkCount ||
+            header.PayloadBytes > MSMON_PAYLOAD_CHUNK_BYTES ||
+            header.PayloadByteOffset > header.PayloadTotalBytes ||
+            header.PayloadBytes > header.PayloadTotalBytes - header.PayloadByteOffset ||
+            header.PayloadByteOffset % MSMON_PAYLOAD_CHUNK_BYTES != 0 ||
+            header.PayloadChunkIndex != header.PayloadByteOffset / MSMON_PAYLOAD_CHUNK_BYTES) {
+            error = "invalid payload metadata";
+            return false;
+        }
+        uint64_t expectedChunks = header.PayloadTotalBytes == 0 ? 1 :
+            (header.PayloadTotalBytes + MSMON_PAYLOAD_CHUNK_BYTES - 1) / MSMON_PAYLOAD_CHUNK_BYTES;
+        if (expectedChunks != header.PayloadChunkCount ||
+            ((header.PayloadChunkIndex + 1 == header.PayloadChunkCount) !=
+             ((header.Flags & MsMonFlagPayloadFinalChunk) != 0))) {
+            error = "inconsistent payload chunk metadata";
+            return false;
+        }
+        if (header.PayloadBytes != 0) {
+            if (header.PayloadOffset < sizeof(header) || header.PayloadOffset > header.Size ||
+                header.PayloadBytes > header.Size - header.PayloadOffset) {
+                error = "invalid payload bounds";
+                return false;
+            }
+            event.payload.assign(data + header.PayloadOffset,
+                                 data + header.PayloadOffset + header.PayloadBytes);
+        }
+    } else if (header.PayloadBytes != 0) {
+        error = "payload bytes without payload flag";
         return false;
     }
     if (header.TextBytes != 0) {

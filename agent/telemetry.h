@@ -17,6 +17,7 @@ struct TelemetryEvent {
     std::wstring text;
     std::wstring detail;
     std::vector<std::wstring> modules;
+    std::vector<BYTE> payload;
     std::string source = "driver";
     bool outsideClient = true;
 };
