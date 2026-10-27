@@ -1,0 +1,51 @@
+# SysInfo access guard policy - example.
+#
+# Usage:  sysinfoctl guard policy policy\example.txt
+#
+# One directive per line.  '#' starts a comment.  Anything the driver cannot
+# parse aborts the whole load, so a typo never silently weakens the policy.
+#
+#   mode    off | audit | enforce
+#   target  <process image name>    a program that must not reach the paths below
+#   process <process image name>    a program whose handles/memory are protected
+#   path    <case-insensitive substring of a file or registry path>
+#
+# The driver ships with no targets at all.  This file is a template: fill in the
+# programs you want watched, and nothing else is affected.
+#
+# The kernel truncates image names to 15 characters and matching is prefix
+# based, so a long name is matched on its prefix.
+
+mode audit
+
+# Programs being watched.  No defaults - uncomment and edit.
+#
+# target app.exe
+# target helper.exe
+
+# Resources that stay off limits.
+path \Google\Chrome\User Data
+path \Google\Chrome\Application
+path \Microsoft\Edge\User Data
+path \Microsoft\Edge\Application
+path \Mozilla\Firefox\Profiles
+path \BraveSoftware\Brave-Browser\User Data
+path \Opera Software\
+path \Vivaldi\User Data
+path \Chromium\User Data
+
+# Registry subtrees that hold the same data (cookies, logins, autofill).
+path \Software\Google\Chrome
+path \Software\Microsoft\Edge
+path \Software\Mozilla\Firefox
+path \Software\BraveSoftware
+path \Software\Opera Software
+path \Software\Vivaldi
+
+# Browser processes whose handles and memory stay off limits.
+process chrome.exe
+process msedge.exe
+process firefox.exe
+process brave.exe
+process opera.exe
+process vivaldi.exe

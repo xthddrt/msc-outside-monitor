@@ -14,6 +14,7 @@ static volatile LONG gProcessCount;
 static UNICODE_STRING gClientRoot;
 static KMUTEX gRootMutex;
 static BOOLEAN gSessionActive;
+static BOOLEAN gProcessNotifyEx;
 
 static BOOLEAN MsMonImageMatches(PCUNICODE_STRING ImageFileName, PCWSTR RelativePath)
 {
@@ -271,6 +272,37 @@ static VOID MsMonImageNotify(PUNICODE_STRING FullImageName, HANDLE ProcessId, PI
                         (ULONGLONG)ImageInfo->ImageBase, ImageInfo->ImageSize, FullImageName, NULL);
 }
 
+static VOID MsMonProcessNotifyLegacy(HANDLE ParentId, HANDLE ProcessId, BOOLEAN Create)
+{
+    PEPROCESS process = NULL;
+    if (!NT_SUCCESS(PsLookupProcessByProcessId(ProcessId, &process))) return;
+    if (Create) {
+        PUNICODE_STRING imageName = NULL;
+        if (NT_SUCCESS(SeLocateProcessImageName(process, &imageName))) {
+            PS_CREATE_NOTIFY_INFO info;
+            RtlZeroMemory(&info, sizeof(info));
+            info.ParentProcessId = ParentId;
+            info.ImageFileName = imageName;
+            MsMonProcessNotify(process, ProcessId, &info);
+            ExFreePool(imageName);
+        } else {
+            MsMonProcessNotify(process, ProcessId, NULL);
+        }
+    } else {
+        MsMonProcessNotify(process, ProcessId, NULL);
+    }
+    ObDereferenceObject(process);
+}
+
+static VOID MsMonRemoveProcessNotify(VOID)
+{
+    if (gProcessNotifyEx) {
+        (VOID)PsSetCreateProcessNotifyRoutineEx(MsMonProcessNotify, TRUE);
+    } else {
+        (VOID)PsSetCreateProcessNotifyRoutine(MsMonProcessNotifyLegacy, TRUE);
+    }
+}
+
 NTSTATUS MsMonProcessInitialize(VOID)
 {
     NTSTATUS status;
@@ -280,17 +312,23 @@ NTSTATUS MsMonProcessInitialize(VOID)
     gProcessCount = 0;
     gClientRoot.Buffer = NULL;
     gSessionActive = FALSE;
+    gProcessNotifyEx = FALSE;
     status = PsSetCreateProcessNotifyRoutineEx(MsMonProcessNotify, FALSE);
-    if (!NT_SUCCESS(status)) return status;
+    if (NT_SUCCESS(status)) {
+        gProcessNotifyEx = TRUE;
+    } else {
+        status = PsSetCreateProcessNotifyRoutine(MsMonProcessNotifyLegacy, FALSE);
+        if (!NT_SUCCESS(status)) return status;
+    }
     status = PsSetCreateThreadNotifyRoutine(MsMonThreadNotify);
     if (!NT_SUCCESS(status)) {
-        (VOID)PsSetCreateProcessNotifyRoutineEx(MsMonProcessNotify, TRUE);
+        MsMonRemoveProcessNotify();
         return status;
     }
     status = PsSetLoadImageNotifyRoutine(MsMonImageNotify);
     if (!NT_SUCCESS(status)) {
         (VOID)PsRemoveCreateThreadNotifyRoutine(MsMonThreadNotify);
-        (VOID)PsSetCreateProcessNotifyRoutineEx(MsMonProcessNotify, TRUE);
+        MsMonRemoveProcessNotify();
     }
     return status;
 }
@@ -299,6 +337,6 @@ VOID MsMonProcessUninitialize(VOID)
 {
     (VOID)PsSetLoadImageNotifyRoutine(MsMonImageNotify);
     (VOID)PsRemoveCreateThreadNotifyRoutine(MsMonThreadNotify);
-    (VOID)PsSetCreateProcessNotifyRoutineEx(MsMonProcessNotify, TRUE);
+    MsMonRemoveProcessNotify();
     MsMonProcessStopSession();
 }

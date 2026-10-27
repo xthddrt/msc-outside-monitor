@@ -5,4 +5,4 @@ if not exist %MSBUILD% (
   echo MSBuild was not found at %MSBUILD%.
   exit /b 1
 )
-%MSBUILD% "%~dp0ms-monitor.sln" /m /p:Configuration=Release /p:Platform=x64
+%MSBUILD% "%~dp0ms-monitor.sln" /m /p:Configuration=Release /p:Platform=x64 && call "%~dp0compat\build.cmd"

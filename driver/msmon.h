@@ -63,6 +63,7 @@ ULONG MsMonTrackedProcessCount(VOID);
 
 NTSTATUS MsMonObjectInitialize(PDRIVER_OBJECT DriverObject);
 VOID MsMonObjectUninitialize(VOID);
+BOOLEAN MsMonObjectAvailable(VOID);
 
 NTSTATUS MsMonFileFilterInitialize(PDRIVER_OBJECT DriverObject);
 VOID MsMonFileFilterUninitialize(VOID);

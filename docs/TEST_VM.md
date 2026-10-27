@@ -40,4 +40,16 @@ Full registry/volume payload capture is enabled by default. Add `--no-payloads` 
 - Validate logs with `python tools\verify_log.py <parts-in-order>`. Confirm malformed Base64, duplicate/missing/out-of-order chunks, incorrect decoded values, and hash-chain tampering are rejected or reported.
 - Review logs for exact registry values, hardware identifiers, paths, command lines, DNS names, and original WMI queries before sharing them. Never commit real payload logs.
 
+## Legacy compatibility subsystem
+
+`build\compat\msmon-legacy.sys` and `msmon-legacyctl.exe` contain the complete legacy capability set, but inline kernel hooks are disabled at compile time and by the runtime gate. Do not enable them expecting PatchGuard stability. The build never installs either driver.
+
+- Verify the compatibility device rejects access from a non-administrator test account and allows the intended elevated account.
+- Confirm status reports unsafe functionality as implemented but disabled, with no inline patch installed and no PatchGuard/security setting changed.
+- Test supported process/thread notifications and handle events, including actual post-operation status and granted access.
+- Test legacy process-notification fallback when the extended registration API is refused, without treating reduced signing support as a reason to bypass signing requirements.
+- Use two different programs accessing the same resource and confirm summary/folding keys keep their events separate by PID.
+- Test guard audit/enforce only with synthetic targets and resources. File/registry/memory detours remain disabled with their inline hooks.
+- Exercise ring overflow and confirm drops are reported; do not treat `mon collect` as a lossless-capture guarantee.
+
 A successful compile is not evidence that kernel runtime behavior is safe. Production use requires the full checklist, independent driver review, and a production signing process. Without a runnable server environment, server-dependent gameplay behavior remains uncertified.

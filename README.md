@@ -36,6 +36,10 @@ Outputs:
 - `build\Release\driver\msmon.sys`
 - `build\Release\driver\msmon.inf`
 - `build\Release\agent\msmon-agent.exe`
+- `build\compat\msmon-legacy.sys`
+- `build\compat\msmon-legacyctl.exe`
+
+The compatibility subsystem in `compat/` contains the complete legacy monitor and guard implementation, with inline PatchGuard-dependent hooks disabled by default. Its device is administrator-only, its summary keys include PID, and its legacy process-notification fallback and hook-index defects are corrected. See `compat/README.md` for the active/degraded/disabled matrix. No driver is installed automatically.
 
 The default build is unsigned development output. Do not load it on a production machine. Use the isolated test-VM procedure in `docs/TEST_VM.md`. The current code has been compiled but has not been installed or runtime-tested.
 

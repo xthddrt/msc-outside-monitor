@@ -1,0 +1,24 @@
+# build output (build.cmd, build2/, build3/, ...)
+build/
+build[0-9]*/
+
+# compiled artefacts
+*.obj
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.exe
+*.sys
+*.dll
+*.res
+
+# symbol cache / crash dumps / logs
+build*/symcache/
+*.dmp
+*.log
+
+# editor / OS noise
+.vs/
+Thumbs.db
+desktop.ini

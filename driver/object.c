@@ -107,6 +107,11 @@ NTSTATUS MsMonObjectInitialize(PDRIVER_OBJECT DriverObject)
     return ObRegisterCallbacks(&registration, &gObjectRegistration);
 }
 
+BOOLEAN MsMonObjectAvailable(VOID)
+{
+    return gObjectRegistration != NULL;
+}
+
 VOID MsMonObjectUninitialize(VOID)
 {
     if (gObjectRegistration != NULL) {

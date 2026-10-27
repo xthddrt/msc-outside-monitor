@@ -27,6 +27,15 @@ static NTSTATUS MsMonStartSession(PMSMON_SESSION_CONFIG Config)
     if (!NT_SUCCESS(status)) return status;
     status = MsMonProcessStartSession(&root);
     if (NT_SUCCESS(status)) status = MsMonAttributionRefresh();
+    if (NT_SUCCESS(status) && !MsMonObjectAvailable()) {
+        UNICODE_STRING text;
+        UNICODE_STRING detail;
+        RtlInitUnicodeString(&text, L"object_callbacks_unavailable");
+        RtlInitUnicodeString(&detail, L"Process and thread handle events are disabled; other monitoring remains active");
+        (VOID)MsMonLogEvent(MsMonCoverage, PsGetCurrentProcessId(), NULL, PsGetCurrentThreadId(),
+                            NULL, 0, MsMonFlagObserverRecord, STATUS_SUCCESS, 0,
+                            MsMonCategoryUnknown, 0, 0, &text, &detail);
+    }
     if (!NT_SUCCESS(status)) {
         MsMonProcessStopSession();
         MsMonEventsStop();
@@ -164,7 +173,13 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     }
     status = MsMonEventsInitialize();
     if (NT_SUCCESS(status)) status = MsMonProcessInitialize();
-    if (NT_SUCCESS(status)) status = MsMonObjectInitialize(DriverObject);
+    if (NT_SUCCESS(status)) {
+        status = MsMonObjectInitialize(DriverObject);
+        if (!NT_SUCCESS(status)) {
+            DbgPrint("MsMon: ObRegisterCallbacks unavailable; continuing without object events\n");
+            status = STATUS_SUCCESS;
+        }
+    }
     if (NT_SUCCESS(status)) status = MsMonFileFilterInitialize(DriverObject);
     if (NT_SUCCESS(status)) status = MsMonRegistryInitialize(DriverObject);
     if (NT_SUCCESS(status)) status = MsMonNetworkInitialize(deviceObject);
