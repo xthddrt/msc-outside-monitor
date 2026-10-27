@@ -32,7 +32,8 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="driver.c" /><ClCompile Include="events.c" /><ClCompile Include="process.c" />
-    <ClCompile Include="file_filter.c" /><ClCompile Include="registry.c" /><ClCompile Include="network.c" />
+    <ClCompile Include="object.c" /><ClCompile Include="file_filter.c" />
+    <ClCompile Include="registry.c" /><ClCompile Include="network.c" />
   </ItemGroup>
   <ItemGroup><ClInclude Include="msmon.h" /><ClInclude Include="..\include\msmon_protocol.h" /><Inf Include="msmon.inf" /></ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

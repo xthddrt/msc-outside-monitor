@@ -1,18 +1,15 @@
-#include <windows.h>
-#include <bcrypt.h>
+#include "telemetry.h"
+#include "classify.h"
+#include "etw.h"
 #include <tlhelp32.h>
 #include <atomic>
-#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <fstream>
-#include <iomanip>
 #include <iostream>
+#include <memory>
+#include <set>
 #include <sstream>
-#include <string>
-#include <vector>
-#include "../include/msmon_protocol.h"
 
 static std::atomic<bool> gStop(false);
 
@@ -25,318 +22,482 @@ static BOOL WINAPI ConsoleHandler(DWORD type)
     return FALSE;
 }
 
-static std::string WideToUtf8(const wchar_t* value)
+static uint64_t FileTimeValue(const FILETIME& value)
 {
-    if (value == nullptr || *value == L'\0') return {};
-    int size = WideCharToMultiByte(CP_UTF8, 0, value, -1, nullptr, 0, nullptr, nullptr);
-    if (size <= 1) return {};
-    std::string result(static_cast<size_t>(size), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, value, -1, result.data(), size, nullptr, nullptr);
-    result.resize(static_cast<size_t>(size - 1));
-    return result;
+    return (static_cast<uint64_t>(value.dwHighDateTime) << 32) | value.dwLowDateTime;
 }
 
-static std::string JsonEscape(const std::string& value)
+static uint64_t Now()
 {
-    std::ostringstream output;
-    for (unsigned char c : value) {
-        switch (c) {
-        case '"': output << "\\\""; break;
-        case '\\': output << "\\\\"; break;
-        case '\b': output << "\\b"; break;
-        case '\f': output << "\\f"; break;
-        case '\n': output << "\\n"; break;
-        case '\r': output << "\\r"; break;
-        case '\t': output << "\\t"; break;
-        default:
-            if (c < 0x20) {
-                output << "\\u" << std::hex << std::setw(4) << std::setfill('0') << static_cast<unsigned>(c)
-                       << std::dec << std::setfill(' ');
-            } else {
-                output << static_cast<char>(c);
-            }
-        }
+    FILETIME value;
+    GetSystemTimeAsFileTime(&value);
+    return FileTimeValue(value);
+}
+
+static std::wstring FullPath(const std::wstring& input)
+{
+    DWORD needed = GetFullPathNameW(input.c_str(), 0, nullptr, nullptr);
+    if (needed == 0) return {};
+    std::wstring output(needed, L'\0');
+    if (GetFullPathNameW(input.c_str(), needed, output.data(), nullptr) == 0) return {};
+    output.resize(std::wcslen(output.c_str()));
+    while (output.size() > 3 && output.back() == L'\\') output.pop_back();
+    return output;
+}
+
+static bool DevicePath(const std::wstring& dosPath, std::wstring& devicePath, std::string& error)
+{
+    if (dosPath.size() < 3 || dosPath[1] != L':') {
+        error = "Only local drive-letter client paths are supported";
+        return false;
     }
-    return output.str();
-}
-
-static const char* EventTypeName(unsigned long type)
-{
-    switch (type) {
-    case MsMonProcessStart: return "process_start";
-    case MsMonProcessExit: return "process_exit";
-    case MsMonThreadStart: return "thread_start";
-    case MsMonThreadExit: return "thread_exit";
-    case MsMonImageLoad: return "image_load";
-    case MsMonFileCreate: return "file_create";
-    case MsMonFileRead: return "file_read";
-    case MsMonFileWrite: return "file_write";
-    case MsMonFileSetInformation: return "file_set_information";
-    case MsMonRegistryOpen: return "registry_open";
-    case MsMonRegistryCreate: return "registry_create";
-    case MsMonRegistrySetValue: return "registry_set_value";
-    case MsMonRegistryDelete: return "registry_delete";
-    case MsMonRegistryRename: return "registry_rename";
-    case MsMonRegistryQuery: return "registry_query";
-    case MsMonRegistryEnumerate: return "registry_enumerate";
-    case MsMonNetworkConnect: return "network_connect";
-    case MsMonNetworkAccept: return "network_accept";
-    default: return "unknown";
+    wchar_t drive[3] = {dosPath[0], L':', L'\0'};
+    wchar_t device[32768];
+    DWORD length = QueryDosDeviceW(drive, device, static_cast<DWORD>(std::size(device)));
+    if (length == 0) {
+        error = "QueryDosDevice failed with Win32 " + std::to_string(GetLastError());
+        return false;
     }
+    devicePath = device + dosPath.substr(2);
+    return true;
 }
 
-static std::string Timestamp(uint64_t value)
+static bool ProcessIdentity(DWORD pid, std::wstring& path, uint64_t& startTime)
 {
-    FILETIME fileTime{};
-    SYSTEMTIME systemTime{};
-    fileTime.dwLowDateTime = static_cast<DWORD>(value & 0xffffffff);
-    fileTime.dwHighDateTime = static_cast<DWORD>(value >> 32);
-    if (!FileTimeToSystemTime(&fileTime, &systemTime)) return {};
-    char buffer[32];
-    std::snprintf(buffer, sizeof(buffer), "%04u-%02u-%02uT%02u:%02u:%02u.%03uZ",
-                  systemTime.wYear, systemTime.wMonth, systemTime.wDay,
-                  systemTime.wHour, systemTime.wMinute, systemTime.wSecond, systemTime.wMilliseconds);
-    return buffer;
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (process == nullptr) return false;
+    DWORD size = 32768;
+    path.resize(size);
+    BOOL ok = QueryFullProcessImageNameW(process, 0, path.data(), &size);
+    FILETIME created{}, exited{}, kernel{}, user{};
+    if (ok) {
+        path.resize(size);
+        ok = GetProcessTimes(process, &created, &exited, &kernel, &user);
+        if (ok) startTime = FileTimeValue(created);
+    }
+    CloseHandle(process);
+    return ok != 0;
 }
 
-static std::string Sha256(const std::string& input)
+static bool EqualPath(const std::wstring& left, const std::wstring& right)
 {
-    BCRYPT_ALG_HANDLE algorithm = nullptr;
-    BCRYPT_HASH_HANDLE hash = nullptr;
-    DWORD objectSize = 0;
-    DWORD resultSize = 0;
-    std::vector<unsigned char> object;
-    unsigned char digest[32];
-    std::ostringstream hex;
-
-    if (BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0) != 0) return {};
-    if (BCryptGetProperty(algorithm, BCRYPT_OBJECT_LENGTH, reinterpret_cast<PUCHAR>(&objectSize),
-                          sizeof(objectSize), &resultSize, 0) != 0) {
-        BCryptCloseAlgorithmProvider(algorithm, 0);
-        return {};
-    }
-    object.resize(objectSize);
-    if (BCryptCreateHash(algorithm, &hash, object.data(), objectSize, nullptr, 0, 0) != 0 ||
-        BCryptHashData(hash, reinterpret_cast<PUCHAR>(const_cast<char*>(input.data())),
-                       static_cast<ULONG>(input.size()), 0) != 0 ||
-        BCryptFinishHash(hash, digest, sizeof(digest), 0) != 0) {
-        if (hash != nullptr) BCryptDestroyHash(hash);
-        BCryptCloseAlgorithmProvider(algorithm, 0);
-        return {};
-    }
-    BCryptDestroyHash(hash);
-    BCryptCloseAlgorithmProvider(algorithm, 0);
-    hex << std::hex << std::setfill('0');
-    for (unsigned char byte : digest) hex << std::setw(2) << static_cast<unsigned>(byte);
-    return hex.str();
+    return _wcsicmp(left.c_str(), right.c_str()) == 0;
 }
 
-class JsonlWriter {
+class DeviceSession {
 public:
-    explicit JsonlWriter(std::string basePath, uint64_t maximumBytes)
-        : basePath_(std::move(basePath)), maximumBytes_(maximumBytes), chain_(64, '0') {}
+    ~DeviceSession()
+    {
+        if (started_) {
+            DWORD bytes = 0;
+            (void)DeviceIoControl(handle_, MSMON_IOCTL_STOP_SESSION, nullptr, 0, nullptr, 0, &bytes, nullptr);
+        }
+        if (handle_ != INVALID_HANDLE_VALUE) CloseHandle(handle_);
+    }
 
     bool Open()
     {
-        stream_.open(basePath_, std::ios::binary | std::ios::trunc);
-        bytes_ = 0;
-        return static_cast<bool>(stream_);
+        handle_ = CreateFileA(MSMON_USER_DEVICE_PATH, GENERIC_READ | GENERIC_WRITE,
+                              0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        return handle_ != INVALID_HANDLE_VALUE;
     }
 
-    bool Write(std::string json)
+    bool Start(MSMON_SESSION_CONFIG& config)
     {
-        if (maximumBytes_ != 0 && bytes_ > maximumBytes_) {
-            stream_.close();
-            std::ostringstream rotated;
-            rotated << basePath_ << "." << ++part_;
-            stream_.open(rotated.str(), std::ios::binary | std::ios::trunc);
-            if (!stream_) return false;
-            bytes_ = 0;
-        }
-        std::string chainedInput = chain_ + json;
-        chain_ = Sha256(chainedInput);
-        if (chain_.empty()) return false;
-        std::string line = json.substr(0, json.size() - 1) + ",\"chain\":\"" + chain_ + "\"}\n";
-        stream_.write(line.data(), static_cast<std::streamsize>(line.size()));
-        stream_.flush();
-        bytes_ += line.size();
-        return static_cast<bool>(stream_);
+        DWORD bytes = 0;
+        started_ = DeviceIoControl(handle_, MSMON_IOCTL_START_SESSION, &config, sizeof(config),
+                                   nullptr, 0, &bytes, nullptr) != 0;
+        return started_;
+    }
+
+    bool Track(DWORD pid, uint64_t startTime, ULONG flags)
+    {
+        MSMON_TRACK_REQUEST request{pid, flags, startTime};
+        DWORD bytes = 0;
+        return DeviceIoControl(handle_, MSMON_IOCTL_TRACK_PID, &request, sizeof(request),
+                               nullptr, 0, &bytes, nullptr) != 0;
+    }
+
+    bool Read(DWORD waitMs, std::vector<BYTE>& buffer, DWORD& bytes)
+    {
+        MSMON_READ_REQUEST request{waitMs, static_cast<ULONG>(buffer.size())};
+        bytes = 0;
+        return DeviceIoControl(handle_, MSMON_IOCTL_READ_EVENTS, &request, sizeof(request),
+                               buffer.data(), static_cast<DWORD>(buffer.size()), &bytes, nullptr) != 0;
+    }
+
+    bool StopTracking()
+    {
+        DWORD bytes = 0;
+        return DeviceIoControl(handle_, MSMON_IOCTL_STOP_TRACKING, nullptr, 0,
+                               nullptr, 0, &bytes, nullptr) != 0;
+    }
+
+    bool Statistics(MSMON_STATISTICS& statistics)
+    {
+        DWORD bytes = 0;
+        return DeviceIoControl(handle_, MSMON_IOCTL_STATISTICS, nullptr, 0,
+                               &statistics, sizeof(statistics), &bytes, nullptr) != 0;
     }
 
 private:
-    std::string basePath_;
-    uint64_t maximumBytes_;
-    uint64_t bytes_ = 0;
-    unsigned part_ = 0;
-    std::ofstream stream_;
-    std::string chain_;
+    HANDLE handle_ = INVALID_HANDLE_VALUE;
+    bool started_ = false;
 };
 
-static std::string EventJson(const MSMON_EVENT& event)
+static bool KnownClientImage(const std::wstring& root, const std::wstring& image)
 {
-    std::ostringstream json;
-    json << "{\"protocol\":" << event.Version
-         << ",\"sequence\":" << event.Sequence
-         << ",\"timestamp\":\"" << Timestamp(event.Timestamp)
-         << "\",\"type\":\"" << EventTypeName(event.Type)
-         << "\",\"type_id\":" << event.Type
-         << ",\"process_id\":" << event.ProcessId
-         << ",\"parent_process_id\":" << event.ParentProcessId
-         << ",\"thread_id\":" << event.ThreadId
-         << ",\"flags\":" << event.Flags
-         << ",\"status\":" << event.Status
-         << ",\"value0\":" << event.Value0
-         << ",\"value1\":" << event.Value1
-         << ",\"text\":\"" << JsonEscape(WideToUtf8(event.Text))
-         << "\",\"detail\":\"" << JsonEscape(WideToUtf8(event.Detail)) << "\"}";
-    return json.str();
+    static const wchar_t* relative[] = {
+        L"\\MapleStory.exe", L"\\grap\\NGService.exe",
+        L"\\NxOverlay\\DwarfAxe.exe", L"\\CrashReportClient.exe"
+    };
+    for (const auto* suffix : relative) {
+        if (EqualPath(image, root + suffix)) return true;
+    }
+    return false;
 }
 
-static bool TrackPid(HANDLE device, DWORD pid)
-{
-    DWORD bytes = 0;
-    return DeviceIoControl(device, MSMON_IOCTL_TRACK_PID, &pid, sizeof(pid), nullptr, 0, &bytes, nullptr) != 0;
-}
-
-static unsigned TrackExistingClientProcesses(HANDLE device)
+static unsigned TrackExisting(DeviceSession& device, const std::wstring& clientRoot,
+                              ProcessScope& scope)
 {
     HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    PROCESSENTRY32W entry{};
-    unsigned tracked = 0;
     if (snapshot == INVALID_HANDLE_VALUE) return 0;
+    std::vector<PROCESSENTRY32W> processes;
+    PROCESSENTRY32W entry{};
     entry.dwSize = sizeof(entry);
     if (Process32FirstW(snapshot, &entry)) {
         do {
-            if (_wcsicmp(entry.szExeFile, L"MapleStory.exe") == 0 ||
-                _wcsicmp(entry.szExeFile, L"NGService.exe") == 0 ||
-                _wcsicmp(entry.szExeFile, L"DwarfAxe.exe") == 0 ||
-                _wcsicmp(entry.szExeFile, L"CrashReportClient.exe") == 0) {
-                if (TrackPid(device, entry.th32ProcessID)) tracked++;
-            }
+            processes.push_back(entry);
         } while (Process32NextW(snapshot, &entry));
     }
     CloseHandle(snapshot);
-    return tracked;
+
+    std::set<DWORD> tracked;
+    unsigned count = 0;
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (const auto& process : processes) {
+            if (tracked.count(process.th32ProcessID) != 0) continue;
+            bool inherited = tracked.count(process.th32ParentProcessID) != 0;
+            std::wstring path;
+            uint64_t startTime = 0;
+            if (!ProcessIdentity(process.th32ProcessID, path, startTime)) continue;
+            if (!inherited && !KnownClientImage(clientRoot, path)) continue;
+            ULONG flags = inherited ? MsMonFlagInheritedTrack : MsMonFlagExplicitTrack;
+            if (device.Track(process.th32ProcessID, startTime, flags)) {
+                tracked.insert(process.th32ProcessID);
+                scope.AddProcess(process.th32ProcessID, startTime, path);
+                count++;
+                changed = true;
+            }
+        }
+    }
+    return count;
 }
 
-static std::string DefaultOutputPath()
+static std::wstring DefaultOutputPath()
 {
     SYSTEMTIME time{};
     GetLocalTime(&time);
-    char path[128];
-    std::snprintf(path, sizeof(path), "msmon-%04u%02u%02u-%02u%02u%02u.jsonl",
-                  time.wYear, time.wMonth, time.wDay, time.wHour, time.wMinute, time.wSecond);
+    wchar_t path[128];
+    swprintf_s(path, L"msmon-%04u%02u%02u-%02u%02u%02u.jsonl",
+               time.wYear, time.wMonth, time.wDay, time.wHour, time.wMinute, time.wSecond);
     return path;
 }
 
 static void Usage()
 {
-    std::cout << "Usage: msmon-agent [--output FILE] [--pid PID] [--wait-ms N] "
-                 "[--max-file-mb N] [--once]\n";
+    std::cout << "Usage: msmon-agent [--client DIRECTORY] [--output FILE] [--pid PID] "
+                 "[--wait-ms N] [--max-file-mb N] [--queue-records N] [--queue-mb N] "
+                 "[--no-etw] [--once]\n";
+}
+
+static bool ParseNumber(const wchar_t* text, uint64_t& value)
+{
+    wchar_t* end = nullptr;
+    value = std::wcstoull(text, &end, 10);
+    return end != text && end != nullptr && *end == L'\0';
 }
 
 int wmain(int argc, wchar_t** argv)
 {
-    std::string output = DefaultOutputPath();
-    unsigned long waitMs = 500;
+    std::wstring clientRoot = L"C:\\Nexon\\Library\\maplestorycw\\appdata";
+    std::wstring output = DefaultOutputPath();
+    uint64_t waitMs = 100;
     uint64_t maxFileBytes = 64ull * 1024ull * 1024ull;
+    uint64_t queueRecords = MSMON_DEFAULT_QUEUE_RECORDS;
+    uint64_t queueBytes = MSMON_DEFAULT_QUEUE_BYTES;
     bool once = false;
+    bool enableEtw = true;
     std::vector<DWORD> explicitPids;
 
     for (int index = 1; index < argc; index++) {
         std::wstring argument = argv[index];
+        uint64_t value = 0;
         if (argument == L"--help" || argument == L"-h") {
             Usage();
             return 0;
         } else if (argument == L"--once") {
             once = true;
+        } else if (argument == L"--no-etw") {
+            enableEtw = false;
+        } else if (index + 1 < argc && argument == L"--client") {
+            clientRoot = argv[++index];
         } else if (index + 1 < argc && argument == L"--output") {
-            output = WideToUtf8(argv[++index]);
-        } else if (index + 1 < argc && argument == L"--wait-ms") {
-            waitMs = std::wcstoul(argv[++index], nullptr, 10);
-        } else if (index + 1 < argc && argument == L"--max-file-mb") {
-            maxFileBytes = std::wcstoull(argv[++index], nullptr, 10) * 1024ull * 1024ull;
-        } else if (index + 1 < argc && argument == L"--pid") {
-            explicitPids.push_back(std::wcstoul(argv[++index], nullptr, 10));
+            output = argv[++index];
+        } else if (index + 1 < argc && argument == L"--wait-ms" && ParseNumber(argv[index + 1], value)) {
+            waitMs = value;
+            index++;
+        } else if (index + 1 < argc && argument == L"--max-file-mb" && ParseNumber(argv[index + 1], value)) {
+            maxFileBytes = value * 1024ull * 1024ull;
+            index++;
+        } else if (index + 1 < argc && argument == L"--queue-records" && ParseNumber(argv[index + 1], value)) {
+            queueRecords = value;
+            index++;
+        } else if (index + 1 < argc && argument == L"--queue-mb" && ParseNumber(argv[index + 1], value)) {
+            queueBytes = value * 1024ull * 1024ull;
+            index++;
+        } else if (index + 1 < argc && argument == L"--pid" && ParseNumber(argv[index + 1], value) && value <= MAXDWORD) {
+            explicitPids.push_back(static_cast<DWORD>(value));
+            index++;
         } else {
             Usage();
             return 2;
         }
     }
 
-    HANDLE device = CreateFileA(MSMON_USER_DEVICE_PATH, GENERIC_READ | GENERIC_WRITE,
-                                0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (device == INVALID_HANDLE_VALUE) {
-        std::cerr << "Cannot open " << MSMON_USER_DEVICE_PATH << ": Win32 error " << GetLastError()
-                  << ". Build and test-load the driver in an isolated test VM first.\n";
+    clientRoot = FullPath(clientRoot);
+    if (clientRoot.empty()) {
+        std::cerr << "Could not resolve the client root.\n";
         return 1;
     }
-    std::cout << "Registered " << TrackExistingClientProcesses(device) << " running client processes.\n";
-    for (DWORD pid : explicitPids) {
-        if (!TrackPid(device, pid)) std::cerr << "Could not track PID " << pid << ".\n";
+    std::wstring clientNt;
+    std::string error;
+    if (!DevicePath(clientRoot, clientNt, error)) {
+        std::cerr << error << "\n";
+        return 1;
     }
+    wchar_t windowsBuffer[32768];
+    if (GetWindowsDirectoryW(windowsBuffer, static_cast<UINT>(std::size(windowsBuffer))) == 0) {
+        std::cerr << "Could not resolve the Windows directory.\n";
+        return 1;
+    }
+    std::wstring windowsDos = windowsBuffer;
+    std::wstring windowsNt;
+    if (!DevicePath(windowsDos, windowsNt, error)) {
+        std::cerr << error << "\n";
+        return 1;
+    }
+
+    uint64_t sessionId = Now() ^ (static_cast<uint64_t>(GetCurrentProcessId()) << 32) ^ GetTickCount64();
+    if (sessionId == 0) sessionId = 1;
+    MSMON_SESSION_CONFIG config{};
+    config.SessionId = sessionId;
+    config.QueueRecords = static_cast<ULONG>(queueRecords);
+    config.QueueBytes = static_cast<ULONG>(queueBytes);
+    if (clientNt.size() >= MSMON_CLIENT_PATH_CHARS) {
+        std::cerr << "The client NT path is too long for the session configuration.\n";
+        return 1;
+    }
+    wcscpy_s(config.ClientRoot, MSMON_CLIENT_PATH_CHARS, clientNt.c_str());
+
+    DeviceSession device;
+    if (!device.Open()) {
+        std::cerr << "Cannot open " MSMON_USER_DEVICE_PATH ": Win32 error " << GetLastError()
+                  << ". Use a properly signed driver in an isolated test VM.\n";
+        return 1;
+    }
+    if (!device.Start(config)) {
+        std::cerr << "Could not start the driver session: Win32 error " << GetLastError() << "\n";
+        return 1;
+    }
+
+    ProcessScope scope;
+    unsigned registered = TrackExisting(device, clientRoot, scope);
+    for (DWORD pid : explicitPids) {
+        std::wstring path;
+        uint64_t startTime = 0;
+        if (ProcessIdentity(pid, path, startTime) && device.Track(pid, startTime, MsMonFlagExplicitTrack)) {
+            scope.AddProcess(pid, startTime, path);
+            registered++;
+        } else {
+            std::cerr << "Could not track explicit PID " << pid << ".\n";
+        }
+    }
+    std::cout << "Registered " << registered << " client/helper/descendant processes.\n";
 
     JsonlWriter writer(output, maxFileBytes);
     if (!writer.Open()) {
         std::cerr << "Cannot open output log.\n";
-        CloseHandle(device);
         return 1;
     }
-    SetConsoleCtrlHandler(ConsoleHandler, TRUE);
-    std::cout << "Writing " << output << "\n";
+    OutsideClassifier classifier(clientRoot, clientNt, windowsDos, windowsNt);
+    SessionSummary summary;
+    EventQueue etwQueue;
+    std::unique_ptr<EtwCollector> etw;
 
-    uint64_t previousSequence = 0;
-    uint64_t totalEvents = 0;
-    uint64_t totalGaps = 0;
-    do {
-        MSMON_READ_REQUEST request{waitMs, MSMON_READ_MAX_EVENTS};
-        MSMON_EVENT events[MSMON_READ_MAX_EVENTS];
-        DWORD bytes = 0;
-        BOOL ok = DeviceIoControl(device, MSMON_IOCTL_READ_EVENTS, &request, sizeof(request),
-                                  events, sizeof(events), &bytes, nullptr);
-        if (!ok) {
-            std::cerr << "Read failed: Win32 error " << GetLastError() << "\n";
-            CloseHandle(device);
-            return 1;
-        }
-        if (bytes % sizeof(MSMON_EVENT) != 0) {
-            std::cerr << "Driver returned a partial event.\n";
-            CloseHandle(device);
-            return 1;
-        }
-        unsigned count = bytes / sizeof(MSMON_EVENT);
-        for (unsigned index = 0; index < count; index++) {
-            const MSMON_EVENT& event = events[index];
-            if (event.Size != sizeof(MSMON_EVENT) || event.Version != MSMON_PROTOCOL_VERSION) {
-                std::cerr << "Protocol version mismatch.\n";
-                CloseHandle(device);
-                return 1;
-            }
-            if (previousSequence != 0 && event.Sequence > previousSequence + 1) {
-                uint64_t gap = event.Sequence - previousSequence - 1;
-                totalGaps += gap;
-                std::ostringstream json;
-                json << "{\"type\":\"observer_sequence_gap\",\"after_sequence\":" << previousSequence
-                     << ",\"before_sequence\":" << event.Sequence << ",\"missing_events\":" << gap << "}";
-                if (!writer.Write(json.str())) return 1;
-            }
-            if (!writer.Write(EventJson(event))) {
-                std::cerr << "Could not write log.\n";
-                CloseHandle(device);
-                return 1;
-            }
-            previousSequence = event.Sequence;
-            totalEvents++;
-        }
-    } while (!once && !gStop.load());
+    auto writeCoverage = [&](const std::wstring& text, const std::wstring& detail,
+                             ULONG attribution = MsMonAttributionUnknown) {
+        TelemetryEvent event;
+        event.source = "agent";
+        event.header.Size = sizeof(event.header);
+        event.header.Version = MSMON_PROTOCOL_VERSION;
+        event.header.Type = MsMonCoverage;
+        event.header.Flags = MsMonFlagObserverRecord;
+        event.header.Timestamp = Now();
+        event.header.SessionId = sessionId;
+        event.header.Attribution = attribution;
+        event.text = text;
+        event.detail = detail;
+        event.outsideClient = false;
+        return writer.Write(TelemetryJson(event));
+    };
 
-    MSMON_STATISTICS statistics{};
-    DWORD bytes = 0;
-    if (DeviceIoControl(device, MSMON_IOCTL_STATISTICS, nullptr, 0,
-                        &statistics, sizeof(statistics), &bytes, nullptr)) {
-        std::cout << "Events written: " << totalEvents << "; sequence gaps: " << totalGaps
-                  << "; driver drops: " << statistics.DroppedEvents << "\n";
+    if (!writeCoverage(L"session_start", L"client_root=" + clientRoot)) return 1;
+    if (!writeCoverage(L"coverage_limit",
+                       L"Handle-less process/window snapshots, ALPC/COM payloads, brokered existing-browser launches, direct adapter APIs, protected processes, pre-start activity, and dropped events are not guaranteed")) return 1;
+    if (!writeCoverage(L"static_hardware_boundary",
+                       L"MachineIdLib.dll imports process/window enumeration, GetVolumeInformationA, and GetAdaptersInfo; static imports do not prove runtime invocation",
+                       MsMonAttributionStaticEvidence)) return 1;
+    if (enableEtw) {
+        etw = std::make_unique<EtwCollector>(scope, etwQueue, sessionId);
+        if (!etw->Start(error)) {
+            if (!writeCoverage(L"etw_unavailable", std::wstring(error.begin(), error.end()))) return 1;
+            etw.reset();
+        } else {
+            for (const auto& warning : etw->Warnings()) {
+                if (!writeCoverage(L"etw_provider_coverage", warning)) return 1;
+            }
+        }
+    } else if (!writeCoverage(L"etw_disabled", L"Started with --no-etw")) {
+        return 1;
     }
-    CloseHandle(device);
-    return 0;
+
+    SetConsoleCtrlHandler(ConsoleHandler, TRUE);
+    std::cout << "Writing " << WideToUtf8(output) << "\n";
+    std::vector<BYTE> buffer(MSMON_READ_MAX_BYTES);
+    uint64_t previousDriverSequence = 0;
+    uint64_t previousEtwSequence = 0;
+    uint64_t driverGaps = 0;
+    uint64_t etwGaps = 0;
+    uint64_t totalEvents = 0;
+    int result = 0;
+
+    auto writeGap = [&](const std::string& source, uint64_t after, uint64_t before) {
+        std::ostringstream json;
+        json << "{\"type\":\"observer_sequence_gap\",\"source\":\"" << source
+             << "\",\"after_sequence\":" << after << ",\"before_sequence\":" << before
+             << ",\"missing_events\":" << (before - after - 1) << "}";
+        return writer.Write(json.str());
+    };
+
+    auto writeEvent = [&](TelemetryEvent& event) {
+        if (event.source == "etw") {
+            if (event.header.Sequence > previousEtwSequence + 1) {
+                uint64_t gap = event.header.Sequence - previousEtwSequence - 1;
+                etwGaps += gap;
+                if (!writeGap("etw", previousEtwSequence, event.header.Sequence)) return false;
+            }
+            previousEtwSequence = event.header.Sequence;
+        }
+        classifier.Classify(event);
+        summary.Add(event);
+        totalEvents++;
+        return writer.Write(TelemetryJson(event));
+    };
+
+    auto drainEtw = [&]() {
+        std::vector<TelemetryEvent> events;
+        etwQueue.Drain(events, 8192);
+        for (auto& event : events) {
+            if (!writeEvent(event)) return false;
+        }
+        return true;
+    };
+
+    DWORD bytes = 0;
+    bool draining = false;
+    do {
+        if (!once && !draining && gStop.load()) {
+            if (!device.StopTracking()) {
+                std::cerr << "Could not stop driver tracking: Win32 error " << GetLastError() << "\n";
+                result = 1;
+                break;
+            }
+            draining = true;
+        }
+        if (!device.Read(draining ? 0 : static_cast<DWORD>(waitMs), buffer, bytes)) {
+            std::cerr << "Driver read failed: Win32 error " << GetLastError() << "\n";
+            result = 1;
+            break;
+        }
+        if (bytes > buffer.size()) {
+            std::cerr << "Driver returned an invalid byte count.\n";
+            result = 1;
+            break;
+        }
+        DWORD offset = 0;
+        while (offset < bytes) {
+            TelemetryEvent event;
+            DWORD consumed = 0;
+            if (!DecodeDriverEvent(buffer.data() + offset, bytes - offset, event, consumed, error) || consumed == 0) {
+                std::cerr << "Invalid driver event: " << error << "\n";
+                result = 1;
+                break;
+            }
+            offset += consumed;
+            if (event.header.SessionId != sessionId) {
+                std::cerr << "Driver returned an event from another session.\n";
+                result = 1;
+                break;
+            }
+            if (previousDriverSequence != 0 && event.header.Sequence <= previousDriverSequence) {
+                std::cerr << "Driver sequence is not increasing.\n";
+                result = 1;
+                break;
+            }
+            if (event.header.Sequence > previousDriverSequence + 1) {
+                uint64_t gap = event.header.Sequence - previousDriverSequence - 1;
+                driverGaps += gap;
+                if (!writeGap("driver", previousDriverSequence, event.header.Sequence)) {
+                    result = 1;
+                    break;
+                }
+            }
+            previousDriverSequence = event.header.Sequence;
+            if (event.header.Type == MsMonProcessStart) {
+                uint64_t start = event.header.ProcessStartTime != 0 ? event.header.ProcessStartTime : event.header.Value0;
+                scope.AddProcess(event.header.ProcessId, start, event.text);
+            } else if (event.header.Type == MsMonProcessExit) {
+                scope.RemoveProcess(event.header.ProcessId, event.header.ProcessStartTime);
+            } else if (event.header.Type == MsMonImageLoad) {
+                scope.AddImage(event.header.ProcessId, event.header.Value0, event.header.Value1, event.text);
+            }
+            if (!writeEvent(event)) {
+                std::cerr << "Could not write the event log.\n";
+                result = 1;
+                break;
+            }
+        }
+        if (result != 0 || !drainEtw()) {
+            result = 1;
+            break;
+        }
+    } while (!once && (!draining || bytes != 0));
+
+    if (etw != nullptr) etw->Stop();
+    if (!drainEtw()) result = 1;
+    MSMON_STATISTICS statistics{};
+    if (!device.Statistics(statistics)) {
+        std::cerr << "Could not read final driver statistics.\n";
+        result = 1;
+    } else {
+        if (!writer.Write(summary.Json(statistics, etwQueue.Dropped(), driverGaps, etwGaps))) result = 1;
+        std::cout << "Events written: " << totalEvents << "; driver gaps: " << driverGaps
+                  << "; ETW gaps: " << etwGaps << "; driver drops: " << statistics.DroppedEvents
+                  << "; ETW queue drops: " << etwQueue.Dropped() << "\n";
+    }
+    SetConsoleCtrlHandler(ConsoleHandler, FALSE);
+    return result;
 }

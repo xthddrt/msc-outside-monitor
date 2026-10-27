@@ -11,66 +11,142 @@ typedef struct _MSMON_PROCESS_ENTRY {
 static LIST_ENTRY gProcesses;
 static KSPIN_LOCK gProcessLock;
 static volatile LONG gProcessCount;
+static UNICODE_STRING gClientRoot;
+static KMUTEX gRootMutex;
+static BOOLEAN gSessionActive;
+
+static BOOLEAN MsMonImageMatches(PCUNICODE_STRING ImageFileName, PCWSTR RelativePath)
+{
+    UNICODE_STRING relative;
+    UNICODE_STRING candidate;
+    if (!gSessionActive || gClientRoot.Buffer == NULL || ImageFileName == NULL || ImageFileName->Buffer == NULL) {
+        return FALSE;
+    }
+    RtlInitUnicodeString(&relative, RelativePath);
+    if (ImageFileName->Length != gClientRoot.Length + relative.Length) return FALSE;
+    if (ImageFileName->Length < gClientRoot.Length ||
+        !RtlPrefixUnicodeString(&gClientRoot, ImageFileName, TRUE)) return FALSE;
+    candidate.Buffer = (PWSTR)((PUCHAR)ImageFileName->Buffer + gClientRoot.Length);
+    candidate.Length = relative.Length;
+    candidate.MaximumLength = relative.Length;
+    return RtlEqualUnicodeString(&candidate, &relative, TRUE);
+}
 
 static BOOLEAN MsMonKnownImage(PCUNICODE_STRING ImageFileName)
 {
-    static const WCHAR* names[] = {
-        L"MapleStory.exe", L"NGService.exe", L"DwarfAxe.exe", L"CrashReportClient.exe"
-    };
-    UNICODE_STRING image;
-    UNICODE_STRING base;
-    UNICODE_STRING expected;
-    ULONG index;
-    USHORT start;
-
-    if (ImageFileName == NULL || ImageFileName->Buffer == NULL || ImageFileName->Length == 0) {
-        return FALSE;
-    }
-    image = *ImageFileName;
-    base = image;
-    for (start = 0; start + sizeof(WCHAR) <= image.Length; start += sizeof(WCHAR)) {
-        if (image.Buffer[start / sizeof(WCHAR)] == L'\\' || image.Buffer[start / sizeof(WCHAR)] == L'/') {
-            base.Buffer = &image.Buffer[start / sizeof(WCHAR) + 1];
-            base.Length = image.Length - start - sizeof(WCHAR);
-            base.MaximumLength = base.Length;
-        }
-    }
-    for (index = 0; index < RTL_NUMBER_OF(names); index++) {
-        RtlInitUnicodeString(&expected, names[index]);
-        if (RtlEqualUnicodeString(&base, &expected, TRUE)) {
-            return TRUE;
-        }
-    }
-    return FALSE;
+    BOOLEAN result;
+    (VOID)KeWaitForSingleObject(&gRootMutex, Executive, KernelMode, FALSE, NULL);
+    result = MsMonImageMatches(ImageFileName, L"\\MapleStory.exe") ||
+             MsMonImageMatches(ImageFileName, L"\\grap\\NGService.exe") ||
+             MsMonImageMatches(ImageFileName, L"\\NxOverlay\\DwarfAxe.exe") ||
+             MsMonImageMatches(ImageFileName, L"\\CrashReportClient.exe");
+    KeReleaseMutex(&gRootMutex, FALSE);
+    return result;
 }
 
-NTSTATUS MsMonTrackProcess(HANDLE ProcessId, BOOLEAN EmitEvent)
+static VOID MsMonClearProcesses(VOID)
+{
+    PLIST_ENTRY entry;
+    KIRQL oldIrql;
+    KeAcquireSpinLock(&gProcessLock, &oldIrql);
+    while (!IsListEmpty(&gProcesses)) {
+        entry = RemoveHeadList(&gProcesses);
+        ExFreePoolWithTag(CONTAINING_RECORD(entry, MSMON_PROCESS_ENTRY, Link), MSMON_POOL_TAG);
+    }
+    gProcessCount = 0;
+    KeReleaseSpinLock(&gProcessLock, oldIrql);
+}
+
+NTSTATUS MsMonProcessStartSession(PCUNICODE_STRING ClientRoot)
+{
+    PWSTR buffer;
+    PWSTR oldBuffer;
+    UNICODE_STRING normalized;
+    USHORT length;
+
+    if (ClientRoot == NULL || ClientRoot->Buffer == NULL || ClientRoot->Length == 0 ||
+        ClientRoot->Length >= MSMON_CLIENT_PATH_CHARS * sizeof(WCHAR)) return STATUS_INVALID_PARAMETER;
+    length = ClientRoot->Length;
+    while (length > 3 * sizeof(WCHAR) && ClientRoot->Buffer[length / sizeof(WCHAR) - 1] == L'\\') {
+        length -= sizeof(WCHAR);
+    }
+    buffer = ExAllocatePool2(POOL_FLAG_NON_PAGED, (SIZE_T)length + sizeof(WCHAR), MSMON_POOL_TAG);
+    if (buffer == NULL) return STATUS_INSUFFICIENT_RESOURCES;
+    RtlCopyMemory(buffer, ClientRoot->Buffer, length);
+    buffer[length / sizeof(WCHAR)] = L'\0';
+    RtlInitUnicodeString(&normalized, buffer);
+    normalized.Length = length;
+    normalized.MaximumLength = length + sizeof(WCHAR);
+
+    MsMonClearProcesses();
+    (VOID)KeWaitForSingleObject(&gRootMutex, Executive, KernelMode, FALSE, NULL);
+    oldBuffer = gClientRoot.Buffer;
+    gClientRoot = normalized;
+    gSessionActive = TRUE;
+    KeReleaseMutex(&gRootMutex, FALSE);
+    if (oldBuffer != NULL) ExFreePoolWithTag(oldBuffer, MSMON_POOL_TAG);
+    return STATUS_SUCCESS;
+}
+
+VOID MsMonProcessStopSession(VOID)
+{
+    PWSTR buffer;
+    (VOID)KeWaitForSingleObject(&gRootMutex, Executive, KernelMode, FALSE, NULL);
+    gSessionActive = FALSE;
+    buffer = gClientRoot.Buffer;
+    gClientRoot.Buffer = NULL;
+    gClientRoot.Length = 0;
+    gClientRoot.MaximumLength = 0;
+    KeReleaseMutex(&gRootMutex, FALSE);
+    if (buffer != NULL) ExFreePoolWithTag(buffer, MSMON_POOL_TAG);
+    MsMonClearProcesses();
+}
+
+NTSTATUS MsMonTrackProcess(HANDLE ProcessId, ULONG Flags)
 {
     PMSMON_PROCESS_ENTRY entry;
     PMSMON_PROCESS_ENTRY existing;
+    PMSMON_PROCESS_ENTRY stale = NULL;
     PLIST_ENTRY link;
     PEPROCESS process = NULL;
     KIRQL oldIrql;
     BOOLEAN duplicate = FALSE;
+    NTSTATUS status = STATUS_SUCCESS;
 
+    (VOID)KeWaitForSingleObject(&gRootMutex, Executive, KernelMode, FALSE, NULL);
+    if (!gSessionActive) {
+        KeReleaseMutex(&gRootMutex, FALSE);
+        return STATUS_DEVICE_NOT_READY;
+    }
     entry = ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(*entry), MSMON_POOL_TAG);
     if (entry == NULL) {
+        KeReleaseMutex(&gRootMutex, FALSE);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
     RtlZeroMemory(entry, sizeof(*entry));
     entry->ProcessId = ProcessId;
-    entry->Flags = MsMonFlagExplicitTrack;
+    entry->Flags = Flags;
     if (NT_SUCCESS(PsLookupProcessByProcessId(ProcessId, &process))) {
         entry->StartTime = PsGetProcessCreateTimeQuadPart(process);
         entry->ParentProcessId = NULL;
         ObDereferenceObject(process);
+    } else {
+        ExFreePoolWithTag(entry, MSMON_POOL_TAG);
+        KeReleaseMutex(&gRootMutex, FALSE);
+        return STATUS_NOT_FOUND;
     }
 
     KeAcquireSpinLock(&gProcessLock, &oldIrql);
     for (link = gProcesses.Flink; link != &gProcesses; link = link->Flink) {
         existing = CONTAINING_RECORD(link, MSMON_PROCESS_ENTRY, Link);
         if (existing->ProcessId == ProcessId) {
-            duplicate = TRUE;
+            if (existing->StartTime == entry->StartTime) {
+                duplicate = TRUE;
+            } else {
+                RemoveEntryList(&existing->Link);
+                stale = existing;
+                InterlockedDecrement(&gProcessCount);
+            }
             break;
         }
     }
@@ -79,29 +155,22 @@ NTSTATUS MsMonTrackProcess(HANDLE ProcessId, BOOLEAN EmitEvent)
         InterlockedIncrement(&gProcessCount);
     }
     KeReleaseSpinLock(&gProcessLock, oldIrql);
-
-    if (duplicate) {
-        ExFreePoolWithTag(entry, MSMON_POOL_TAG);
-        return STATUS_SUCCESS;
-    }
-    if (EmitEvent) {
-        (VOID)MsMonLogEvent(MsMonProcessStart, ProcessId, entry->ParentProcessId, NULL,
-                            entry->Flags, STATUS_SUCCESS, (ULONGLONG)entry->StartTime, 0, NULL, NULL);
-    }
-    return STATUS_SUCCESS;
+    KeReleaseMutex(&gRootMutex, FALSE);
+    if (stale != NULL) ExFreePoolWithTag(stale, MSMON_POOL_TAG);
+    if (duplicate) ExFreePoolWithTag(entry, MSMON_POOL_TAG);
+    return status;
 }
 
 BOOLEAN MsMonIsTracked(HANDLE ProcessId, LONGLONG StartTime)
 {
     PLIST_ENTRY link;
-    PMSMON_PROCESS_ENTRY entry;
     KIRQL oldIrql;
     BOOLEAN found = FALSE;
-
     KeAcquireSpinLock(&gProcessLock, &oldIrql);
     for (link = gProcesses.Flink; link != &gProcesses; link = link->Flink) {
-        entry = CONTAINING_RECORD(link, MSMON_PROCESS_ENTRY, Link);
-        if (entry->ProcessId == ProcessId && (StartTime == 0 || entry->StartTime == 0 || entry->StartTime == StartTime)) {
+        PMSMON_PROCESS_ENTRY entry = CONTAINING_RECORD(link, MSMON_PROCESS_ENTRY, Link);
+        if (entry->ProcessId == ProcessId &&
+            (StartTime == 0 || entry->StartTime == 0 || entry->StartTime == StartTime)) {
             found = TRUE;
             break;
         }
@@ -110,87 +179,103 @@ BOOLEAN MsMonIsTracked(HANDLE ProcessId, LONGLONG StartTime)
     return found;
 }
 
+LONGLONG MsMonProcessStartTime(HANDLE ProcessId)
+{
+    PLIST_ENTRY link;
+    KIRQL oldIrql;
+    LONGLONG startTime = 0;
+    KeAcquireSpinLock(&gProcessLock, &oldIrql);
+    for (link = gProcesses.Flink; link != &gProcesses; link = link->Flink) {
+        PMSMON_PROCESS_ENTRY entry = CONTAINING_RECORD(link, MSMON_PROCESS_ENTRY, Link);
+        if (entry->ProcessId == ProcessId) {
+            startTime = entry->StartTime;
+            break;
+        }
+    }
+    KeReleaseSpinLock(&gProcessLock, oldIrql);
+    return startTime;
+}
+
 ULONG MsMonTrackedProcessCount(VOID)
 {
     return (ULONG)gProcessCount;
 }
 
-static VOID MsMonForgetProcess(HANDLE ProcessId)
+static VOID MsMonForgetProcess(HANDLE ProcessId, LONGLONG StartTime)
 {
     PLIST_ENTRY link;
     KIRQL oldIrql;
-
+    PMSMON_PROCESS_ENTRY removed = NULL;
     KeAcquireSpinLock(&gProcessLock, &oldIrql);
     for (link = gProcesses.Flink; link != &gProcesses; link = link->Flink) {
         PMSMON_PROCESS_ENTRY entry = CONTAINING_RECORD(link, MSMON_PROCESS_ENTRY, Link);
-        if (entry->ProcessId == ProcessId) {
+        if (entry->ProcessId == ProcessId && entry->StartTime == StartTime) {
             RemoveEntryList(&entry->Link);
-            ExFreePoolWithTag(entry, MSMON_POOL_TAG);
+            removed = entry;
             InterlockedDecrement(&gProcessCount);
             break;
         }
     }
     KeReleaseSpinLock(&gProcessLock, oldIrql);
+    if (removed != NULL) ExFreePoolWithTag(removed, MSMON_POOL_TAG);
 }
 
 static VOID MsMonProcessNotify(PEPROCESS Process, HANDLE ProcessId, PPS_CREATE_NOTIFY_INFO CreateInfo)
 {
     LONGLONG startTime = PsGetProcessCreateTimeQuadPart(Process);
-    BOOLEAN inherited;
     ULONG flags;
+    NTSTATUS status;
 
     if (CreateInfo == NULL) {
         if (MsMonIsTracked(ProcessId, startTime)) {
-            (VOID)MsMonLogEvent(MsMonProcessExit, ProcessId, NULL, NULL, 0, STATUS_SUCCESS,
+            (VOID)MsMonLogEvent(MsMonProcessExit, ProcessId, NULL, NULL, NULL, 0, 0,
+                                STATUS_SUCCESS, 0, MsMonCategoryExternalProcess,
                                 (ULONGLONG)startTime, 0, NULL, NULL);
-            MsMonForgetProcess(ProcessId);
+            MsMonForgetProcess(ProcessId, startTime);
         }
         return;
     }
-
-    inherited = MsMonIsTracked(CreateInfo->ParentProcessId, 0);
-    if (!inherited && !MsMonKnownImage(CreateInfo->ImageFileName)) {
+    if (MsMonIsTracked(CreateInfo->ParentProcessId, 0)) {
+        flags = MsMonFlagInheritedTrack;
+    } else if (MsMonKnownImage(CreateInfo->ImageFileName)) {
+        flags = MsMonFlagExplicitTrack;
+    } else {
         return;
     }
-
-    flags = inherited ? MsMonFlagInheritedTrack : MsMonFlagExplicitTrack;
-    (VOID)MsMonTrackProcess(ProcessId, FALSE);
-    (VOID)MsMonLogEvent(MsMonProcessStart, ProcessId, CreateInfo->ParentProcessId, NULL,
-                        flags, STATUS_SUCCESS, (ULONGLONG)startTime, 0,
-                        CreateInfo->ImageFileName != NULL ? CreateInfo->ImageFileName->Buffer : NULL,
-                        CreateInfo->CommandLine != NULL ? CreateInfo->CommandLine->Buffer : NULL);
+    status = MsMonTrackProcess(ProcessId, flags);
+    if (!NT_SUCCESS(status)) return;
+    (VOID)MsMonLogEvent(MsMonProcessStart, ProcessId, CreateInfo->ParentProcessId, NULL, NULL, 0,
+                        flags, STATUS_SUCCESS, 0, MsMonCategoryExternalProcess,
+                        (ULONGLONG)startTime, 0, CreateInfo->ImageFileName, CreateInfo->CommandLine);
 }
 
 static VOID MsMonThreadNotify(HANDLE ProcessId, HANDLE ThreadId, BOOLEAN Create)
 {
-    if (!MsMonIsTracked(ProcessId, 0)) {
-        return;
-    }
+    if (!MsMonIsTracked(ProcessId, 0)) return;
     (VOID)MsMonLogEvent(Create ? MsMonThreadStart : MsMonThreadExit,
-                        ProcessId, NULL, ThreadId, 0, STATUS_SUCCESS, 0, 0, NULL, NULL);
+                        ProcessId, NULL, ThreadId, NULL, 0, 0, STATUS_SUCCESS, 0,
+                        MsMonCategoryUnknown, 0, 0, NULL, NULL);
 }
 
 static VOID MsMonImageNotify(PUNICODE_STRING FullImageName, HANDLE ProcessId, PIMAGE_INFO ImageInfo)
 {
-    if (!MsMonIsTracked(ProcessId, 0)) {
-        return;
-    }
-    (VOID)MsMonLogEvent(MsMonImageLoad, ProcessId, NULL, NULL, 0, STATUS_SUCCESS,
-                        (ULONGLONG)ImageInfo->ImageBase, ImageInfo->ImageSize,
-                        FullImageName != NULL ? FullImageName->Buffer : NULL, NULL);
+    if (!MsMonIsTracked(ProcessId, 0)) return;
+    (VOID)MsMonLogEvent(MsMonImageLoad, ProcessId, NULL, NULL, NULL, 0, 0,
+                        STATUS_SUCCESS, 0, MsMonCategoryUnknown,
+                        (ULONGLONG)ImageInfo->ImageBase, ImageInfo->ImageSize, FullImageName, NULL);
 }
 
 NTSTATUS MsMonProcessInitialize(VOID)
 {
     NTSTATUS status;
-
     InitializeListHead(&gProcesses);
     KeInitializeSpinLock(&gProcessLock);
+    KeInitializeMutex(&gRootMutex, 0);
     gProcessCount = 0;
+    gClientRoot.Buffer = NULL;
+    gSessionActive = FALSE;
     status = PsSetCreateProcessNotifyRoutineEx(MsMonProcessNotify, FALSE);
-    if (!NT_SUCCESS(status)) {
-        return status;
-    }
+    if (!NT_SUCCESS(status)) return status;
     status = PsSetCreateThreadNotifyRoutine(MsMonThreadNotify);
     if (!NT_SUCCESS(status)) {
         (VOID)PsSetCreateProcessNotifyRoutineEx(MsMonProcessNotify, TRUE);
@@ -206,17 +291,8 @@ NTSTATUS MsMonProcessInitialize(VOID)
 
 VOID MsMonProcessUninitialize(VOID)
 {
-    PLIST_ENTRY entry;
-    KIRQL oldIrql;
-
     (VOID)PsSetLoadImageNotifyRoutine(MsMonImageNotify);
     (VOID)PsRemoveCreateThreadNotifyRoutine(MsMonThreadNotify);
     (VOID)PsSetCreateProcessNotifyRoutineEx(MsMonProcessNotify, TRUE);
-    KeAcquireSpinLock(&gProcessLock, &oldIrql);
-    while (!IsListEmpty(&gProcesses)) {
-        entry = RemoveHeadList(&gProcesses);
-        ExFreePoolWithTag(CONTAINING_RECORD(entry, MSMON_PROCESS_ENTRY, Link), MSMON_POOL_TAG);
-    }
-    gProcessCount = 0;
-    KeReleaseSpinLock(&gProcessLock, oldIrql);
+    MsMonProcessStopSession();
 }

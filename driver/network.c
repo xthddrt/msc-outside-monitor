@@ -9,20 +9,47 @@
 #include <ntstrsafe.h>
 #include "../include/msmon_protocol.h"
 
+#define MSMON_POOL_TAG 'noSM'
+#define MSMON_CALLOUT_COUNT 6
+
 BOOLEAN MsMonIsTracked(HANDLE ProcessId, LONGLONG StartTime);
 NTSTATUS MsMonLogEvent(ULONG Type, HANDLE ProcessId, HANDLE ParentProcessId, HANDLE ThreadId,
-                       ULONG Flags, NTSTATUS Status, ULONGLONG Value0, ULONGLONG Value1,
-                       PCWSTR Text, PCWSTR Detail);
+                       HANDLE TargetProcessId, LONGLONG TargetProcessStartTime, ULONG Flags,
+                       NTSTATUS Status, ULONG DesiredAccess, ULONG Category,
+                       ULONGLONG Value0, ULONGLONG Value1,
+                       PCUNICODE_STRING Text, PCUNICODE_STRING Detail);
 VOID MsMonNetworkUninitialize(VOID);
 
-static const GUID MSMON_CALLOUT_CONNECT_V4 = { 0x43f00e61, 0x2a6f, 0x4dd3, { 0x91, 0x3b, 0x1b, 0x42, 0x8c, 0x83, 0x20, 0x01 } };
-static const GUID MSMON_CALLOUT_CONNECT_V6 = { 0x43f00e61, 0x2a6f, 0x4dd3, { 0x91, 0x3b, 0x1b, 0x42, 0x8c, 0x83, 0x20, 0x02 } };
-static const GUID MSMON_CALLOUT_ACCEPT_V4 = { 0x43f00e61, 0x2a6f, 0x4dd3, { 0x91, 0x3b, 0x1b, 0x42, 0x8c, 0x83, 0x20, 0x03 } };
-static const GUID MSMON_CALLOUT_ACCEPT_V6 = { 0x43f00e61, 0x2a6f, 0x4dd3, { 0x91, 0x3b, 0x1b, 0x42, 0x8c, 0x83, 0x20, 0x04 } };
+static const GUID MSMON_CALLOUT_KEYS[MSMON_CALLOUT_COUNT] = {
+    { 0x43f00e61, 0x2a6f, 0x4dd3, { 0x91, 0x3b, 0x1b, 0x42, 0x8c, 0x83, 0x20, 0x01 } },
+    { 0x43f00e61, 0x2a6f, 0x4dd3, { 0x91, 0x3b, 0x1b, 0x42, 0x8c, 0x83, 0x20, 0x02 } },
+    { 0x43f00e61, 0x2a6f, 0x4dd3, { 0x91, 0x3b, 0x1b, 0x42, 0x8c, 0x83, 0x20, 0x03 } },
+    { 0x43f00e61, 0x2a6f, 0x4dd3, { 0x91, 0x3b, 0x1b, 0x42, 0x8c, 0x83, 0x20, 0x04 } },
+    { 0x43f00e61, 0x2a6f, 0x4dd3, { 0x91, 0x3b, 0x1b, 0x42, 0x8c, 0x83, 0x20, 0x05 } },
+    { 0x43f00e61, 0x2a6f, 0x4dd3, { 0x91, 0x3b, 0x1b, 0x42, 0x8c, 0x83, 0x20, 0x06 } }
+};
+
+typedef struct _MSMON_FLOW_CONTEXT {
+    LIST_ENTRY Link;
+    UINT64 FlowId;
+    UINT32 CalloutId;
+    UINT16 LayerId;
+    HANDLE ProcessId;
+    UINT8 Protocol;
+    UINT16 LocalPort;
+    UINT16 RemotePort;
+    WCHAR Endpoints[128];
+} MSMON_FLOW_CONTEXT, *PMSMON_FLOW_CONTEXT;
 
 static HANDLE gEngine;
-static UINT32 gCalloutIds[4];
-static BOOLEAN gCalloutRegistered[4];
+static UINT32 gCalloutIds[MSMON_CALLOUT_COUNT];
+static BOOLEAN gCalloutRegistered[MSMON_CALLOUT_COUNT];
+static LIST_ENTRY gFlows;
+static KSPIN_LOCK gFlowLock;
+static BOOLEAN gFlowListInitialized;
+static BOOLEAN gNetworkActive;
+
+static VOID NTAPI MsMonWfpFlowDelete(UINT16 LayerId, UINT32 CalloutId, UINT64 FlowContext);
 
 static VOID MsMonFormatIpv4(UINT32 Address, PWSTR Output, SIZE_T Characters)
 {
@@ -36,7 +63,6 @@ static VOID MsMonFormatIpv6(const FWP_BYTE_ARRAY16* Address, PWSTR Output, SIZE_
     static const WCHAR hex[] = L"0123456789abcdef";
     ULONG index;
     ULONG offset = 0;
-
     if (Address == NULL || Characters < 40) {
         if (Characters != 0) Output[0] = L'\0';
         return;
@@ -49,6 +75,132 @@ static VOID MsMonFormatIpv6(const FWP_BYTE_ARRAY16* Address, PWSTR Output, SIZE_
     Output[offset] = L'\0';
 }
 
+static ULONG MsMonCalloutIndex(const FWPS_FILTER3* Filter)
+{
+    ULONG index;
+    for (index = 0; index < MSMON_CALLOUT_COUNT; index++) {
+        if (gCalloutRegistered[index] && Filter->action.calloutId == gCalloutIds[index]) return index;
+    }
+    return MSMON_CALLOUT_COUNT;
+}
+
+static VOID MsMonSelectFields(
+    ULONG Index,
+    PUINT16 LocalAddress,
+    PUINT16 RemoteAddress,
+    PUINT16 LocalPort,
+    PUINT16 RemotePort,
+    PUINT16 Protocol
+)
+{
+    BOOLEAN ipv6 = (Index & 1) != 0;
+    if (Index >= 4) {
+        if (ipv6) {
+            *LocalAddress = FWPS_FIELD_ALE_FLOW_ESTABLISHED_V6_IP_LOCAL_ADDRESS;
+            *RemoteAddress = FWPS_FIELD_ALE_FLOW_ESTABLISHED_V6_IP_REMOTE_ADDRESS;
+            *LocalPort = FWPS_FIELD_ALE_FLOW_ESTABLISHED_V6_IP_LOCAL_PORT;
+            *RemotePort = FWPS_FIELD_ALE_FLOW_ESTABLISHED_V6_IP_REMOTE_PORT;
+            *Protocol = FWPS_FIELD_ALE_FLOW_ESTABLISHED_V6_IP_PROTOCOL;
+        } else {
+            *LocalAddress = FWPS_FIELD_ALE_FLOW_ESTABLISHED_V4_IP_LOCAL_ADDRESS;
+            *RemoteAddress = FWPS_FIELD_ALE_FLOW_ESTABLISHED_V4_IP_REMOTE_ADDRESS;
+            *LocalPort = FWPS_FIELD_ALE_FLOW_ESTABLISHED_V4_IP_LOCAL_PORT;
+            *RemotePort = FWPS_FIELD_ALE_FLOW_ESTABLISHED_V4_IP_REMOTE_PORT;
+            *Protocol = FWPS_FIELD_ALE_FLOW_ESTABLISHED_V4_IP_PROTOCOL;
+        }
+    } else if (Index >= 2) {
+        if (ipv6) {
+            *LocalAddress = FWPS_FIELD_ALE_AUTH_RECV_ACCEPT_V6_IP_LOCAL_ADDRESS;
+            *RemoteAddress = FWPS_FIELD_ALE_AUTH_RECV_ACCEPT_V6_IP_REMOTE_ADDRESS;
+            *LocalPort = FWPS_FIELD_ALE_AUTH_RECV_ACCEPT_V6_IP_LOCAL_PORT;
+            *RemotePort = FWPS_FIELD_ALE_AUTH_RECV_ACCEPT_V6_IP_REMOTE_PORT;
+            *Protocol = FWPS_FIELD_ALE_AUTH_RECV_ACCEPT_V6_IP_PROTOCOL;
+        } else {
+            *LocalAddress = FWPS_FIELD_ALE_AUTH_RECV_ACCEPT_V4_IP_LOCAL_ADDRESS;
+            *RemoteAddress = FWPS_FIELD_ALE_AUTH_RECV_ACCEPT_V4_IP_REMOTE_ADDRESS;
+            *LocalPort = FWPS_FIELD_ALE_AUTH_RECV_ACCEPT_V4_IP_LOCAL_PORT;
+            *RemotePort = FWPS_FIELD_ALE_AUTH_RECV_ACCEPT_V4_IP_REMOTE_PORT;
+            *Protocol = FWPS_FIELD_ALE_AUTH_RECV_ACCEPT_V4_IP_PROTOCOL;
+        }
+    } else {
+        if (ipv6) {
+            *LocalAddress = FWPS_FIELD_ALE_AUTH_CONNECT_V6_IP_LOCAL_ADDRESS;
+            *RemoteAddress = FWPS_FIELD_ALE_AUTH_CONNECT_V6_IP_REMOTE_ADDRESS;
+            *LocalPort = FWPS_FIELD_ALE_AUTH_CONNECT_V6_IP_LOCAL_PORT;
+            *RemotePort = FWPS_FIELD_ALE_AUTH_CONNECT_V6_IP_REMOTE_PORT;
+            *Protocol = FWPS_FIELD_ALE_AUTH_CONNECT_V6_IP_PROTOCOL;
+        } else {
+            *LocalAddress = FWPS_FIELD_ALE_AUTH_CONNECT_V4_IP_LOCAL_ADDRESS;
+            *RemoteAddress = FWPS_FIELD_ALE_AUTH_CONNECT_V4_IP_REMOTE_ADDRESS;
+            *LocalPort = FWPS_FIELD_ALE_AUTH_CONNECT_V4_IP_LOCAL_PORT;
+            *RemotePort = FWPS_FIELD_ALE_AUTH_CONNECT_V4_IP_REMOTE_PORT;
+            *Protocol = FWPS_FIELD_ALE_AUTH_CONNECT_V4_IP_PROTOCOL;
+        }
+    }
+}
+
+static VOID MsMonLogNetwork(
+    ULONG Type,
+    HANDLE ProcessId,
+    UINT64 FlowId,
+    UINT8 Protocol,
+    UINT16 LocalPort,
+    UINT16 RemotePort,
+    PCWSTR Endpoints,
+    PCWSTR Direction
+)
+{
+    UNICODE_STRING text;
+    UNICODE_STRING detail;
+    ULONGLONG packed = ((ULONGLONG)Protocol << 32) | ((ULONGLONG)LocalPort << 16) | RemotePort;
+    RtlInitUnicodeString(&text, Endpoints);
+    RtlInitUnicodeString(&detail, Direction);
+    (VOID)MsMonLogEvent(Type, ProcessId, NULL, NULL, NULL, 0, 0, STATUS_SUCCESS, 0,
+                        MsMonCategoryNetwork, FlowId, packed, &text, &detail);
+}
+
+static VOID MsMonAssociateFlow(
+    const FWPS_INCOMING_VALUES0* InFixedValues,
+    const FWPS_INCOMING_METADATA_VALUES0* InMetaValues,
+    ULONG Index,
+    UINT64 FlowId,
+    UINT8 Protocol,
+    UINT16 LocalPort,
+    UINT16 RemotePort,
+    PCWSTR Endpoints
+)
+{
+    PMSMON_FLOW_CONTEXT context;
+    KIRQL oldIrql;
+    NTSTATUS status;
+    if (!gFlowListInitialized || (InMetaValues->currentMetadataValues & FWPS_METADATA_FIELD_FLOW_HANDLE) == 0 ||
+        FlowId == 0) return;
+    context = ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(*context), MSMON_POOL_TAG);
+    if (context == NULL) return;
+    RtlZeroMemory(context, sizeof(*context));
+    context->FlowId = FlowId;
+    context->CalloutId = gCalloutIds[Index];
+    context->LayerId = InFixedValues->layerId;
+    context->ProcessId = UlongToHandle((ULONG)InMetaValues->processId);
+    context->Protocol = Protocol;
+    context->LocalPort = LocalPort;
+    context->RemotePort = RemotePort;
+    (VOID)RtlStringCchCopyW(context->Endpoints, RTL_NUMBER_OF(context->Endpoints), Endpoints);
+
+    KeAcquireSpinLock(&gFlowLock, &oldIrql);
+    if (!gNetworkActive) {
+        KeReleaseSpinLock(&gFlowLock, oldIrql);
+        ExFreePoolWithTag(context, MSMON_POOL_TAG);
+        return;
+    }
+    InsertTailList(&gFlows, &context->Link);
+    status = FwpsFlowAssociateContext0(FlowId, InFixedValues->layerId,
+                                       gCalloutIds[Index], (UINT64)context);
+    if (!NT_SUCCESS(status)) RemoveEntryList(&context->Link);
+    KeReleaseSpinLock(&gFlowLock, oldIrql);
+    if (!NT_SUCCESS(status)) ExFreePoolWithTag(context, MSMON_POOL_TAG);
+}
+
 static VOID NTAPI MsMonWfpClassify(
     const FWPS_INCOMING_VALUES0* InFixedValues,
     const FWPS_INCOMING_METADATA_VALUES0* InMetaValues,
@@ -59,52 +211,66 @@ static VOID NTAPI MsMonWfpClassify(
     FWPS_CLASSIFY_OUT0* ClassifyOut
 )
 {
-    BOOLEAN ipv6 = Filter->action.calloutId == gCalloutIds[1] || Filter->action.calloutId == gCalloutIds[3];
-    BOOLEAN accept = Filter->action.calloutId == gCalloutIds[2] || Filter->action.calloutId == gCalloutIds[3];
-    UINT16 localField = accept ? FWPS_FIELD_ALE_AUTH_RECV_ACCEPT_V4_IP_LOCAL_PORT : FWPS_FIELD_ALE_AUTH_CONNECT_V4_IP_LOCAL_PORT;
-    UINT16 remoteField = accept ? FWPS_FIELD_ALE_AUTH_RECV_ACCEPT_V4_IP_REMOTE_PORT : FWPS_FIELD_ALE_AUTH_CONNECT_V4_IP_REMOTE_PORT;
-    UINT16 protocolField = accept ? FWPS_FIELD_ALE_AUTH_RECV_ACCEPT_V4_IP_PROTOCOL : FWPS_FIELD_ALE_AUTH_CONNECT_V4_IP_PROTOCOL;
-    UINT32 localAddress = 0;
-    UINT32 remoteAddress = 0;
+    ULONG index = MsMonCalloutIndex(Filter);
+    UINT16 localAddressField;
+    UINT16 remoteAddressField;
+    UINT16 localPortField;
+    UINT16 remotePortField;
+    UINT16 protocolField;
     UINT16 localPort;
     UINT16 remotePort;
+    UINT8 protocol;
+    UINT64 flowId = 0;
     WCHAR local[48];
     WCHAR remote[48];
     WCHAR endpoints[128];
+    PCWSTR direction;
+    ULONG type;
 
     UNREFERENCED_PARAMETER(LayerData);
     UNREFERENCED_PARAMETER(ClassifyContext);
     UNREFERENCED_PARAMETER(FlowContext);
-
-    if ((InMetaValues->currentMetadataValues & FWPS_METADATA_FIELD_PROCESS_ID) != 0 &&
+    if (index < MSMON_CALLOUT_COUNT &&
+        (InMetaValues->currentMetadataValues & FWPS_METADATA_FIELD_PROCESS_ID) != 0 &&
         MsMonIsTracked(UlongToHandle((ULONG)InMetaValues->processId), 0)) {
-        localPort = RtlUshortByteSwap(InFixedValues->incomingValue[localField].value.uint16);
-        remotePort = RtlUshortByteSwap(InFixedValues->incomingValue[remoteField].value.uint16);
-        if (ipv6) {
-            UINT16 base = accept ? FWPS_FIELD_ALE_AUTH_RECV_ACCEPT_V6_IP_LOCAL_ADDRESS : FWPS_FIELD_ALE_AUTH_CONNECT_V6_IP_LOCAL_ADDRESS;
-            MsMonFormatIpv6(InFixedValues->incomingValue[base].value.byteArray16, local, RTL_NUMBER_OF(local));
-            MsMonFormatIpv6(InFixedValues->incomingValue[base + 1].value.byteArray16, remote, RTL_NUMBER_OF(remote));
-            localField = accept ? FWPS_FIELD_ALE_AUTH_RECV_ACCEPT_V6_IP_LOCAL_PORT : FWPS_FIELD_ALE_AUTH_CONNECT_V6_IP_LOCAL_PORT;
-            remoteField = accept ? FWPS_FIELD_ALE_AUTH_RECV_ACCEPT_V6_IP_REMOTE_PORT : FWPS_FIELD_ALE_AUTH_CONNECT_V6_IP_REMOTE_PORT;
-            protocolField = accept ? FWPS_FIELD_ALE_AUTH_RECV_ACCEPT_V6_IP_PROTOCOL : FWPS_FIELD_ALE_AUTH_CONNECT_V6_IP_PROTOCOL;
-            localPort = RtlUshortByteSwap(InFixedValues->incomingValue[localField].value.uint16);
-            remotePort = RtlUshortByteSwap(InFixedValues->incomingValue[remoteField].value.uint16);
+        MsMonSelectFields(index, &localAddressField, &remoteAddressField,
+                          &localPortField, &remotePortField, &protocolField);
+        localPort = RtlUshortByteSwap(InFixedValues->incomingValue[localPortField].value.uint16);
+        remotePort = RtlUshortByteSwap(InFixedValues->incomingValue[remotePortField].value.uint16);
+        protocol = InFixedValues->incomingValue[protocolField].value.uint8;
+        if ((InMetaValues->currentMetadataValues & FWPS_METADATA_FIELD_FLOW_HANDLE) != 0) {
+            flowId = InMetaValues->flowHandle;
+        }
+        if ((index & 1) != 0) {
+            MsMonFormatIpv6(InFixedValues->incomingValue[localAddressField].value.byteArray16,
+                            local, RTL_NUMBER_OF(local));
+            MsMonFormatIpv6(InFixedValues->incomingValue[remoteAddressField].value.byteArray16,
+                            remote, RTL_NUMBER_OF(remote));
         } else {
-            UINT16 base = accept ? FWPS_FIELD_ALE_AUTH_RECV_ACCEPT_V4_IP_LOCAL_ADDRESS : FWPS_FIELD_ALE_AUTH_CONNECT_V4_IP_LOCAL_ADDRESS;
-            localAddress = InFixedValues->incomingValue[base].value.uint32;
-            remoteAddress = InFixedValues->incomingValue[base + 1].value.uint32;
-            MsMonFormatIpv4(localAddress, local, RTL_NUMBER_OF(local));
-            MsMonFormatIpv4(remoteAddress, remote, RTL_NUMBER_OF(remote));
+            MsMonFormatIpv4(InFixedValues->incomingValue[localAddressField].value.uint32,
+                            local, RTL_NUMBER_OF(local));
+            MsMonFormatIpv4(InFixedValues->incomingValue[remoteAddressField].value.uint32,
+                            remote, RTL_NUMBER_OF(remote));
         }
         (VOID)RtlStringCchPrintfW(endpoints, RTL_NUMBER_OF(endpoints), L"%ws:%u -> %ws:%u",
                                   local, localPort, remote, remotePort);
-        (VOID)MsMonLogEvent(accept ? MsMonNetworkAccept : MsMonNetworkConnect,
-                            UlongToHandle((ULONG)InMetaValues->processId), NULL, NULL, 0, STATUS_SUCCESS,
-                            InFixedValues->incomingValue[protocolField].value.uint8,
-                            ((ULONGLONG)localPort << 16) | remotePort, endpoints,
-                            accept ? L"recv_accept" : L"connect");
+        if (index >= 4) {
+            type = MsMonNetworkFlowEstablished;
+            direction = L"flow_established";
+        } else if (index >= 2) {
+            type = MsMonNetworkAccept;
+            direction = L"recv_accept";
+        } else {
+            type = MsMonNetworkConnect;
+            direction = L"connect";
+        }
+        MsMonLogNetwork(type, UlongToHandle((ULONG)InMetaValues->processId), flowId,
+                        protocol, localPort, remotePort, endpoints, direction);
+        if (index >= 4 && FlowContext == 0) {
+            MsMonAssociateFlow(InFixedValues, InMetaValues, index, flowId,
+                               protocol, localPort, remotePort, endpoints);
+        }
     }
-
     if ((ClassifyOut->rights & FWPS_RIGHT_ACTION_WRITE) != 0) {
         ClassifyOut->actionType = FWP_ACTION_PERMIT;
     }
@@ -122,11 +288,36 @@ static NTSTATUS NTAPI MsMonWfpNotify(
     return STATUS_SUCCESS;
 }
 
+static VOID NTAPI MsMonWfpFlowDelete(UINT16 LayerId, UINT32 CalloutId, UINT64 FlowContext)
+{
+    PLIST_ENTRY link;
+    PMSMON_FLOW_CONTEXT context = NULL;
+    KIRQL oldIrql;
+    UNREFERENCED_PARAMETER(LayerId);
+    UNREFERENCED_PARAMETER(CalloutId);
+    if (!gFlowListInitialized || FlowContext == 0) return;
+    KeAcquireSpinLock(&gFlowLock, &oldIrql);
+    for (link = gFlows.Flink; link != &gFlows; link = link->Flink) {
+        PMSMON_FLOW_CONTEXT candidate = CONTAINING_RECORD(link, MSMON_FLOW_CONTEXT, Link);
+        if ((UINT64)candidate == FlowContext) {
+            RemoveEntryList(&candidate->Link);
+            context = candidate;
+            break;
+        }
+    }
+    KeReleaseSpinLock(&gFlowLock, oldIrql);
+    if (context != NULL) {
+        MsMonLogNetwork(MsMonNetworkFlowClose, context->ProcessId, context->FlowId,
+                        context->Protocol, context->LocalPort, context->RemotePort,
+                        context->Endpoints, L"flow_close");
+        ExFreePoolWithTag(context, MSMON_POOL_TAG);
+    }
+}
+
 static NTSTATUS MsMonAddCallout(
     PDEVICE_OBJECT DeviceObject,
-    const GUID* CalloutKey,
-    const GUID* LayerKey,
     ULONG Index,
+    const GUID* LayerKey,
     PCWSTR Name
 )
 {
@@ -136,31 +327,28 @@ static NTSTATUS MsMonAddCallout(
     NTSTATUS status;
 
     RtlZeroMemory(&callout, sizeof(callout));
-    callout.calloutKey = *CalloutKey;
+    callout.calloutKey = MSMON_CALLOUT_KEYS[Index];
     callout.classifyFn = MsMonWfpClassify;
     callout.notifyFn = MsMonWfpNotify;
+    if (Index >= 4) callout.flowDeleteFn = MsMonWfpFlowDelete;
     status = FwpsCalloutRegister3(DeviceObject, &callout, &gCalloutIds[Index]);
-    if (!NT_SUCCESS(status)) {
-        return status;
-    }
+    if (!NT_SUCCESS(status)) return status;
     gCalloutRegistered[Index] = TRUE;
 
     RtlZeroMemory(&managerCallout, sizeof(managerCallout));
-    managerCallout.calloutKey = *CalloutKey;
+    managerCallout.calloutKey = MSMON_CALLOUT_KEYS[Index];
     managerCallout.displayData.name = (PWSTR)Name;
     managerCallout.displayData.description = (PWSTR)L"MapleStory application network metadata monitor";
     managerCallout.calloutId = gCalloutIds[Index];
     status = FwpmCalloutAdd(gEngine, &managerCallout, NULL, NULL);
-    if (!NT_SUCCESS(status)) {
-        return status;
-    }
+    if (!NT_SUCCESS(status)) return status;
 
     RtlZeroMemory(&filter, sizeof(filter));
     filter.displayData.name = (PWSTR)Name;
-    filter.displayData.description = (PWSTR)L"Observe application network authorization events";
+    filter.displayData.description = (PWSTR)L"Observe application network authorization and flow events";
     filter.layerKey = *LayerKey;
     filter.action.type = FWP_ACTION_CALLOUT_UNKNOWN;
-    filter.action.calloutKey = *CalloutKey;
+    filter.action.calloutKey = MSMON_CALLOUT_KEYS[Index];
     filter.weight.type = FWP_EMPTY;
     return FwpmFilterAdd(gEngine, &filter, NULL, NULL);
 }
@@ -169,35 +357,60 @@ NTSTATUS MsMonNetworkInitialize(PDEVICE_OBJECT DeviceObject)
 {
     FWPM_SESSION session;
     NTSTATUS status;
+    KeInitializeSpinLock(&gFlowLock);
+    InitializeListHead(&gFlows);
+    gFlowListInitialized = TRUE;
+    gNetworkActive = FALSE;
 
     RtlZeroMemory(&session, sizeof(session));
     session.displayData.name = (PWSTR)L"MsMon dynamic session";
     session.displayData.description = (PWSTR)L"Passive application network monitoring";
     session.flags = FWPM_SESSION_FLAG_DYNAMIC;
     status = FwpmEngineOpen(NULL, RPC_C_AUTHN_WINNT, NULL, &session, &gEngine);
-    if (!NT_SUCCESS(status)) {
-        return status;
-    }
+    if (!NT_SUCCESS(status)) return status;
 
-    status = MsMonAddCallout(DeviceObject, &MSMON_CALLOUT_CONNECT_V4, &FWPM_LAYER_ALE_AUTH_CONNECT_V4, 0, L"MsMon connect IPv4");
-    if (NT_SUCCESS(status)) status = MsMonAddCallout(DeviceObject, &MSMON_CALLOUT_CONNECT_V6, &FWPM_LAYER_ALE_AUTH_CONNECT_V6, 1, L"MsMon connect IPv6");
-    if (NT_SUCCESS(status)) status = MsMonAddCallout(DeviceObject, &MSMON_CALLOUT_ACCEPT_V4, &FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V4, 2, L"MsMon accept IPv4");
-    if (NT_SUCCESS(status)) status = MsMonAddCallout(DeviceObject, &MSMON_CALLOUT_ACCEPT_V6, &FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V6, 3, L"MsMon accept IPv6");
+    status = MsMonAddCallout(DeviceObject, 0, &FWPM_LAYER_ALE_AUTH_CONNECT_V4, L"MsMon connect IPv4");
+    if (NT_SUCCESS(status)) status = MsMonAddCallout(DeviceObject, 1, &FWPM_LAYER_ALE_AUTH_CONNECT_V6, L"MsMon connect IPv6");
+    if (NT_SUCCESS(status)) status = MsMonAddCallout(DeviceObject, 2, &FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V4, L"MsMon accept IPv4");
+    if (NT_SUCCESS(status)) status = MsMonAddCallout(DeviceObject, 3, &FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V6, L"MsMon accept IPv6");
+    if (NT_SUCCESS(status)) status = MsMonAddCallout(DeviceObject, 4, &FWPM_LAYER_ALE_FLOW_ESTABLISHED_V4, L"MsMon flow IPv4");
+    if (NT_SUCCESS(status)) status = MsMonAddCallout(DeviceObject, 5, &FWPM_LAYER_ALE_FLOW_ESTABLISHED_V6, L"MsMon flow IPv6");
     if (!NT_SUCCESS(status)) {
         MsMonNetworkUninitialize();
+        return status;
     }
-    return status;
+    gNetworkActive = TRUE;
+    return STATUS_SUCCESS;
 }
 
 VOID MsMonNetworkUninitialize(VOID)
 {
     ULONG index;
-
+    KIRQL oldIrql;
+    gNetworkActive = FALSE;
     if (gEngine != NULL) {
         (VOID)FwpmEngineClose(gEngine);
         gEngine = NULL;
     }
-    for (index = 0; index < RTL_NUMBER_OF(gCalloutRegistered); index++) {
+    if (gFlowListInitialized) {
+        for (;;) {
+            PMSMON_FLOW_CONTEXT context = NULL;
+            KeAcquireSpinLock(&gFlowLock, &oldIrql);
+            if (!IsListEmpty(&gFlows)) {
+                PLIST_ENTRY entry = RemoveHeadList(&gFlows);
+                context = CONTAINING_RECORD(entry, MSMON_FLOW_CONTEXT, Link);
+            }
+            KeReleaseSpinLock(&gFlowLock, oldIrql);
+            if (context == NULL) break;
+            (VOID)FwpsFlowRemoveContext0(context->FlowId, context->LayerId, context->CalloutId);
+            MsMonLogNetwork(MsMonNetworkFlowClose, context->ProcessId, context->FlowId,
+                            context->Protocol, context->LocalPort, context->RemotePort,
+                            context->Endpoints, L"flow_close_monitor_stop");
+            ExFreePoolWithTag(context, MSMON_POOL_TAG);
+        }
+        gFlowListInitialized = FALSE;
+    }
+    for (index = 0; index < MSMON_CALLOUT_COUNT; index++) {
         if (gCalloutRegistered[index]) {
             (VOID)FwpsCalloutUnregisterById(gCalloutIds[index]);
             gCalloutRegistered[index] = FALSE;

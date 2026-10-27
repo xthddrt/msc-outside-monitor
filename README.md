@@ -1,21 +1,25 @@
-# ms-monitor
+# msc-outside-monitor
 
-Application-scoped Windows telemetry for the MapleStoryCW client, with a WDM kernel driver, a Win32 JSONL collector, and a reproducible static inventory of the supplied installation.
+Application-scoped Windows telemetry for the MapleStoryCW client, with a WDM kernel/minifilter driver, an elevated Win32 collector, ETW correlation, chained JSONL output, and a static inventory of the supplied installation.
 
-The monitor observes `MapleStory.exe`, its descendants, and the Nexon security, overlay, and crash helpers. It does not inject code, bypass GRAP/Nexon security, disable driver signing, capture credentials, read file contents, or decrypt network traffic.
+The monitor observes an exact client installation, its descendants, and configured Nexon helpers. It does not inject code, hook SSDTs, patch the client, bypass GRAP/Nexon security, disable driver signing, capture credentials, read file/registry payloads, collect hardware-ID values, or decrypt network traffic.
 
 ## What it captures
 
 | Source | Events |
 |---|---|
-| Process callbacks | process start/exit, parent PID, creation time, image and command line when available |
-| Thread callbacks | thread create/exit and owning PID |
-| Image callbacks | module path, base address, and size |
-| Filesystem minifilter | create/open, read/write offsets and lengths, file-information changes |
-| Registry callbacks | open/create, value set/query, enumeration, delete, and rename metadata |
-| Windows Filtering Platform | IPv4/IPv6 connect and receive/accept endpoints, protocol, ports, and PID |
+| Process/thread/image callbacks | start/exit, PID and creation time, ancestry, image path, command line when available, module base/size |
+| Object callbacks | process/thread handle creation and duplication, target PID/image, requested and granted access, result |
+| Filesystem minifilter | create, read/write, query/set information, directory control, cleanup, visible FS/device controls, volume-information queries |
+| Registry callbacks | open/create, query/enumerate, set/delete/rename, key/value names, value type/size, operation result |
+| Windows Filtering Platform | IPv4/IPv6 connect/accept and flow establish/close, flow ID, endpoints, protocol, ports, PID |
+| WMI Activity ETW | correlated client PID, namespace/provider/operation, sanitized query metadata |
+| DNS Client ETW | correlated query name and query metadata |
+| RPC ETW | correlated endpoint/operation metadata where client attribution is available |
 
-This is broad OS telemetry, not a guarantee of every instruction, UI action, IPC message, or application-level decision. See `docs/ARCHITECTURE.md` for limitations and `analysis/CLIENT_ANALYSIS.md` for what the installed files actually establish.
+Records are classified as client data, Windows runtime, external process, browser interaction, hardware identity, user data, registry, network, IPC, or unknown. Hardware classification is evidence of a privacy-sensitive query surface, not proof that an ID value was disclosed.
+
+This is broad OS telemetry, not a guarantee of every instruction, function call, service-mediated action, or hardware read. See `docs/ARCHITECTURE.md` for attribution and coverage limits.
 
 ## Build
 
@@ -31,28 +35,34 @@ Outputs:
 - `build\Release\driver\msmon.inf`
 - `build\Release\agent\msmon-agent.exe`
 
-The default build is unsigned development output. Do not load it on a production machine. Use the isolated test-VM procedure in `docs/TEST_VM.md`; no driver was installed or loaded while developing this repository.
+The default build is unsigned development output. Do not load it on a production machine. Use the isolated test-VM procedure in `docs/TEST_VM.md`. The current code has been compiled but has not been installed or runtime-tested.
 
 ## Collect
 
-Run elevated after properly signing and starting the driver in the test VM:
+Run elevated in the test VM after properly signing and starting the driver. Start the collector before launching the game:
 
 ```bat
-msmon-agent.exe --output session.jsonl
+msmon-agent.exe --client "C:\Nexon\Library\maplestorycw\appdata" --output session.jsonl
 ```
 
 Options:
 
-- `--pid PID` tracks an additional existing process explicitly;
-- `--wait-ms N` sets the empty-queue wait, capped by the driver at 30 seconds;
-- `--max-file-mb N` rotates output after the threshold, with a continuing hash chain;
-- `--once` performs one read and exits.
+- `--pid PID` explicitly tracks another existing process;
+- `--wait-ms N` sets the empty-queue wait, capped by the driver at one second;
+- `--max-file-mb N` rotates output after the threshold with a continuing hash chain;
+- `--queue-records N` and `--queue-mb N` adjust bounded driver buffering;
+- `--no-etw` disables the private ETW session and records a coverage warning;
+- `--once` reads one driver batch and exits.
 
-Every line has a SHA-256 chain over the previous chain and the event JSON. Sequence gaps and driver drop counters make queue loss visible. Validate one or more rotated logs, in order:
+The default root is `C:\Nexon\Library\maplestorycw\appdata`. Local drive-letter paths are translated to the NT device paths seen by kernel process callbacks. The configured root contains `MapleStory.exe`, `grap\NGService.exe`, `NxOverlay\DwarfAxe.exe`, and `CrashReportClient.exe`; descendants inherit tracking. Existing unrelated browsers and services are logged as interaction targets, not monitored wholesale.
+
+Every output line has a consecutive record index and a SHA-256 chain. Driver and ETW sequence numbers remain independent; gaps and queue drops are visible. Validate rotated logs in order:
 
 ```bat
 python tools\verify_log.py session.jsonl session.jsonl.1
 ```
+
+The final record is an observer summary grouped by category, process, target process, and resolved module. Keep the final chain separately if later modification detection matters.
 
 ## Static client inventory
 
@@ -62,8 +72,8 @@ The analysis script requires Python and `pefile`:
 python tools\analyze_client.py C:\Nexon\Library\maplestorycw analysis\pe-inventory.json
 ```
 
-The committed inventory covers all 391 supplied files and 46 PE images, including the PE-formatted GRAP `.aes` payloads. No proprietary client binaries are included in this repository.
+The committed inventory covers all 391 supplied files and 46 PE images, including PE-formatted GRAP `.aes` payloads. No proprietary client binaries are included here. The installation contains no original C/C++ source or symbols; import analysis is not a complete decompilation.
 
 ## Safety and privacy
 
-Use only on systems and software you are authorized to inspect. Logs contain command lines, paths, registry activity, process relationships, and network endpoints. Restrict access, define a retention period, and avoid monitoring unrelated PIDs. The control device is intended for elevated collection, and the driver is not hidden or hardened against tampering.
+Use only on systems and software you are authorized to inspect. Logs still contain command lines, paths, process relationships, registry metadata, network endpoints, DNS names, and sanitized WMI queries. Restrict access and define a retention period. The control device is administrator-only, and the driver is not hidden or hardened against tampering.

@@ -6,33 +6,44 @@
 #include "../include/msmon_protocol.h"
 
 #define MSMON_POOL_TAG 'noSM'
-#define MSMON_MAX_QUEUED_EVENTS 4096u
 
 DRIVER_INITIALIZE DriverEntry;
 DRIVER_UNLOAD MsMonDriverUnload;
 
 NTSTATUS MsMonEventsInitialize(VOID);
 VOID MsMonEventsUninitialize(VOID);
+NTSTATUS MsMonEventsStart(ULONGLONG SessionId, ULONG QueueRecords, ULONG QueueBytes);
+VOID MsMonEventsStop(VOID);
 NTSTATUS MsMonLogEvent(
     ULONG Type,
     HANDLE ProcessId,
     HANDLE ParentProcessId,
     HANDLE ThreadId,
+    HANDLE TargetProcessId,
+    LONGLONG TargetProcessStartTime,
     ULONG Flags,
     NTSTATUS Status,
+    ULONG DesiredAccess,
+    ULONG Category,
     ULONGLONG Value0,
     ULONGLONG Value1,
-    PCWSTR Text,
-    PCWSTR Detail
+    PCUNICODE_STRING Text,
+    PCUNICODE_STRING Detail
 );
-NTSTATUS MsMonReadEvents(PMSMON_EVENT Output, ULONG MaximumEvents, ULONG TimeoutMilliseconds, PULONG EventsRead);
+NTSTATUS MsMonReadEvents(PVOID Output, ULONG MaximumBytes, ULONG TimeoutMilliseconds, PULONG BytesRead);
 VOID MsMonGetStatistics(PMSMON_STATISTICS Statistics);
 
 NTSTATUS MsMonProcessInitialize(VOID);
 VOID MsMonProcessUninitialize(VOID);
-NTSTATUS MsMonTrackProcess(HANDLE ProcessId, BOOLEAN EmitEvent);
+NTSTATUS MsMonProcessStartSession(PCUNICODE_STRING ClientRoot);
+VOID MsMonProcessStopSession(VOID);
+NTSTATUS MsMonTrackProcess(HANDLE ProcessId, ULONG Flags);
 BOOLEAN MsMonIsTracked(HANDLE ProcessId, LONGLONG StartTime);
+LONGLONG MsMonProcessStartTime(HANDLE ProcessId);
 ULONG MsMonTrackedProcessCount(VOID);
+
+NTSTATUS MsMonObjectInitialize(PDRIVER_OBJECT DriverObject);
+VOID MsMonObjectUninitialize(VOID);
 
 NTSTATUS MsMonFileFilterInitialize(PDRIVER_OBJECT DriverObject);
 VOID MsMonFileFilterUninitialize(VOID);

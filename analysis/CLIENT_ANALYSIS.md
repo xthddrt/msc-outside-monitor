@@ -33,6 +33,21 @@ No original C/C++ source, project files, symbols, or script source files were pr
 
 The executable exports only allocator functions and GPU-selection markers. Its size and limited exports are consistent with most game logic being internal rather than exposed as a public API. PE imports alone cannot reconstruct that logic.
 
+### Privacy-sensitive import evidence
+
+| Component | Direct PE evidence | Monitoring implication |
+|---|---|---|
+| `MachineIdLib.dll` | Exports `MIDLib_GetMachineId`; imports process/thread snapshots, window enumeration/title queries, volume information, and `GetAdaptersInfo` | Prioritize process access, window/browser attribution limits, volume-information, and adapter/hardware classification |
+| `MapleSecurePC64.dll` | Exports `GetOldHWID` | The export name is a hardware-ID boundary, but imports alone do not establish its implementation |
+| `grap64.dll` | Imports process/module/thread enumeration, pipes, service and registry APIs, volume/device queries | Track descendants, handle access, registry, IPC, and security-service activity without bypassing GRAP |
+| `nexon_api_x64.dll` | Exports device-ID APIs and imports process snapshots, `OpenProcess`, and registry queries | Correlate process and registry events with the loaded SDK module where stacks are available |
+| `nmconew64.dll` / `nmcogame64.dll` | Import process/module inspection, foreground-window/process APIs, volume information, pipes/mappings, and HTTP networking | Cover process inspection, IPC metadata, hardware-related queries, and network endpoints |
+| `NexonAnalytics64.dll` | Imports process snapshots, window enumeration/hooks, sessions, adapters, registry, and certificate-store enumeration | Treat analytics as a distinct privacy-sensitive component; certificate contents and window titles are outside metadata-only coverage |
+| `nps64.dll` | Imports `ShellExecuteExW` and WinHTTP | External browser launches may be brokered rather than created as direct children |
+| `NxOverlay_x64.dll` / `DwarfAxe.exe` | Import process creation/snapshots, named pipes, window enumeration, and CEF process messaging | Track overlay descendants and pipe/RPC metadata; existing browser processes are not monitored wholesale |
+
+These are import/export facts, not proof that every API is called in a particular session or proof of an internal call stack. Runtime records retain separate process, service-correlated, and stack-resolved evidence levels.
+
 ### Game support libraries
 
 The client contains rendering, canvas, audio, resource, namespace, PCOM, compression, and DirectX support DLLs. `Canvas.dll`, `Gr2D_DX11.dll`, `ResMan.dll`, `Shape2D.dll`, and `Sound.dll` expose COM-style `DllGetClassObject`/`DllCanUnloadNow` entry points. `WzMss.dll` exports 20 SOAP/board-related operations. `NexonAnalytics64.dll` exports analytics and embedded cJSON APIs. `nmconew64.dll`, `nmcogame64.dll`, and `nps64.dll` implement messenger and survey integration. These are useful boundaries for later reversing work, but exported names do not prove call flows.
