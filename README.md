@@ -17,6 +17,8 @@ The monitor observes an exact client installation, its descendants, and configur
 | DNS Client ETW | correlated query name and query metadata |
 | RPC ETW | correlated endpoint/operation metadata where client attribution is available |
 
+For `BlackCat64.sys`, the driver maps the kernel image and checks the active kernel stack. Direct matches are emitted with component `BlackCat64.sys` and `stack_resolved` attribution. This proves BlackCat participated in the operation, not that MapleStory requested it. Queued work, shared worker threads, protected code, and BlackCat device IRPs outside existing callbacks remain unattributed.
+
 Registry values are emitted as Base64 bytes with friendly decoding for common string, multi-string, DWORD, and QWORD types. Volume results include raw bytes plus the exact serial number, creation time, and label when the returned structure is valid. Large values use linked 8-KiB chunks.
 
 Records are classified as client data, Windows runtime, external process, browser interaction, hardware identity, user data, registry, network, IPC, or unknown. Capturing a request or returned value does not prove that MapleStory retained or transmitted it. This is broad OS telemetry, not a guarantee of every instruction, function call, service-mediated action, or hardware read.

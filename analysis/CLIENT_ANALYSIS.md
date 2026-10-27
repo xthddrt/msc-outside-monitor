@@ -46,6 +46,8 @@ The executable exports only allocator functions and GPU-selection markers. Its s
 | `nps64.dll` | Imports `ShellExecuteExW` and WinHTTP | External browser launches may be brokered rather than created as direct children |
 | `NxOverlay_x64.dll` / `DwarfAxe.exe` | Import process creation/snapshots, named pipes, window enumeration, and CEF process messaging | Track overlay descendants and pipe/RPC metadata; existing browser processes are not monitored wholesale |
 
+`BlackCat64.sys` is mapped by kernel image base and size. A direct frame inside that image produces component `BlackCat64.sys` with stack-resolved evidence in process, object, file, and registry callbacks. Queued work, shared worker threads, device IRPs outside those callbacks, protected code, and MapleStory-to-BlackCat causality are not inferred.
+
 These are import/export facts, not proof that every API is called in a particular session or proof of an internal call stack. Runtime records retain separate process, service-correlated, and stack-resolved evidence levels.
 
 ### Game support libraries

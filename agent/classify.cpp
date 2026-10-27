@@ -90,6 +90,7 @@ void OutsideClassifier::Classify(TelemetryEvent& event) const
 void SessionSummary::Add(const TelemetryEvent& event)
 {
     events_++;
+    if (event.component == L"BlackCat64.sys") blackCatEvents_++;
     if (event.outsideClient) outsideEvents_++;
     if (event.header.Category == MsMonCategoryHardwareIdentity) hardwareEvents_++;
     if ((event.header.Flags & MsMonFlagPayloadUnavailable) != 0) payloadUnavailable_++;
@@ -124,6 +125,7 @@ std::string SessionSummary::Json(const MSMON_STATISTICS& statistics, uint64_t et
     json << "{\"type\":\"observer_summary\",\"session_id\":" << statistics.SessionId
          << ",\"events\":" << events_ << ",\"outside_client_events\":" << outsideEvents_
          << ",\"hardware_identity_events\":" << hardwareEvents_
+         << ",\"blackcat_events\":" << blackCatEvents_
          << ",\"payload_bytes\":" << payloadBytes_
          << ",\"payload_operations\":" << payloadOperations_.size()
          << ",\"complete_payload_operations\":" << completePayloads

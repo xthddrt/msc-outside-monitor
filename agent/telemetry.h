@@ -16,6 +16,7 @@ struct TelemetryEvent {
     MSMON_EVENT_HEADER header{};
     std::wstring text;
     std::wstring detail;
+    std::wstring component;
     std::vector<std::wstring> modules;
     std::vector<BYTE> payload;
     std::string source = "driver";

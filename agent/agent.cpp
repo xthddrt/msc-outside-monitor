@@ -126,6 +126,13 @@ public:
                                buffer.data(), static_cast<DWORD>(buffer.size()), &bytes, nullptr) != 0;
     }
 
+    bool RefreshModules()
+    {
+        DWORD bytes = 0;
+        return DeviceIoControl(handle_, MSMON_IOCTL_REFRESH_MODULES, nullptr, 0,
+                               nullptr, 0, &bytes, nullptr) != 0;
+    }
+
     bool StopTracking()
     {
         DWORD bytes = 0;
@@ -316,6 +323,10 @@ int wmain(int argc, wchar_t** argv)
         std::cerr << "Could not start the driver session: Win32 error " << GetLastError() << "\n";
         return 1;
     }
+    if (!device.RefreshModules()) {
+        std::cerr << "Could not refresh kernel module attribution: Win32 error " << GetLastError() << "\n";
+        return 1;
+    }
 
     ProcessScope scope;
     unsigned registered = TrackExisting(device, clientRoot, scope);
@@ -390,6 +401,8 @@ int wmain(int argc, wchar_t** argv)
     uint64_t driverGaps = 0;
     uint64_t etwGaps = 0;
     uint64_t totalEvents = 0;
+    uint64_t nextModuleRefresh = GetTickCount64() + 1000;
+    bool moduleRefreshWarning = false;
     int result = 0;
 
     auto writeGap = [&](const std::string& source, uint64_t after, uint64_t before) {
@@ -491,6 +504,17 @@ int wmain(int argc, wchar_t** argv)
         if (result != 0 || !drainEtw()) {
             result = 1;
             break;
+        }
+        if (!draining && GetTickCount64() >= nextModuleRefresh) {
+            if (!device.RefreshModules() && !moduleRefreshWarning) {
+                if (!writeCoverage(L"module_refresh_failed",
+                                   L"BlackCat image mapping could not be refreshed; direct stack attribution may be incomplete")) {
+                    result = 1;
+                    break;
+                }
+                moduleRefreshWarning = true;
+            }
+            nextModuleRefresh = GetTickCount64() + 1000;
         }
     } while (!once && (!draining || bytes != 0));
 

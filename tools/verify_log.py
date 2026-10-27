@@ -63,7 +63,7 @@ def verify(paths):
                 expected = hashlib.sha256((previous + original).encode("utf-8")).hexdigest()
                 if chain != expected:
                     raise ValueError(f"{path}:{number}: hash-chain mismatch")
-                if record.get("protocol", 1) not in {1, 2, 3}:
+                if record.get("protocol", 1) not in {1, 2, 3, 4}:
                     raise ValueError(f"{path}:{number}: unsupported protocol")
                 if "record_index" in record and record["record_index"] != lines + 1:
                     raise ValueError(f"{path}:{number}: non-consecutive record index")

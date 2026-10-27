@@ -25,6 +25,7 @@ Full registry/volume payload capture is enabled by default. Add `--no-payloads` 
 
 - Start the collector before the game. Verify exact-path root/helper registration, descendant inheritance, PID + creation-time identity, and no tracking of an unrelated same-named executable.
 - Confirm process/thread start/exit, image paths, module bases/sizes, and command lines when available.
+- Verify BlackCat load detection and direct-stack component attribution. Confirm `BlackCat64.sys` appears only on direct matches and unrelated system activity is not labeled. Do not treat a BlackCat frame as proof that MapleStory requested the operation.
 - From a controlled tracked process, open and duplicate handles to another process/thread. Verify target PID/image, requested/granted access, and result without changing access.
 - Perform controlled file reads/writes, directory enumeration, rename/set-information, named-pipe, and visible device-control operations. Verify paths, status, lengths/offsets, and missing-path flags. Generic file and named-pipe contents are intentionally not captured in this version.
 - Use synthetic registry strings, multi-strings, DWORD/QWORD values, binary data, and values larger than 8 KiB. Verify exact Base64 bytes, friendly decoded values, chunk ordering, and final operation status. Compare the values with the known inputs, not with real credentials or production identifiers.

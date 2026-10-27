@@ -18,7 +18,9 @@ static OB_PREOP_CALLBACK_STATUS MsMonObjectPre(PVOID RegistrationContext, POB_PR
 
     UNREFERENCED_PARAMETER(RegistrationContext);
     Information->CallContext = NULL;
-    if (Information->KernelHandle || !MsMonIsTracked(source, 0) || Information->Parameters == NULL) {
+    if (Information->Parameters == NULL ||
+        (Information->KernelHandle && !MsMonCurrentIsBlackCat()) ||
+        (!MsMonIsTracked(source, 0) && !MsMonCurrentIsBlackCat())) {
         return OB_PREOP_SUCCESS;
     }
     context = ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(*context), MSMON_POOL_TAG);

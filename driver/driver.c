@@ -26,7 +26,11 @@ static NTSTATUS MsMonStartSession(PMSMON_SESSION_CONFIG Config)
     status = MsMonEventsStart(Config->SessionId, Config->QueueRecords, Config->QueueBytes, Config->PayloadMode);
     if (!NT_SUCCESS(status)) return status;
     status = MsMonProcessStartSession(&root);
-    if (!NT_SUCCESS(status)) MsMonEventsStop();
+    if (NT_SUCCESS(status)) status = MsMonAttributionRefresh();
+    if (!NT_SUCCESS(status)) {
+        MsMonProcessStopSession();
+        MsMonEventsStop();
+    }
     return status;
 }
 
@@ -49,13 +53,18 @@ static NTSTATUS MsMonDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
         status = MsMonStartSession((PMSMON_SESSION_CONFIG)Irp->AssociatedIrp.SystemBuffer);
         break;
     case MSMON_IOCTL_STOP_SESSION:
+        MsMonAttributionStop();
         MsMonProcessStopSession();
         MsMonEventsStop();
         status = STATUS_SUCCESS;
         break;
     case MSMON_IOCTL_STOP_TRACKING:
+        MsMonAttributionStop();
         MsMonProcessStopSession();
         status = STATUS_SUCCESS;
+        break;
+    case MSMON_IOCTL_REFRESH_MODULES:
+        status = MsMonAttributionRefresh();
         break;
     case MSMON_IOCTL_TRACK_PID: {
         PMSMON_TRACK_REQUEST request = (PMSMON_TRACK_REQUEST)Irp->AssociatedIrp.SystemBuffer;
@@ -114,6 +123,7 @@ VOID MsMonDriverUnload(PDRIVER_OBJECT DriverObject)
     MsMonFileFilterUninitialize();
     MsMonObjectUninitialize();
     MsMonProcessUninitialize();
+    MsMonAttributionStop();
     MsMonEventsUninitialize();
     RtlInitUnicodeString(&dosName, MSMON_DOS_DEVICE_NAME);
     (VOID)IoDeleteSymbolicLink(&dosName);
@@ -146,6 +156,12 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
         return status;
     }
 
+    status = MsMonAttributionInitialize();
+    if (!NT_SUCCESS(status)) {
+        (VOID)IoDeleteSymbolicLink(&dosName);
+        IoDeleteDevice(deviceObject);
+        return status;
+    }
     status = MsMonEventsInitialize();
     if (NT_SUCCESS(status)) status = MsMonProcessInitialize();
     if (NT_SUCCESS(status)) status = MsMonObjectInitialize(DriverObject);

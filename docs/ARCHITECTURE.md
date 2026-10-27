@@ -2,7 +2,7 @@
 
 ## Data path
 
-Protocol v3 uses self-delimiting `MSMON_EVENT_HEADER` records with bounded UTF-16 metadata and optional raw payloads. Each text field is capped at 2,048 bytes, each record at 16,384 bytes, and each payload chunk at 8,192 bytes. Payload records include an operation ID, total byte length, byte offset, and chunk index/count. The collector validates all sizes, offsets, versions, session IDs, string/payload bounds, and source sequences.
+Protocol v4 uses self-delimiting `MSMON_EVENT_HEADER` records with bounded UTF-16 metadata, an optional source component, and optional raw payloads. Each text field is capped at 2,048 bytes, each record at 16,384 bytes, and each payload chunk at 8,192 bytes. Payload records include an operation ID, total byte length, byte offset, and chunk index/count. The collector validates all sizes, offsets, versions, session IDs, string/payload bounds, and source sequences.
 
 The driver assigns session, source-sequence, and operation IDs and queues records in a bounded nonpaged list. Defaults are 16,384 records and 64 MiB, with maxima of 32,768 records and 128 MiB. The collector drains up to 1 MiB per IOCTL. ETW uses a separate bounded queue and source sequence. Allocation failure or a full queue increments drop counters; missing chunks make payload operations incomplete. On Ctrl+C, the collector stops new driver tracking and drains the remaining queue before final statistics. This is not lossless capture.
 
@@ -44,6 +44,12 @@ Successful value queries and enumeration support Partial, Full, Align64, and mul
 ### Network
 
 WFP callouts cover ALE connect and receive/accept plus flow-established IPv4/IPv6 layers. Events carry flow IDs, endpoints, protocol, and packed ports. Associated flow contexts produce close events and are removed during teardown. Callouts permit traffic and do not capture packet payloads or decrypt TLS.
+
+### BlackCat kernel attribution
+
+`driver/attribution.c` uses Auxiliary Kernel Library module enumeration at PASSIVE_LEVEL to record BlackCat's image base and size. The map refreshes at session start and through a once-per-second agent IOCTL. Event-time checks use `RtlCaptureStackBackTrace` and accept only a direct address within that image. Direct matches produce component `BlackCat64.sys` and `stack_resolved`; unrelated system activity does not inherit the component.
+
+This is intentionally limited to direct evidence in existing process, object, file, and registry callbacks. There is no thread-lineage map, completion-context redesign, network expansion, or BlackCat device-stack attachment. Queued work items, DPCs on shared worker threads, protected code, and BlackCat device IRPs outside those callbacks remain uncovered. A BlackCat frame proves BlackCat participation, not MapleStory-to-BlackCat causality.
 
 ### ETW and attribution
 

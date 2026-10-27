@@ -227,18 +227,24 @@ static VOID MsMonProcessNotify(PEPROCESS Process, HANDLE ProcessId, PPS_CREATE_N
     NTSTATUS status;
 
     if (CreateInfo == NULL) {
-        if (MsMonIsTracked(ProcessId, startTime)) {
+        BOOLEAN tracked = MsMonIsTracked(ProcessId, startTime);
+        if (tracked || MsMonCurrentIsBlackCat()) {
             (VOID)MsMonLogEvent(MsMonProcessExit, ProcessId, NULL, NULL, NULL, 0, 0,
                                 STATUS_SUCCESS, 0, MsMonCategoryExternalProcess,
                                 (ULONGLONG)startTime, 0, NULL, NULL);
-            MsMonForgetProcess(ProcessId, startTime);
         }
+        if (tracked) MsMonForgetProcess(ProcessId, startTime);
         return;
     }
     if (MsMonIsTracked(CreateInfo->ParentProcessId, 0)) {
         flags = MsMonFlagInheritedTrack;
     } else if (MsMonKnownImage(CreateInfo->ImageFileName)) {
         flags = MsMonFlagExplicitTrack;
+    } else if (MsMonCurrentIsBlackCat()) {
+        (VOID)MsMonLogEvent(MsMonProcessStart, ProcessId, CreateInfo->ParentProcessId, NULL, NULL, 0,
+                            MsMonFlagExplicitTrack, STATUS_SUCCESS, 0, MsMonCategoryExternalProcess,
+                            (ULONGLONG)startTime, 0, CreateInfo->ImageFileName, CreateInfo->CommandLine);
+        return;
     } else {
         return;
     }
@@ -251,7 +257,7 @@ static VOID MsMonProcessNotify(PEPROCESS Process, HANDLE ProcessId, PPS_CREATE_N
 
 static VOID MsMonThreadNotify(HANDLE ProcessId, HANDLE ThreadId, BOOLEAN Create)
 {
-    if (!MsMonIsTracked(ProcessId, 0)) return;
+    if (!MsMonIsTracked(ProcessId, 0) && !MsMonCurrentIsBlackCat()) return;
     (VOID)MsMonLogEvent(Create ? MsMonThreadStart : MsMonThreadExit,
                         ProcessId, NULL, ThreadId, NULL, 0, 0, STATUS_SUCCESS, 0,
                         MsMonCategoryUnknown, 0, 0, NULL, NULL);
@@ -259,7 +265,7 @@ static VOID MsMonThreadNotify(HANDLE ProcessId, HANDLE ThreadId, BOOLEAN Create)
 
 static VOID MsMonImageNotify(PUNICODE_STRING FullImageName, HANDLE ProcessId, PIMAGE_INFO ImageInfo)
 {
-    if (!MsMonIsTracked(ProcessId, 0)) return;
+    if (!MsMonIsTracked(ProcessId, 0) && !MsMonCurrentIsBlackCat()) return;
     (VOID)MsMonLogEvent(MsMonImageLoad, ProcessId, NULL, NULL, NULL, 0, 0,
                         STATUS_SUCCESS, 0, MsMonCategoryUnknown,
                         (ULONGLONG)ImageInfo->ImageBase, ImageInfo->ImageSize, FullImageName, NULL);

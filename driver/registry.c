@@ -320,7 +320,7 @@ static NTSTATUS MsMonRegistryCallback(PVOID CallbackContext, PVOID Argument1, PV
         ExFreePoolWithTag(context, MSMON_POOL_TAG);
         return STATUS_SUCCESS;
     }
-    if (!MsMonIsTracked(PsGetCurrentProcessId(), 0)) return STATUS_SUCCESS;
+    if (!MsMonIsTracked(PsGetCurrentProcessId(), 0) && !MsMonCurrentIsBlackCat()) return STATUS_SUCCESS;
 
     switch (operation) {
     case RegNtPreOpenKeyEx:

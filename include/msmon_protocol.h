@@ -7,7 +7,7 @@ extern "C" {
 #define MSMON_DEVICE_NAME L"\\Device\\MsMon"
 #define MSMON_DOS_DEVICE_NAME L"\\DosDevices\\MsMon"
 #define MSMON_USER_DEVICE_PATH "\\\\.\\MsMon"
-#define MSMON_PROTOCOL_VERSION 3u
+#define MSMON_PROTOCOL_VERSION 4u
 #define MSMON_MAX_EVENT_RECORD_BYTES 16384u
 #define MSMON_MAX_EVENT_STRING_BYTES 2048u
 #define MSMON_PAYLOAD_CHUNK_BYTES 8192u
@@ -117,6 +117,8 @@ typedef struct _MSMON_EVENT_HEADER {
     unsigned short TextBytes;
     unsigned short DetailOffset;
     unsigned short DetailBytes;
+    unsigned short ComponentOffset;
+    unsigned short ComponentBytes;
     unsigned __int64 Value0;
     unsigned __int64 Value1;
     unsigned __int64 OperationId;
@@ -184,6 +186,7 @@ typedef MSMON_STATISTICS* PMSMON_STATISTICS;
 #define MSMON_IOCTL_READ_EVENTS CTL_CODE(FILE_DEVICE_UNKNOWN, 0x803, METHOD_BUFFERED, FILE_READ_ACCESS)
 #define MSMON_IOCTL_STATISTICS CTL_CODE(FILE_DEVICE_UNKNOWN, 0x804, METHOD_BUFFERED, FILE_READ_ACCESS)
 #define MSMON_IOCTL_STOP_TRACKING CTL_CODE(FILE_DEVICE_UNKNOWN, 0x805, METHOD_BUFFERED, FILE_WRITE_ACCESS)
+#define MSMON_IOCTL_REFRESH_MODULES CTL_CODE(FILE_DEVICE_UNKNOWN, 0x806, METHOD_BUFFERED, FILE_WRITE_ACCESS)
 
 #ifdef __cplusplus
 }

@@ -121,11 +121,15 @@ static NTSTATUS MsMonLogEventInternal(
     LARGE_INTEGER timestamp;
     KIRQL oldIrql;
     BOOLEAN truncated = FALSE;
+    BOOLEAN blackCat = MsMonCurrentIsBlackCat();
+    UNICODE_STRING component = { sizeof(L"BlackCat64.sys") - sizeof(WCHAR), sizeof(L"BlackCat64.sys"), (PWSTR)L"BlackCat64.sys" };
     USHORT textBytes = MsMonStringBytes(Text, &truncated);
     USHORT detailBytes = MsMonStringBytes(Detail, &truncated);
+    USHORT componentBytes = blackCat ? MsMonStringBytes(&component, &truncated) : 0;
     ULONG textOffset = (sizeof(MSMON_EVENT_HEADER) + 7u) & ~7u;
     ULONG detailOffset = (textOffset + textBytes + (textBytes != 0 ? 2u : 0u) + 7u) & ~7u;
-    ULONG payloadOffset = (detailOffset + detailBytes + (detailBytes != 0 ? 2u : 0u) + 7u) & ~7u;
+    ULONG componentOffset = (detailOffset + detailBytes + (detailBytes != 0 ? 2u : 0u) + 7u) & ~7u;
+    ULONG payloadOffset = (componentOffset + componentBytes + (componentBytes != 0 ? 2u : 0u) + 7u) & ~7u;
     ULONG payloadBytes = Payload != NULL ? Payload->ByteCount : 0;
     ULONG recordBytes = payloadOffset + payloadBytes;
     ULONG allocationBytes = sizeof(LIST_ENTRY) + recordBytes;
@@ -157,7 +161,7 @@ static NTSTATUS MsMonLogEventInternal(
     block->Event.Status = Status;
     block->Event.DesiredAccess = DesiredAccess;
     block->Event.Category = Category;
-    block->Event.Attribution = MsMonAttributionProcessOnly;
+    block->Event.Attribution = blackCat ? MsMonAttributionStackResolved : MsMonAttributionProcessOnly;
     block->Event.Value0 = Value0;
     block->Event.Value1 = Value1;
     block->Event.OperationId = Payload != NULL ? Payload->OperationId : OperationId;
@@ -177,6 +181,13 @@ static NTSTATUS MsMonLogEventInternal(
         destination = (PWSTR)((PUCHAR)&block->Event + detailOffset);
         RtlCopyMemory(destination, Detail->Buffer, detailBytes);
         destination[detailBytes / sizeof(WCHAR)] = L'\0';
+    }
+    if (componentBytes != 0) {
+        block->Event.ComponentOffset = (USHORT)componentOffset;
+        block->Event.ComponentBytes = componentBytes;
+        destination = (PWSTR)((PUCHAR)&block->Event + componentOffset);
+        RtlCopyMemory(destination, component.Buffer, componentBytes);
+        destination[componentBytes / sizeof(WCHAR)] = L'\0';
     }
     if (Payload != NULL) {
         block->Event.Flags |= MsMonFlagPayloadPresent;

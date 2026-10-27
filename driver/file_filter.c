@@ -4,6 +4,7 @@
 #define MSMON_POOL_TAG 'noSM'
 
 BOOLEAN MsMonIsTracked(HANDLE ProcessId, LONGLONG StartTime);
+BOOLEAN MsMonCurrentIsBlackCat(VOID);
 NTSTATUS MsMonLogEvent(ULONG Type, HANDLE ProcessId, HANDLE ParentProcessId, HANDLE ThreadId,
                        HANDLE TargetProcessId, LONGLONG TargetProcessStartTime, ULONG Flags,
                        NTSTATUS Status, ULONG DesiredAccess, ULONG Category,
@@ -85,7 +86,7 @@ static FLT_PREOP_CALLBACK_STATUS MsMonPreOperation(
     PFLT_FILE_NAME_INFORMATION nameInfo = NULL;
     UNREFERENCED_PARAMETER(FltObjects);
     *CompletionContext = NULL;
-    if (!MsMonIsTracked(PsGetCurrentProcessId(), 0)) return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    if (!MsMonIsTracked(PsGetCurrentProcessId(), 0) && !MsMonCurrentIsBlackCat()) return FLT_PREOP_SUCCESS_NO_CALLBACK;
     (VOID)FltGetFileNameInformation(Data,
                                     FLT_FILE_NAME_NORMALIZED | FLT_FILE_NAME_QUERY_CACHE_ONLY,
                                     &nameInfo);
@@ -162,7 +163,7 @@ static FLT_POSTOP_CALLBACK_STATUS MsMonPostOperation(
     PCUNICODE_STRING path = nameInfo != NULL ? &nameInfo->Name : NULL;
     UNREFERENCED_PARAMETER(FltObjects);
     UNREFERENCED_PARAMETER(Flags);
-    if (MsMonIsTracked(PsGetCurrentProcessId(), 0)) {
+    if (MsMonIsTracked(PsGetCurrentProcessId(), 0) || MsMonCurrentIsBlackCat()) {
         if (Data->Iopb->MajorFunction == IRP_MJ_QUERY_VOLUME_INFORMATION && MsMonPayloadEnabled()) {
             MsMonCaptureVolume(Data, path);
         } else {
@@ -189,7 +190,7 @@ static FLT_POSTOP_CALLBACK_STATUS MsMonPostCreate(
     UNREFERENCED_PARAMETER(FltObjects);
     UNREFERENCED_PARAMETER(CompletionContext);
     UNREFERENCED_PARAMETER(Flags);
-    if (!MsMonIsTracked(PsGetCurrentProcessId(), 0)) return FLT_POSTOP_FINISHED_PROCESSING;
+    if (!MsMonIsTracked(PsGetCurrentProcessId(), 0) && !MsMonCurrentIsBlackCat()) return FLT_POSTOP_FINISHED_PROCESSING;
     if (NT_SUCCESS(FltGetFileNameInformation(Data,
                                              FLT_FILE_NAME_NORMALIZED | FLT_FILE_NAME_QUERY_DEFAULT,
                                              &nameInfo))) path = &nameInfo->Name;

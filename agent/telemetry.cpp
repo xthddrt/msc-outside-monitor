@@ -412,7 +412,8 @@ std::string TelemetryJson(const TelemetryEvent& event)
          << ",\"value1\":" << header.Value1
          << ",\"operation_id\":" << header.OperationId
          << ",\"text\":\"" << JsonEscape(WideToUtf8(event.text))
-         << "\",\"detail\":\"" << JsonEscape(WideToUtf8(event.detail)) << "\"";
+         << "\",\"detail\":\"" << JsonEscape(WideToUtf8(event.detail))
+         << "\",\"component\":\"" << JsonEscape(WideToUtf8(event.component)) << "\"";
     if ((header.Flags & MsMonFlagPayloadPresent) != 0) {
         json << ",\"payload\":{\"kind\":\"" << PayloadKindName(header.PayloadKind)
              << "\",\"encoding\":\"base64\",\"data\":\"" << Base64(event.payload)
@@ -459,7 +460,8 @@ bool DecodeDriverEvent(const BYTE* data, DWORD available, TelemetryEvent& event,
                offset <= header.Size && bytes <= header.Size - offset;
     };
     if (!validString(header.TextOffset, header.TextBytes) ||
-        !validString(header.DetailOffset, header.DetailBytes)) {
+        !validString(header.DetailOffset, header.DetailBytes) ||
+        !validString(header.ComponentOffset, header.ComponentBytes)) {
         error = "invalid event string bounds";
         return false;
     }
@@ -503,6 +505,10 @@ bool DecodeDriverEvent(const BYTE* data, DWORD available, TelemetryEvent& event,
     if (header.DetailBytes != 0) {
         const wchar_t* detail = reinterpret_cast<const wchar_t*>(data + header.DetailOffset);
         event.detail.assign(detail, detail + header.DetailBytes / sizeof(wchar_t));
+    }
+    if (header.ComponentBytes != 0) {
+        const wchar_t* component = reinterpret_cast<const wchar_t*>(data + header.ComponentOffset);
+        event.component.assign(component, component + header.ComponentBytes / sizeof(wchar_t));
     }
     event.source = "driver";
     consumed = header.Size;

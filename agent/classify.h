@@ -26,6 +26,7 @@ private:
     uint64_t events_ = 0;
     uint64_t outsideEvents_ = 0;
     uint64_t hardwareEvents_ = 0;
+    uint64_t blackCatEvents_ = 0;
     uint64_t payloadBytes_ = 0;
     uint64_t payloadUnavailable_ = 0;
     uint64_t payloadDuplicateChunks_ = 0;

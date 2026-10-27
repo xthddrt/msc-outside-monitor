@@ -10,6 +10,11 @@
 DRIVER_INITIALIZE DriverEntry;
 DRIVER_UNLOAD MsMonDriverUnload;
 
+NTSTATUS MsMonAttributionInitialize(VOID);
+NTSTATUS MsMonAttributionRefresh(VOID);
+VOID MsMonAttributionStop(VOID);
+BOOLEAN MsMonCurrentIsBlackCat(VOID);
+
 NTSTATUS MsMonEventsInitialize(VOID);
 VOID MsMonEventsUninitialize(VOID);
 NTSTATUS MsMonEventsStart(ULONGLONG SessionId, ULONG QueueRecords, ULONG QueueBytes, ULONG PayloadMode);
