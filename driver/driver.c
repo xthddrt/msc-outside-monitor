@@ -6,8 +6,8 @@ static const GUID MSMON_DEVICE_GUID = { 0xdb6a8ad5, 0xc08e, 0x4f95, { 0x8d, 0x15
 /*
  * Control IRPs can block inside the driver (MSMON_IOCTL_READ_EVENTS waits for
  * events). DriverUnload must not return while one of those is still executing
- * our code, so every dispatch takes a rundown reference and unload completes
- * the rundown and waits before tearing anything down.
+ * our code, so every dispatch takes a rundown reference and unload refuses new
+ * acquisitions, waits for the ones in flight, then marks the rundown complete.
  */
 static EX_RUNDOWN_REF gIoRundown;
 
@@ -179,8 +179,10 @@ VOID MsMonDriverUnload(PDRIVER_OBJECT DriverObject)
     MsMonAttributionStop();
 
     /*
-     * No new control IRP can start now, and the ones already running (bounded
-     * by the read timeout, which the event above shortens) have finished.
+     * ExWaitForRundownProtectionRelease refuses new acquisitions and blocks
+     * until the control IRPs already in flight (bounded by the read timeout,
+     * which the event above shortens) have finished. ExRundownCompleted marks
+     * the rundown finished and must follow the wait, per its documentation.
      */
     ExWaitForRundownProtectionRelease(&gIoRundown);
     ExRundownCompleted(&gIoRundown);
