@@ -322,7 +322,7 @@ static std::string BuildCoverageJson(
         firstCount = false;
         json << "\"" << item.first << "\":" << item.second;
     }
-    json << "}}";
+    json << "}}}";
     return json.str();
 }
 
