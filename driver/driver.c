@@ -182,8 +182,8 @@ VOID MsMonDriverUnload(PDRIVER_OBJECT DriverObject)
      * No new control IRP can start now, and the ones already running (bounded
      * by the read timeout, which the event above shortens) have finished.
      */
-    ExRundownCompleted(&gIoRundown);
     ExWaitForRundownProtectionRelease(&gIoRundown);
+    ExRundownCompleted(&gIoRundown);
 
     MsMonEventsUninitialize();
     RtlInitUnicodeString(&dosName, MSMON_DOS_DEVICE_NAME);

@@ -414,8 +414,8 @@ VOID MsMonProcessUninitialize(VOID)
     MsMonRemoveProcessNotify();
     if (gCallbackRundownInitialized) {
         /* Stop granting new callbacks, then drain the ones already running. */
-        ExRundownCompleted(&gCallbackRundown);
         ExWaitForRundownProtectionRelease(&gCallbackRundown);
+        ExRundownCompleted(&gCallbackRundown);
         gCallbackRundownInitialized = FALSE;
     }
     MsMonRecordStatus(L"RundownComplete", STATUS_SUCCESS);
