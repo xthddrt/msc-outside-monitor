@@ -78,6 +78,8 @@
     - Direct BlackCat stack matches are accepted in addition to tracked PIDs.
 18. **Allocation-drop accounting**
     - `MsMonEventsNoteDropped` advances the driver sequence and increments `Dropped` when a file/registry/object context or a process registration fails, so the gap is visible.
+19. **ETW wall-clock timestamps**
+    - `ClientContext = 2` (system time) is required because `Timestamp()` decodes `EventHeader.TimeStamp` as a FILETIME. The baseline value `3` (CPU cycle counter) produced 1601-era timestamps for every ETW event.
 
 ---
 

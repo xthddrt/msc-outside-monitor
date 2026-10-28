@@ -219,6 +219,11 @@ bool EtwCollector::Start(std::string& error)
     auto* properties = reinterpret_cast<EVENT_TRACE_PROPERTIES*>(properties_.data());
     properties->Wnode.BufferSize = static_cast<ULONG>(properties_.size());
     properties->Wnode.Flags = WNODE_FLAG_TRACED_GUID;
+    /*
+     * ClientContext 2 = system time (100ns FILETIME).  The JSON writer decodes
+     * EventHeader.TimeStamp as a FILETIME; the old value 3 (CPU cycle counter)
+     * produced 1601-era timestamps for every ETW event.
+     */
     properties->Wnode.ClientContext = 2;
     properties->LogFileMode = EVENT_TRACE_REAL_TIME_MODE;
     properties->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
