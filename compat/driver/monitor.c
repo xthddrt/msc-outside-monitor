@@ -1480,7 +1480,11 @@ MonConfigure(_In_ const SYSINFO_MON_CONFIG *config)
     g_Types = config->Types & SYSINFO_MON_BITS_ALL;
     InterlockedExchange(&g_Enabled, 1);
 
-    TraceSetUnsafeHooksEnabled(config->UnsafeHooksEnabled);
+    if (!config->Enable) {
+        TraceSetUnsafeHooksEnabled(0);
+    } else if (config->UnsafeHooksEnabled) {
+        TraceSetUnsafeHooksEnabled(1);
+    }
 #if SYSINFO_ENABLE_HANDLE_HOOKS
     if (TraceUnsafeHooksEnabled()) StartOpenHooks();
 #endif

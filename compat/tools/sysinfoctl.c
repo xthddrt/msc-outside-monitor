@@ -2320,7 +2320,7 @@ ParseTypes(const char *spec, ULONG *mask)
 
 static int
 CmdMonConfig(ULONG enable, const char *filter, ULONG types, const char *ignoreSpec,
-             int ioctlBytes, const char *ioctlMatch)
+             int ioctlBytes, const char *ioctlMatch, int unsafeHooks)
 {
     HANDLE device = OpenDriver();
     SYSINFO_MON_CONFIG cfg;
@@ -2338,6 +2338,7 @@ CmdMonConfig(ULONG enable, const char *filter, ULONG types, const char *ignoreSp
     cfg.SsnRead = NtdllSsn("NtReadVirtualMemory");
     cfg.SsnWrite = NtdllSsn("NtWriteVirtualMemory");
     cfg.Types = types;
+    cfg.UnsafeHooksEnabled = (enable && unsafeHooks) ? 1u : 0u;
 
     /* IOCTL payload capture: tells you what user mode asks a driver to do. */
     {
@@ -2713,7 +2714,7 @@ CmdMonCollect(const char *file, const char *filter, ULONG types)
     }
 
     /* Collect takes whatever the caller asked for; default is everything. */
-    if (CmdMonConfig(1, filter, types, NULL, 16, NULL) != 0) {
+    if (CmdMonConfig(1, filter, types, NULL, 16, NULL, 0) != 0) {
         fclose(out);
         CloseHandle(device);
         return 1;
@@ -3059,10 +3060,11 @@ Usage(VOID)
            "  sysinfoctl status\n"
            "  sysinfoctl hostname [name]          show or set the real computer name\n"
            "  sysinfoctl mac on | off             set/clear a real MAC on every adapter\n"
-           "  sysinfoctl mon on [pid|name,...] [types=..] [ignore=..] [ioctl=N] [ioctlmatch=..]\n"
+           "  sysinfoctl mon on [pid|name,...] [types=..] [ignore=..] [ioctl=N] [ioctlmatch=..] [unsafe]\n"
            "                                      watch what a process (or everything) does\n"
            "                                      types: quiet (default) | all | file,key,...\n"
            "                                      ioctl: hex-dump N bytes of matching IOCTL input\n"
+           "                                      unsafe: enable PatchGuard-unsafe inline hooks\n"
            "  sysinfoctl mon summary [filter]     everything so far, aggregated\n"
            "  sysinfoctl mon dump [filter] | watch [filter]\n"
            "                                      print events (filter matches image/path/detail/caller)\n"
@@ -3097,6 +3099,7 @@ main(int argc, char **argv)
             const char *ignore = NULL;
             const char *ioctlMatch = NULL;
             int ioctlBytes = 16;
+            int unsafeHooks = (argc > 3 && _stricmp(argv[3], "unsafe") == 0) ? 1 : 0;
             int i;
 
             for (i = 4; i < argc; i++) {
@@ -3108,12 +3111,15 @@ main(int argc, char **argv)
                     ioctlMatch = argv[i] + 11;
                 } else if (_strnicmp(argv[i], "ioctl=", 6) == 0) {
                     ioctlBytes = atoi(argv[i] + 6);
+                } else if (_stricmp(argv[i], "unsafe") == 0) {
+                    unsafeHooks = 1;
                 }
             }
-            return CmdMonConfig(1, (argc > 3) ? argv[3] : NULL, types, ignore,
-                                ioctlBytes, ioctlMatch);
+            return CmdMonConfig(1,
+                                (argc > 3 && _stricmp(argv[3], "unsafe") != 0) ? argv[3] : NULL,
+                                types, ignore, ioctlBytes, ioctlMatch, unsafeHooks);
         }
-        if (_stricmp(what, "off") == 0)   return CmdMonConfig(0, NULL, 0, NULL, 0, NULL);
+        if (_stricmp(what, "off") == 0)   return CmdMonConfig(0, NULL, 0, NULL, 0, NULL, 0);
         if (_stricmp(what, "collect") == 0) {
             ULONG types = SYSINFO_MON_BITS_ALL;
 

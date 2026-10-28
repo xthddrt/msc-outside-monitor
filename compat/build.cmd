@@ -35,7 +35,7 @@ link /nologo /DRIVER:WDM /MAP:"%OUT%\msmon-legacy.map" /SUBSYSTEM:NATIVE /MACHIN
      /OUT:"%OUT%\%SYSN%" ^
      "%OUT%\disasm.obj" "%OUT%\hooks.obj" "%OUT%\syscall.obj" ^
      "%OUT%\monitor.obj" "%OUT%\trace.obj" "%OUT%\guard.obj" "%OUT%\main.obj" ^
-     ntoskrnl.lib hal.lib Wdmsec.lib kernel32.lib
+     ntoskrnl.lib hal.lib Wdmsec.lib BufferOverflowFastFailK.lib
 if errorlevel 1 ( echo [!] driver link failed & exit /b 1 )
 
 echo === compatibility control tool ===

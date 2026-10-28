@@ -37,7 +37,7 @@
  * on a machine that is being used.  Set to 1 only for a short, supervised
  * monitoring session. */
 #ifndef SYSINFO_ENABLE_TRACE_HOOKS
-#define SYSINFO_ENABLE_TRACE_HOOKS 0
+#define SYSINFO_ENABLE_TRACE_HOOKS 1
 #endif
 
 static volatile LONG g_UnsafeHooksEnabled;
@@ -79,6 +79,12 @@ typedef NTSTATUS (NTAPI *PFN_NtWriteFile)(
 typedef NTSTATUS (NTAPI *PFN_NtSetInformationFile)(
     _In_ HANDLE, _Out_ PIO_STATUS_BLOCK, _In_reads_bytes_(Length) PVOID, _In_ ULONG,
     _In_ FILE_INFORMATION_CLASS);
+typedef NTSTATUS (NTAPI *PFN_NtDeviceIoControlFile)(
+    _In_ HANDLE, _In_opt_ HANDLE, _In_opt_ PIO_APC_ROUTINE, _In_opt_ PVOID,
+    _Out_ PIO_STATUS_BLOCK, _In_ ULONG, _In_opt_ PVOID, _In_ ULONG,
+    _Out_opt_ PVOID, _In_ ULONG);
+typedef NTSTATUS (NTAPI *PFN_NtQuerySystemInformation)(
+    _In_ ULONG, PVOID, ULONG, PULONG);
 
 /* FILE_RENAME_INFORMATION as the kernel sees it on x64. */
 typedef struct _SYSINFO_RENAME_INFO {
@@ -290,7 +296,7 @@ PrependRoot(_In_opt_ HANDLE root, _Inout_ PUNICODE_STRING path,
 }
 
 
-static HOOK g_Hooks[28];
+static HOOK g_Hooks[30];
 static ULONG g_HookCount;
 static volatile LONG g_TraceHookCount;
 
@@ -1680,6 +1686,78 @@ HookNtWriteVirtualMemory(_In_ HANDLE ProcessHandle, _In_ PVOID BaseAddress,
     return status;
 }
 
+static NTSTATUS NTAPI
+HookNtDeviceIoControlFile(
+    _In_ HANDLE FileHandle,
+    _In_opt_ HANDLE Event,
+    _In_opt_ PIO_APC_ROUTINE ApcRoutine,
+    _In_opt_ PVOID ApcContext,
+    _Out_ PIO_STATUS_BLOCK IoStatusBlock,
+    _In_ ULONG IoControlCode,
+    _In_opt_ PVOID InputBuffer,
+    _In_ ULONG InputBufferLength,
+    _Out_opt_ PVOID OutputBuffer,
+    _In_ ULONG OutputBufferLength)
+{
+    PFN_NtDeviceIoControlFile original = (PFN_NtDeviceIoControlFile)g_Hooks[28].Trampoline;
+    NTSTATUS status;
+
+    HookEnter();
+    status = original(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
+                      IoControlCode, InputBuffer, InputBufferLength,
+                      OutputBuffer, OutputBufferLength);
+    if (MonActive()) {
+        WCHAR pathBuffer[SYSINFO_MON_MAX_PATH];
+        UNICODE_STRING path;
+        CHAR detail[SYSINFO_MON_MAX_DETAIL];
+        ULONG pos = 0;
+
+        detail[0] = 0;
+        AppendStr(detail, sizeof(detail), &pos, "in ");
+        AppendDec(detail, sizeof(detail), &pos, InputBufferLength);
+        AppendStr(detail, sizeof(detail), &pos, " out ");
+        AppendDec(detail, sizeof(detail), &pos, OutputBufferLength);
+        if (!NT_SUCCESS(status)) AppendStr(detail, sizeof(detail), &pos, " FAILED");
+        if (FileHandlePath(FileHandle, &path, pathBuffer, RTL_NUMBER_OF(pathBuffer))) {
+            MonEvent(SYSINFO_MON_IOCTL, IoControlCode, &path, detail);
+        } else {
+            MonEvent(SYSINFO_MON_IOCTL, IoControlCode, NULL, detail);
+        }
+    }
+    HookLeave();
+    return status;
+}
+
+static NTSTATUS NTAPI
+HookNtQuerySystemInformation(
+    _In_ ULONG SystemInformationClass,
+    PVOID SystemInformation,
+    ULONG SystemInformationLength,
+    PULONG ReturnLength)
+{
+    PFN_NtQuerySystemInformation original = (PFN_NtQuerySystemInformation)g_Hooks[29].Trampoline;
+    ULONG bytes = 0;
+    NTSTATUS status;
+
+    HookEnter();
+    status = original(SystemInformationClass, SystemInformation,
+                      SystemInformationLength, ReturnLength != NULL ? ReturnLength : &bytes);
+    if (MonActive()) {
+        CHAR detail[SYSINFO_MON_MAX_DETAIL];
+        ULONG pos = 0;
+
+        detail[0] = 0;
+        AppendStr(detail, sizeof(detail), &pos, "class ");
+        AppendDec(detail, sizeof(detail), &pos, (ULONG)SystemInformationClass);
+        AppendStr(detail, sizeof(detail), &pos, " bytes ");
+        AppendDec(detail, sizeof(detail), &pos, ReturnLength != NULL ? *ReturnLength : bytes);
+        if (!NT_SUCCESS(status)) AppendStr(detail, sizeof(detail), &pos, " FAILED");
+        MonEvent(SYSINFO_MON_SYSINFO, (ULONG)SystemInformationClass, NULL, detail);
+    }
+    HookLeave();
+    return status;
+}
+
 /* ------------------------------------------------------- callback registry */
 
 static VOID
@@ -1836,19 +1914,21 @@ TraceInit(VOID)
         /* 18-25: file write/rename, handle duplication, directory listing,
          *        key/value enumeration, APC and context - all unvalidated after
          *        NtSetInformationFile was caught (0x109, 2026-10-25 20:09). */
+        [28] = { L"NtDeviceIoControlFile",       (PVOID)HookNtDeviceIoControlFile },
+        [29] = { L"NtQuerySystemInformation",    (PVOID)HookNtQuerySystemInformation },
     };
     ULONG i;
 
     if (g_HookCount != 0) return;
 
-#if SYSINFO_ENABLE_TRACE_HOOKS
+#if !SYSINFO_ENABLE_TRACE_HOOKS
+    DbgPrint("SysInfo: trace hooks disabled at compile time\n");
+    return;
+#else
     if (!TraceUnsafeHooksEnabled()) {
         DbgPrint("SysInfo: trace hooks disabled by runtime gate\n");
         return;
     }
-#else
-    DbgPrint("SysInfo: trace hooks disabled at compile time\n");
-
     if (SysinfoPatchBlocked()) {
         DbgPrint("SysInfo: trace: inline hooks are blocked (HVCI/hypervisor)\n");
         return;
