@@ -18,6 +18,8 @@ static BOOLEAN gProcessNotifyEx;
 static BOOLEAN gProcessNotifyRegistered;
 static BOOLEAN gThreadNotifyRegistered;
 static BOOLEAN gImageNotifyRegistered;
+static BOOLEAN gCallbackRundownInitialized;
+static BOOLEAN gProcessInitialized;
 static EX_RUNDOWN_REF gCallbackRundown;
 
 VOID MsMonRecordStatus(PCWSTR Name, NTSTATUS Status)
@@ -352,6 +354,8 @@ NTSTATUS MsMonProcessInitialize(VOID)
     gProcessNotifyRegistered = FALSE;
     gThreadNotifyRegistered = FALSE;
     gImageNotifyRegistered = FALSE;
+    gCallbackRundownInitialized = TRUE;
+    gProcessInitialized = TRUE;
     ExInitializeRundownProtection(&gCallbackRundown);
     status = PsSetCreateProcessNotifyRoutineEx(MsMonProcessNotify, FALSE);
     if (NT_SUCCESS(status)) {
@@ -381,11 +385,25 @@ NTSTATUS MsMonImageInitialize(VOID)
 
 VOID MsMonProcessUninitialize(VOID)
 {
+    /*
+     * MsMonProcessInitialize may never have run if an earlier driver
+     * initialisation step failed; the list, mutex and spin lock would still be
+     * zeroed memory and must not be touched.
+     */
+    if (!gProcessInitialized) return;
     MsMonRecordStatus(L"ProcessUninitializeStart", STATUS_SUCCESS);
     if (gImageNotifyRegistered) {
-        NTSTATUS status = PsSetLoadImageNotifyRoutine(MsMonImageNotify);
-        MsMonRecordStatus(L"ImageRemoveStatus", status);
+        /*
+         * Image-notify routines are removed with PsRemoveLoadImageNotifyRoutine.
+         * The previous code called PsSetLoadImageNotifyRoutine again, which only
+         * fails (the routine is already registered) and leaves a pointer to this
+         * driver in the kernel's notify list after the image is unloaded. The
+         * next image load anywhere in the system then jumps into unmapped code
+         * and bugchecks.
+         */
+        NTSTATUS removeStatus = PsRemoveLoadImageNotifyRoutine(MsMonImageNotify);
         gImageNotifyRegistered = FALSE;
+        MsMonRecordStatus(L"ImageRemoveStatus", removeStatus);
     } else {
         MsMonRecordStatus(L"ImageRemoveStatus", STATUS_PROCEDURE_NOT_FOUND);
     }
@@ -394,7 +412,12 @@ VOID MsMonProcessUninitialize(VOID)
         gThreadNotifyRegistered = FALSE;
     }
     MsMonRemoveProcessNotify();
-    ExWaitForRundownProtectionRelease(&gCallbackRundown);
+    if (gCallbackRundownInitialized) {
+        /* Stop granting new callbacks, then drain the ones already running. */
+        ExRundownCompleted(&gCallbackRundown);
+        ExWaitForRundownProtectionRelease(&gCallbackRundown);
+        gCallbackRundownInitialized = FALSE;
+    }
     MsMonRecordStatus(L"RundownComplete", STATUS_SUCCESS);
     MsMonProcessStopSession();
 }

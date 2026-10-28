@@ -3,13 +3,30 @@
 
 static const GUID MSMON_DEVICE_GUID = { 0xdb6a8ad5, 0xc08e, 0x4f95, { 0x8d, 0x15, 0x11, 0x5a, 0x72, 0x13, 0x6d, 0x40 } };
 
+/*
+ * Control IRPs can block inside the driver (MSMON_IOCTL_READ_EVENTS waits for
+ * events). DriverUnload must not return while one of those is still executing
+ * our code, so every dispatch takes a rundown reference and unload completes
+ * the rundown and waits before tearing anything down.
+ */
+static EX_RUNDOWN_REF gIoRundown;
+
+static NTSTATUS MsMonCompleteIrp(PIRP Irp, NTSTATUS Status, ULONG_PTR Information)
+{
+    Irp->IoStatus.Status = Status;
+    Irp->IoStatus.Information = Information;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    return Status;
+}
+
 static NTSTATUS MsMonCreateClose(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 {
     UNREFERENCED_PARAMETER(DeviceObject);
-    Irp->IoStatus.Status = STATUS_SUCCESS;
-    Irp->IoStatus.Information = 0;
-    IoCompleteRequest(Irp, IO_NO_INCREMENT);
-    return STATUS_SUCCESS;
+    if (!ExAcquireRundownProtection(&gIoRundown)) {
+        return MsMonCompleteIrp(Irp, STATUS_DELETE_PENDING, 0);
+    }
+    ExReleaseRundownProtection(&gIoRundown);
+    return MsMonCompleteIrp(Irp, STATUS_SUCCESS, 0);
 }
 
 static NTSTATUS MsMonStartSession(PMSMON_SESSION_CONFIG Config)
@@ -62,6 +79,9 @@ static NTSTATUS MsMonDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
     ULONG_PTR information = 0;
 
     UNREFERENCED_PARAMETER(DeviceObject);
+    if (!ExAcquireRundownProtection(&gIoRundown)) {
+        return MsMonCompleteIrp(Irp, STATUS_DELETE_PENDING, 0);
+    }
     switch (code) {
     case MSMON_IOCTL_START_SESSION:
         if (inputLength < sizeof(MSMON_SESSION_CONFIG)) {
@@ -129,6 +149,7 @@ static NTSTATUS MsMonDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 
     Irp->IoStatus.Status = status;
     Irp->IoStatus.Information = information;
+    ExReleaseRundownProtection(&gIoRundown);
     IoCompleteRequest(Irp, IO_NO_INCREMENT);
     return status;
 }
@@ -137,6 +158,14 @@ VOID MsMonDriverUnload(PDRIVER_OBJECT DriverObject)
 {
     UNICODE_STRING dosName;
     MsMonRecordStatus(L"DriverUnloadStart", STATUS_SUCCESS);
+
+    /*
+     * Wake a collector that is blocked in MSMON_IOCTL_READ_EVENTS before
+     * waiting for in-flight IRPs; the read timeout alone can be one second and
+     * the session must be stopped from another thread.
+     */
+    MsMonEventsWakeAll();
+
     MsMonNetworkUninitialize();
     MsMonRecordStatus(L"NetworkStopped", STATUS_SUCCESS);
     MsMonRegistryUninitialize();
@@ -148,6 +177,14 @@ VOID MsMonDriverUnload(PDRIVER_OBJECT DriverObject)
     MsMonProcessUninitialize();
     MsMonRecordStatus(L"ProcessStopped", STATUS_SUCCESS);
     MsMonAttributionStop();
+
+    /*
+     * No new control IRP can start now, and the ones already running (bounded
+     * by the read timeout, which the event above shortens) have finished.
+     */
+    ExRundownCompleted(&gIoRundown);
+    ExWaitForRundownProtectionRelease(&gIoRundown);
+
     MsMonEventsUninitialize();
     RtlInitUnicodeString(&dosName, MSMON_DOS_DEVICE_NAME);
     (VOID)IoDeleteSymbolicLink(&dosName);
@@ -162,6 +199,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     NTSTATUS status;
 
     UNREFERENCED_PARAMETER(RegistryPath);
+    ExInitializeRundownProtection(&gIoRundown);
     DriverObject->MajorFunction[IRP_MJ_CREATE] = MsMonCreateClose;
     DriverObject->MajorFunction[IRP_MJ_CLOSE] = MsMonCreateClose;
     DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = MsMonDeviceControl;

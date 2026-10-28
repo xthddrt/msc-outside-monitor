@@ -21,6 +21,10 @@ typedef struct _MSMON_EVENT_QUEUE {
 } MSMON_EVENT_QUEUE;
 
 static MSMON_EVENT_QUEUE gQueue;
+static BOOLEAN gQueueInitialized;
+
+/* Upper bound on chunks emitted for one payload operation (8 MiB). */
+#define MSMON_MAX_PAYLOAD_CHUNKS 1024u
 
 static USHORT MsMonStringBytes(PCUNICODE_STRING Value, PBOOLEAN Truncated)
 {
@@ -58,6 +62,7 @@ NTSTATUS MsMonEventsInitialize(VOID)
     gQueue.QueueRecordLimit = MSMON_DEFAULT_QUEUE_RECORDS;
     gQueue.QueueByteLimit = MSMON_DEFAULT_QUEUE_BYTES;
     gQueue.PayloadEnabled = FALSE;
+    gQueueInitialized = TRUE;
     return STATUS_SUCCESS;
 }
 
@@ -87,11 +92,20 @@ NTSTATUS MsMonEventsStart(ULONGLONG SessionId, ULONG QueueRecords, ULONG QueueBy
 VOID MsMonEventsStop(VOID)
 {
     KIRQL oldIrql;
+    if (!gQueueInitialized) return;
     KeAcquireSpinLock(&gQueue.Lock, &oldIrql);
     gQueue.SessionId = 0;
     gQueue.PayloadEnabled = FALSE;
     MsMonClearQueueLocked();
     KeReleaseSpinLock(&gQueue.Lock, oldIrql);
+    /* Release a reader that is waiting for events it will never receive. */
+    KeSetEvent(&gQueue.DataAvailable, IO_NO_INCREMENT, FALSE);
+}
+
+VOID MsMonEventsWakeAll(VOID)
+{
+    if (!gQueueInitialized) return;
+    KeSetEvent(&gQueue.DataAvailable, IO_NO_INCREMENT, FALSE);
 }
 
 VOID MsMonEventsUninitialize(VOID)
@@ -139,6 +153,7 @@ static NTSTATUS MsMonLogEventInternal(
         (Payload != NULL && Payload->ByteCount != 0 && Payload->Data == NULL)) {
         return STATUS_INVALID_PARAMETER;
     }
+    if (!gQueueInitialized) return STATUS_DEVICE_NOT_READY;
     block = ExAllocatePool2(POOL_FLAG_NON_PAGED, allocationBytes, MSMON_POOL_TAG);
     if (block == NULL) {
         KeAcquireSpinLock(&gQueue.Lock, &oldIrql);
@@ -266,7 +281,7 @@ NTSTATUS MsMonLogPayloadSeries(
     if (AvailableBytes != 0 && Payload == NULL) return STATUS_INVALID_PARAMETER;
     if (AvailableBytes > TotalBytes) return STATUS_INVALID_BUFFER_SIZE;
     chunkCount = TotalBytes == 0 ? 1 : (TotalBytes + MSMON_PAYLOAD_CHUNK_BYTES - 1) / MSMON_PAYLOAD_CHUNK_BYTES;
-    if (chunkCount > MAXULONG || AvailableBytes > TotalBytes) return STATUS_INVALID_BUFFER_SIZE;
+    if (chunkCount > MSMON_MAX_PAYLOAD_CHUNKS) return STATUS_INVALID_BUFFER_SIZE;
 
     if (TotalBytes == 0) {
         MSMON_PAYLOAD empty = {OperationId, 0, 0, 0, 1, PayloadKind, NULL, 0};

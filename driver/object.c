@@ -16,12 +16,15 @@ static OB_PREOP_CALLBACK_STATUS MsMonObjectPre(PVOID RegistrationContext, POB_PR
     PMSMON_OBJECT_CONTEXT context;
     HANDLE source = PsGetCurrentProcessId();
     ULONG desiredAccess;
+    BOOLEAN blackCat;
 
     UNREFERENCED_PARAMETER(RegistrationContext);
     Information->CallContext = NULL;
+    /* One stack lookup per handle operation, not one per test below. */
+    blackCat = MsMonCurrentIsBlackCat();
     if (Information->Parameters == NULL ||
-        (Information->KernelHandle && !MsMonCurrentIsBlackCat()) ||
-        (!MsMonIsTracked(source, 0) && !MsMonCurrentIsBlackCat())) {
+        (Information->KernelHandle && !blackCat) ||
+        (!MsMonIsTracked(source, 0) && !blackCat)) {
         return OB_PREOP_SUCCESS;
     }
     context = ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(*context), MSMON_POOL_TAG);
@@ -58,18 +61,24 @@ static OB_PREOP_CALLBACK_STATUS MsMonObjectPre(PVOID RegistrationContext, POB_PR
 
 static VOID MsMonObjectPost(PVOID RegistrationContext, POB_POST_OPERATION_INFORMATION Information)
 {
-    PMSMON_OBJECT_CONTEXT context = (PMSMON_OBJECT_CONTEXT)Information->CallContext;
+    PMSMON_OBJECT_CONTEXT context;
     PUNICODE_STRING imageName = NULL;
     ULONG grantedAccess = 0;
 
     UNREFERENCED_PARAMETER(RegistrationContext);
+    if (Information == NULL) return;
+    context = (PMSMON_OBJECT_CONTEXT)Information->CallContext;
     if (context == NULL) return;
+    if (Information->Parameters == NULL) {
+        ExFreePoolWithTag(context, MSMON_POOL_TAG);
+        return;
+    }
     if (Information->Operation == OB_OPERATION_HANDLE_CREATE) {
         grantedAccess = Information->Parameters->CreateHandleInformation.GrantedAccess;
     } else if (Information->Operation == OB_OPERATION_HANDLE_DUPLICATE) {
         grantedAccess = Information->Parameters->DuplicateHandleInformation.GrantedAccess;
     }
-    if (!context->ThreadObject) {
+    if (!context->ThreadObject && Information->Object != NULL) {
         (VOID)SeLocateProcessImageName((PEPROCESS)Information->Object, &imageName);
     }
     (VOID)MsMonLogEvent(context->ThreadObject ? MsMonThreadHandle : MsMonProcessHandle,

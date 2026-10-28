@@ -43,6 +43,8 @@ The compatibility subsystem in `compat/` contains the complete legacy monitor an
 
 The default build is unsigned development output. Do not load it on a production machine. Use the isolated test-VM procedure in `docs/TEST_VM.md`. The current code has been compiled but has not been installed or runtime-tested.
 
+`docs/RELIABILITY.md` records the driver defects found while investigating host bugchecks on stop/unload and under network load, together with the fixes. Read it before loading a build.
+
 ## Collect
 
 Run elevated in the test VM after properly signing and starting the driver. Start the collector before launching the game:

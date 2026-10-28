@@ -189,18 +189,27 @@ static VOID MsMonAssociateFlow(
     context->RemotePort = RemotePort;
     (VOID)RtlStringCchCopyW(context->Endpoints, RTL_NUMBER_OF(context->Endpoints), Endpoints);
 
+    /*
+     * WFP is called without holding gFlowLock. Holding a spinlock across
+     * FwpsFlowAssociateContext0 risks a lock-order inversion with the flow
+     * teardown path, which calls MsMonWfpFlowDelete and takes the same lock.
+     */
+    status = FwpsFlowAssociateContext0(FlowId, InFixedValues->layerId,
+                                       gCalloutIds[Index], (UINT64)context);
+    if (!NT_SUCCESS(status)) {
+        ExFreePoolWithTag(context, MSMON_POOL_TAG);
+        return;
+    }
+
     KeAcquireSpinLock(&gFlowLock, &oldIrql);
     if (!gNetworkActive) {
         KeReleaseSpinLock(&gFlowLock, oldIrql);
+        (VOID)FwpsFlowRemoveContext0(context->FlowId, context->LayerId, context->CalloutId);
         ExFreePoolWithTag(context, MSMON_POOL_TAG);
         return;
     }
     InsertTailList(&gFlows, &context->Link);
-    status = FwpsFlowAssociateContext0(FlowId, InFixedValues->layerId,
-                                       gCalloutIds[Index], (UINT64)context);
-    if (!NT_SUCCESS(status)) RemoveEntryList(&context->Link);
     KeReleaseSpinLock(&gFlowLock, oldIrql);
-    if (!NT_SUCCESS(status)) ExFreePoolWithTag(context, MSMON_POOL_TAG);
 }
 
 static VOID NTAPI MsMonWfpClassify(
@@ -213,7 +222,7 @@ static VOID NTAPI MsMonWfpClassify(
     FWPS_CLASSIFY_OUT0* ClassifyOut
 )
 {
-    ULONG index = MsMonCalloutIndex(Filter);
+    ULONG index;
     UINT16 localAddressField;
     UINT16 remoteAddressField;
     UINT16 localPortField;
@@ -232,11 +241,24 @@ static VOID NTAPI MsMonWfpClassify(
     UNREFERENCED_PARAMETER(LayerData);
     UNREFERENCED_PARAMETER(ClassifyContext);
     UNREFERENCED_PARAMETER(FlowContext);
-    if (index < MSMON_CALLOUT_COUNT &&
-        (InMetaValues->currentMetadataValues & FWPS_METADATA_FIELD_PROCESS_ID) != 0 &&
-        MsMonIsTracked(UlongToHandle((ULONG)InMetaValues->processId), 0)) {
+    if (ClassifyOut == NULL) return;
+    index = Filter != NULL ? MsMonCalloutIndex(Filter) : MSMON_CALLOUT_COUNT;
+    do {
+        if (index >= MSMON_CALLOUT_COUNT || InFixedValues == NULL || InMetaValues == NULL) break;
+        if ((InMetaValues->currentMetadataValues & FWPS_METADATA_FIELD_PROCESS_ID) == 0) break;
+        if (!MsMonIsTracked(UlongToHandle((ULONG)InMetaValues->processId), 0)) break;
         MsMonSelectFields(index, &localAddressField, &remoteAddressField,
                           &localPortField, &remotePortField, &protocolField);
+        /*
+         * Never index the layer's value array past the count the filter engine
+         * supplied; a layer that reports fewer fields would otherwise make the
+         * callout read out of bounds.
+         */
+        if (protocolField >= InFixedValues->valueCount ||
+            localAddressField >= InFixedValues->valueCount ||
+            remoteAddressField >= InFixedValues->valueCount ||
+            localPortField >= InFixedValues->valueCount ||
+            remotePortField >= InFixedValues->valueCount) break;
         localPort = RtlUshortByteSwap(InFixedValues->incomingValue[localPortField].value.uint16);
         remotePort = RtlUshortByteSwap(InFixedValues->incomingValue[remotePortField].value.uint16);
         protocol = InFixedValues->incomingValue[protocolField].value.uint8;
@@ -272,7 +294,7 @@ static VOID NTAPI MsMonWfpClassify(
             MsMonAssociateFlow(InFixedValues, InMetaValues, index, flowId,
                                protocol, localPort, remotePort, endpoints);
         }
-    }
+    } while (0);
     if ((ClassifyOut->rights & FWPS_RIGHT_ACTION_WRITE) != 0) {
         ClassifyOut->actionType = FWP_ACTION_PERMIT;
     }
@@ -414,10 +436,11 @@ VOID MsMonNetworkUninitialize(VOID)
     ULONG index;
     KIRQL oldIrql;
     gNetworkActive = FALSE;
-    if (gEngine != NULL) {
-        (VOID)FwpmEngineClose(gEngine);
-        gEngine = NULL;
-    }
+    /*
+     * Remove flow contexts while the callouts and the engine are still alive,
+     * otherwise FwpsFlowRemoveContext0 fails and the flow-delete callback can
+     * still fire for a context this routine already freed.
+     */
     if (gFlowListInitialized) {
         for (;;) {
             PMSMON_FLOW_CONTEXT context = NULL;
@@ -436,10 +459,23 @@ VOID MsMonNetworkUninitialize(VOID)
         }
         gFlowListInitialized = FALSE;
     }
+    if (gEngine != NULL) {
+        (VOID)FwpmEngineClose(gEngine);
+        gEngine = NULL;
+    }
     for (index = 0; index < MSMON_CALLOUT_COUNT; index++) {
         if (gCalloutRegistered[index]) {
-            (VOID)FwpsCalloutUnregisterById(gCalloutIds[index]);
-            gCalloutRegistered[index] = FALSE;
+            /*
+             * Only clear the registered flag when the callout really went away.
+             * Leaving a registered callout behind after the driver image is
+             * unmapped faults the next time traffic hits that layer.
+             */
+            NTSTATUS status = FwpsCalloutUnregisterById0(gCalloutIds[index]);
+            if (NT_SUCCESS(status)) {
+                gCalloutRegistered[index] = FALSE;
+            } else {
+                DbgPrint("MsMon: WFP callout %lu unregister failed 0x%08X\n", index, status);
+            }
         }
         gNetworkLayerStatus[index] = STATUS_SUCCESS;
     }

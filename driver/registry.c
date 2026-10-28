@@ -3,6 +3,9 @@
 static LARGE_INTEGER gRegistryCookie;
 static BOOLEAN gRegistryRegistered;
 
+/* Cap on bytes copied out of one registry value; keeps the payload stream bounded. */
+#define MSMON_REGISTRY_CAPTURE_MAX_BYTES (64u * 1024u)
+
 typedef struct _MSMON_REGISTRY_CONTEXT {
     HANDLE ProcessId;
     HANDLE ThreadId;
@@ -157,13 +160,19 @@ static VOID MsMonLogRegistryValue(
     const VOID* Data, ULONG DataBytes
 )
 {
+    /*
+     * Never turn a single registry value into an unbounded burst of nonpaged
+     * records. Larger values are recorded as an incomplete payload operation
+     * (MsMonFlagPayloadPartial) with the true total length.
+     */
+    ULONG captured = min(DataBytes, MSMON_REGISTRY_CAPTURE_MAX_BYTES);
     (VOID)MsMonLogPayloadSeries(Context->Type, Context->ProcessId, Context->ThreadId,
                                 0, Status, MsMonCategoryRegistry,
                                 Context->Value0, Type,
                                 Context->Path.Buffer != NULL ? &Context->Path : NULL,
                                 Context->Detail.Buffer != NULL ? &Context->Detail : NULL,
                                 MsMonPayloadRegistryValue, Context->OperationId,
-                                DataBytes, Data, DataBytes);
+                                DataBytes, Data, captured);
 }
 
 static VOID MsMonCaptureSingleValue(

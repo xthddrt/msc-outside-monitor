@@ -35,6 +35,9 @@ Full registry/volume payload capture is enabled by default. Add `--no-payloads` 
 - Enable an isolated network and verify IPv4/IPv6 connect/accept and flow establish/close correlation. Packet payloads and TLS plaintext remain outside this version's coverage.
 - Launch an external URL/browser through the client or a controlled descendant. Distinguish direct child creation, handle access, and brokered/RPC evidence.
 - Start/stop the collector and driver repeatedly, including with pending reads and active flows. Check for hangs, stale sessions, leaked contexts, and bugchecks.
+- Specifically: run the agent, then `sc stop msmon` while the agent is still collecting. The unload must wake the pending read and complete without a bugcheck.
+- Attempt `fltmc unload msmon`; the filter must refuse with `STATUS_FLT_DO_NOT_DETACH` and remain attached. Then stop the driver normally.
+- Run Driver Verifier with `/standard /all` (plus `/em` for the test-signed build) from load through unload, and confirm no "driver unloaded without cancelling" reports for notification routines, WFP callouts, or minifilter registrations.
 - Run Driver Verifier and controlled stress tests. Exceed record and byte queue limits; verify source gaps, incomplete payload operations, and final drop statistics. Test multi-megabyte values and unsafe-IRQL paths without using sensitive payloads.
 - Exercise PID reuse and protected-process cases; review zero creation times and unknown attribution rather than treating them as strong identity.
 - Validate logs with `python tools\verify_log.py <parts-in-order>`. Confirm malformed Base64, duplicate/missing/out-of-order chunks, incorrect decoded values, and hash-chain tampering are rejected or reported.
