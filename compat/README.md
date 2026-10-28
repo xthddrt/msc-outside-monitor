@@ -20,7 +20,7 @@ The main `msmon.sys` driver and agent remain independent. This subsystem exists 
 | Guard file/registry/process-handle/memory enforcement | Guard framework present; file/registry/memory detours are disabled with their hooks |
 | Inline kernel-text patching, CR0.WP changes, PatchGuard bypasses | **Not enabled and not claimed to be stable** |
 
-`SYSINFO_ENABLE_TRACE_HOOKS` and `SYSINFO_ENABLE_HANDLE_HOOKS` are both `0`. `UnsafeHooksEnabled` in `SYSINFO_MON_CONFIG` is also `0` by default. Both the compile-time and runtime gates would have to be deliberately enabled for the inline paths to execute. Do not treat those paths as PatchGuard-safe.
+`SYSINFO_ENABLE_HANDLE_HOOKS` and `SYSINFO_ENABLE_TRACE_HOOKS` both default to `0` in the compat sources. The separate runtime gate, `UnsafeHooksEnabled` in `SYSINFO_MON_CONFIG`, is also `0` by default. Inline kernel hooks therefore require a deliberate rebuild with the compile-time switch plus a deliberate runtime opt-in (`mon on [unsafe]`). Several implemented detours are also absent from the installation table, so opting in would not activate everything advertised. Do not treat any of these paths as PatchGuard-safe, and do not load this driver for normal coverage work.
 
 ## High-value fixes in this copy
 

@@ -118,6 +118,16 @@ BOOLEAN MsMonPayloadEnabled(VOID)
     return gQueue.PayloadEnabled;
 }
 
+VOID MsMonEventsNoteDropped(VOID)
+{
+    KIRQL oldIrql;
+    if (!gQueueInitialized) return;
+    KeAcquireSpinLock(&gQueue.Lock, &oldIrql);
+    if (gQueue.SessionId != 0) gQueue.Sequence++;
+    InterlockedIncrement64(&gQueue.Dropped);
+    KeReleaseSpinLock(&gQueue.Lock, oldIrql);
+}
+
 ULONGLONG MsMonNextOperationId(VOID)
 {
     return (ULONGLONG)InterlockedIncrement64((volatile LONG64*)&gQueue.OperationId);

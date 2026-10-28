@@ -3,6 +3,8 @@
 #include "telemetry.h"
 #include <evntrace.h>
 #include <evntcons.h>
+#include <deque>
+#include <mutex>
 #include <thread>
 
 class EtwCollector {
@@ -13,9 +15,27 @@ public:
     void Stop();
     const std::vector<std::wstring>& Warnings() const { return warnings_; }
 
+    /* Re-emit events that arrived before the driver's process-start record. */
+    void ReplayProcess(DWORD pid);
+    /* Expire unmatched events and emit an etw_unattributed coverage record. */
+    void ExpirePending(uint64_t nowTick);
+    uint64_t PendingCount() const;
+    uint64_t UnattributedCount() const { return unattributed_.load(); }
+    uint64_t PendingOverflow() const { return pendingOverflow_.load(); }
+    uint64_t LostEvents() const { return lostEvents_.load(); }
+    uint64_t ParseFailures() const { return parseFailures_.load(); }
+
 private:
+    static ULONG WINAPI BufferCallback(PEVENT_TRACE_LOGFILEW logfile);
     void OnRecord(PEVENT_RECORD record);
     void EnableProvider(const GUID& provider, const std::wstring& name);
+    void Emit(TelemetryEvent&& event);
+    std::wstring ProviderName(unsigned long type) const;
+
+    struct PendingEvent {
+        TelemetryEvent event;
+        uint64_t deadline = 0;
+    };
 
     ProcessScope& scope_;
     EventQueue& queue_;
@@ -27,6 +47,13 @@ private:
     std::vector<BYTE> properties_;
     std::thread worker_;
     std::atomic<uint64_t> sequence_{0};
+    std::atomic<uint64_t> unattributed_{0};
+    std::atomic<uint64_t> pendingOverflow_{0};
+    std::atomic<uint64_t> lostEvents_{0};
+    std::atomic<uint64_t> parseFailures_{0};
+    mutable std::mutex pendingMutex_;
+    std::mutex emitMutex_;
+    std::deque<PendingEvent> pending_;
     std::vector<std::wstring> warnings_;
     bool started_ = false;
 };

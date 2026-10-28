@@ -54,6 +54,13 @@ uint64_t ProcessScope::StartTime(DWORD pid) const
     return found == processes_.end() ? 0 : found->second.startTime;
 }
 
+std::wstring ProcessScope::Path(DWORD pid) const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto found = processes_.find(pid);
+    return found == processes_.end() ? std::wstring() : found->second.path;
+}
+
 std::vector<std::wstring> ProcessScope::ResolveStack(DWORD pid, const uint64_t* addresses, size_t count) const
 {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -158,6 +165,13 @@ std::string EventTypeName(unsigned long type)
     case MsMonFileSystemControl: return "file_system_control";
     case MsMonFileQueryVolumeInformation: return "file_query_volume_information";
     case MsMonFileQueryInformation: return "file_query_information";
+    case MsMonFileSection: return "file_section";
+    case MsMonFileClose: return "file_close";
+    case MsMonFileFlush: return "file_flush";
+    case MsMonFileQuerySecurity: return "file_query_security";
+    case MsMonFileSetSecurity: return "file_set_security";
+    case MsMonFileQueryEa: return "file_query_ea";
+    case MsMonFileSetEa: return "file_set_ea";
     case MsMonRegistryOpen: return "registry_open";
     case MsMonRegistryCreate: return "registry_create";
     case MsMonRegistrySetValue: return "registry_set_value";
@@ -172,6 +186,7 @@ std::string EventTypeName(unsigned long type)
     case MsMonEtwWmi: return "etw_wmi";
     case MsMonEtwDns: return "etw_dns";
     case MsMonEtwRpc: return "etw_rpc";
+    case MsMonEtwUnattributed: return "etw_unattributed";
     case MsMonCoverage: return "coverage";
     default: return "unknown";
     }
@@ -401,6 +416,7 @@ std::string TelemetryJson(const TelemetryEvent& event)
          << "\",\"type_id\":" << header.Type
          << ",\"process_id\":" << header.ProcessId
          << ",\"process_start_time\":" << header.ProcessStartTime
+         << ",\"process_path\":\"" << JsonEscape(WideToUtf8(event.processPath)) << "\""
          << ",\"parent_process_id\":" << header.ParentProcessId
          << ",\"thread_id\":" << header.ThreadId
          << ",\"target_process_id\":" << header.TargetProcessId

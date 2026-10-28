@@ -11,6 +11,7 @@ extern "C" {
 #define MSMON_MAX_EVENT_RECORD_BYTES 16384u
 #define MSMON_MAX_EVENT_STRING_BYTES 2048u
 #define MSMON_PAYLOAD_CHUNK_BYTES 8192u
+#define MSMON_MAX_PAYLOAD_TOTAL_BYTES (8u * 1024u * 1024u)
 #define MSMON_READ_MAX_BYTES (1024u * 1024u)
 #define MSMON_DEFAULT_QUEUE_RECORDS 16384u
 #define MSMON_MAX_QUEUE_RECORDS 32768u
@@ -47,9 +48,17 @@ typedef enum _MSMON_EVENT_TYPE {
     MsMonNetworkAccept = 31,
     MsMonNetworkFlowEstablished = 32,
     MsMonNetworkFlowClose = 33,
+    MsMonFileSection = 34,
+    MsMonFileClose = 35,
+    MsMonFileFlush = 36,
+    MsMonFileQuerySecurity = 37,
+    MsMonFileSetSecurity = 38,
+    MsMonFileQueryEa = 39,
+    MsMonFileSetEa = 40,
     MsMonEtwWmi = 100,
     MsMonEtwDns = 101,
     MsMonEtwRpc = 102,
+    MsMonEtwUnattributed = 103,
     MsMonCoverage = 110
 } MSMON_EVENT_TYPE;
 

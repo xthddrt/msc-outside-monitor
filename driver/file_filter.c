@@ -7,12 +7,34 @@
 
 static PFLT_FILTER gFilter;
 
+/*
+ * One completion context for every file operation we decide to observe.
+ *
+ * The requestor must be captured in the pre-operation callback.  A post-
+ * operation callback can run in a different thread (and, for asynchronous
+ * I/O, a different process), so re-reading PsGetCurrentProcessId() there
+ * silently drops or misattributes events.  The tracking decision and the
+ * requestor identity travel with the operation instead.
+ */
+typedef struct _MSMON_FILE_CONTEXT {
+    PFLT_FILE_NAME_INFORMATION NameInfo;
+    HANDLE ProcessId;
+    HANDLE ThreadId;
+    BOOLEAN Tracked;
+    ULONG DesiredAccess;
+    ULONG Reserved;
+} MSMON_FILE_CONTEXT, *PMSMon_FILE_CONTEXT;
+
 static ULONG MsMonFileCategory(PCUNICODE_STRING Path)
 {
     UNICODE_STRING namedPipe;
+    UNICODE_STRING mailslot;
     RtlInitUnicodeString(&namedPipe, L"\\Device\\NamedPipe");
+    RtlInitUnicodeString(&mailslot, L"\\Device\\Mailslot");
     if (Path != NULL && Path->Length >= namedPipe.Length &&
         RtlPrefixUnicodeString(&namedPipe, Path, TRUE)) return MsMonCategoryIpc;
+    if (Path != NULL && Path->Length >= mailslot.Length &&
+        RtlPrefixUnicodeString(&mailslot, Path, TRUE)) return MsMonCategoryIpc;
     return MsMonCategoryUnknown;
 }
 
@@ -25,6 +47,13 @@ static ULONG MsMonEventType(UCHAR MajorFunction)
     case IRP_MJ_QUERY_INFORMATION: return MsMonFileQueryInformation;
     case IRP_MJ_DIRECTORY_CONTROL: return MsMonFileDirectoryControl;
     case IRP_MJ_CLEANUP: return MsMonFileCleanup;
+    case IRP_MJ_CLOSE: return MsMonFileClose;
+    case IRP_MJ_FLUSH_BUFFERS: return MsMonFileFlush;
+    case IRP_MJ_QUERY_SECURITY: return MsMonFileQuerySecurity;
+    case IRP_MJ_SET_SECURITY: return MsMonFileSetSecurity;
+    case IRP_MJ_QUERY_EA: return MsMonFileQueryEa;
+    case IRP_MJ_SET_EA: return MsMonFileSetEa;
+    case IRP_MJ_ACQUIRE_FOR_SECTION_SYNCHRONIZATION: return MsMonFileSection;
     case IRP_MJ_DEVICE_CONTROL:
     case IRP_MJ_INTERNAL_DEVICE_CONTROL: return MsMonFileDeviceControl;
     case IRP_MJ_FILE_SYSTEM_CONTROL: return MsMonFileSystemControl;
@@ -50,6 +79,13 @@ static ULONGLONG MsMonEventValue(PFLT_CALLBACK_DATA Data, BOOLEAN Second)
             return Data->Iopb->Parameters.DirectoryControl.QueryDirectory.FileInformationClass;
         }
         return Data->Iopb->MinorFunction;
+    case IRP_MJ_ACQUIRE_FOR_SECTION_SYNCHRONIZATION:
+        return Second ? Data->Iopb->Parameters.AcquireForSectionSynchronization.PageProtection :
+                        Data->Iopb->Parameters.AcquireForSectionSynchronization.SyncType;
+    case IRP_MJ_QUERY_SECURITY:
+        return Second ? 0 : Data->Iopb->Parameters.QuerySecurity.SecurityInformation;
+    case IRP_MJ_SET_SECURITY:
+        return Second ? 0 : Data->Iopb->Parameters.SetSecurity.SecurityInformation;
     case IRP_MJ_DEVICE_CONTROL:
     case IRP_MJ_INTERNAL_DEVICE_CONTROL:
         return Second ? Data->Iopb->Parameters.DeviceIoControl.Common.InputBufferLength :
@@ -80,24 +116,72 @@ static PFLT_FILE_NAME_INFORMATION MsMonAcquireName(PFLT_CALLBACK_DATA Data, ULON
     return nameInfo;
 }
 
+static PMSMon_FILE_CONTEXT MsMonCreateFileContext(PFLT_CALLBACK_DATA Data, ULONG QueryFlags)
+{
+    PMSMon_FILE_CONTEXT context;
+    ULONG requestorId;
+    HANDLE requestor;
+
+    /*
+     * Decide before allocating.  This callback is invoked for file I/O from
+     * every process on the system; allocating a context for every unrelated
+     * create/read/write would be an unnecessary nonpaged-pool cost.
+     */
+    requestorId = FltGetRequestorProcessId(Data);
+    if (requestorId == 0) requestorId = HandleToUlong(PsGetCurrentProcessId());
+    requestor = UlongToHandle(requestorId);
+    if (!MsMonIsTracked(requestor, 0) && !MsMonCurrentIsBlackCat()) return NULL;
+
+    context = ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(*context), MSMON_POOL_TAG);
+    if (context == NULL) {
+        MsMonEventsNoteDropped();
+        return NULL;
+    }
+    RtlZeroMemory(context, sizeof(*context));
+    context->ProcessId = requestor;
+    context->ThreadId = PsGetCurrentThreadId();
+    context->Tracked = TRUE;
+    context->NameInfo = MsMonAcquireName(Data, QueryFlags);
+    return context;
+}
+
+static VOID MsMonFreeFileContext(PMSMon_FILE_CONTEXT Context)
+{
+    if (Context == NULL) return;
+    if (Context->NameInfo != NULL) {
+        FltReleaseFileNameInformation(Context->NameInfo);
+        Context->NameInfo = NULL;
+    }
+    ExFreePoolWithTag(Context, MSMON_POOL_TAG);
+}
+
 static FLT_PREOP_CALLBACK_STATUS MsMonPreCreate(
     PFLT_CALLBACK_DATA Data,
     PCFLT_RELATED_OBJECTS FltObjects,
     PVOID* CompletionContext
 )
 {
+    PMSMon_FILE_CONTEXT context;
     UNREFERENCED_PARAMETER(FltObjects);
     *CompletionContext = NULL;
-    if (!MsMonIsTracked(PsGetCurrentProcessId(), 0) && !MsMonCurrentIsBlackCat()) {
+
+    context = MsMonCreateFileContext(Data, FLT_FILE_NAME_QUERY_DEFAULT);
+    if (context == NULL) return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    if (!context->Tracked) {
+        MsMonFreeFileContext(context);
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
+    if (Data->Iopb->MajorFunction == IRP_MJ_CREATE &&
+        Data->Iopb->Parameters.Create.SecurityContext != NULL) {
+        context->DesiredAccess = Data->Iopb->Parameters.Create.SecurityContext->DesiredAccess;
     }
     /*
      * Resolve the name in the pre-create path, which is the documented safe
      * place for a file-system name query. Post-create used to query the name
-     * itself, which can recurse into the file system and is not valid when the
-     * create failed.
+     * itself, which can recurse into the file system and is not valid when
+     * the create failed.
      */
-    *CompletionContext = MsMonAcquireName(Data, FLT_FILE_NAME_QUERY_DEFAULT);
+    *CompletionContext = context;
     return FLT_PREOP_SUCCESS_WITH_CALLBACK;
 }
 
@@ -107,34 +191,48 @@ static FLT_PREOP_CALLBACK_STATUS MsMonPreOperation(
     PVOID* CompletionContext
 )
 {
+    PMSMon_FILE_CONTEXT context;
+    ULONG queryFlags;
     UNREFERENCED_PARAMETER(FltObjects);
     *CompletionContext = NULL;
-    if (!MsMonIsTracked(PsGetCurrentProcessId(), 0) && !MsMonCurrentIsBlackCat()) return FLT_PREOP_SUCCESS_NO_CALLBACK;
+
     /*
-     * Cache first, file system second, but only when the filter manager judges
-     * it safe. The recorded session lost 7.4% of file paths with a cache-only
-     * lookup (45% of query-information events), which is too much to analyse.
+     * Section acquisition runs in the memory-manager path.  Even though a name
+     * query is usually served from the name cache, never let it issue file
+     * system I/O there; a missing path is preferable to re-entering the FS
+     * during paging.
      */
-    *CompletionContext = MsMonAcquireName(Data, FLT_FILE_NAME_QUERY_ALWAYS_ALLOW_CACHE_LOOKUP);
+    queryFlags = Data->Iopb->MajorFunction == IRP_MJ_ACQUIRE_FOR_SECTION_SYNCHRONIZATION
+                     ? FLT_FILE_NAME_QUERY_CACHE_ONLY
+                     : FLT_FILE_NAME_QUERY_ALWAYS_ALLOW_CACHE_LOOKUP;
+    context = MsMonCreateFileContext(Data, queryFlags);
+    if (context == NULL) return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    if (!context->Tracked) {
+        MsMonFreeFileContext(context);
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
+    *CompletionContext = context;
     return FLT_PREOP_SUCCESS_WITH_CALLBACK;
 }
 
 static VOID MsMonVolumeUnavailable(
-    PFLT_CALLBACK_DATA Data, PCUNICODE_STRING Path, PCWSTR Reason
+    PFLT_CALLBACK_DATA Data, PMSMon_FILE_CONTEXT Context, PCWSTR Reason
 )
 {
     UNICODE_STRING detail;
-    ULONG category = MsMonEventValue(Data, FALSE) == 1 ? MsMonCategoryHardwareIdentity : MsMonFileCategory(Path);
+    PCUNICODE_STRING path = Context->NameInfo != NULL ? &Context->NameInfo->Name : NULL;
+    ULONG category = MsMonEventValue(Data, FALSE) == 1 ? MsMonCategoryHardwareIdentity : MsMonFileCategory(path);
     RtlInitUnicodeString(&detail, Reason);
-    (VOID)MsMonLogEvent(MsMonFileQueryVolumeInformation, PsGetCurrentProcessId(), NULL,
-                        PsGetCurrentThreadId(), NULL, 0, MsMonFlagPayloadUnavailable,
+    (VOID)MsMonLogEvent(MsMonFileQueryVolumeInformation, Context->ProcessId, NULL,
+                        Context->ThreadId, NULL, 0, MsMonFlagPayloadUnavailable,
                         Data->IoStatus.Status, 0, category, MsMonEventValue(Data, FALSE),
-                        0, Path, &detail);
+                        0, path, &detail);
 }
 
-static VOID MsMonCaptureVolume(PFLT_CALLBACK_DATA Data, PCUNICODE_STRING Path)
+static VOID MsMonCaptureVolume(PFLT_CALLBACK_DATA Data, PMSMon_FILE_CONTEXT Context)
 {
-    ULONG category = MsMonEventValue(Data, FALSE) == 1 ? MsMonCategoryHardwareIdentity : MsMonFileCategory(Path);
+    PCUNICODE_STRING path = Context->NameInfo != NULL ? &Context->NameInfo->Name : NULL;
+    ULONG category = MsMonEventValue(Data, FALSE) == 1 ? MsMonCategoryHardwareIdentity : MsMonFileCategory(path);
     PVOID buffer = Data->Iopb->Parameters.QueryVolumeInformation.VolumeBuffer;
     ULONG length = Data->Iopb->Parameters.QueryVolumeInformation.Length;
     ULONG information = (ULONG)Data->IoStatus.Information;
@@ -151,28 +249,28 @@ static VOID MsMonCaptureVolume(PFLT_CALLBACK_DATA Data, PCUNICODE_STRING Path)
              */
             UNICODE_STRING detail;
             RtlInitUnicodeString(&detail, L"two_pass_probe");
-            (VOID)MsMonLogEvent(MsMonFileQueryVolumeInformation, PsGetCurrentProcessId(), NULL,
-                                PsGetCurrentThreadId(), NULL, 0, 0, Data->IoStatus.Status, 0,
-                                category, MsMonEventValue(Data, FALSE), 0, Path, &detail);
+            (VOID)MsMonLogEvent(MsMonFileQueryVolumeInformation, Context->ProcessId, NULL,
+                                Context->ThreadId, NULL, 0, 0, Data->IoStatus.Status, 0,
+                                category, MsMonEventValue(Data, FALSE), 0, path, &detail);
         } else {
-            MsMonVolumeUnavailable(Data, Path, L"volume_query_failed");
+            MsMonVolumeUnavailable(Data, Context, L"volume_query_failed");
         }
         return;
     }
     if (buffer == NULL) {
-        MsMonVolumeUnavailable(Data, Path, L"missing_volume_buffer");
+        MsMonVolumeUnavailable(Data, Context, L"missing_volume_buffer");
         return;
     }
     if (information == 0 || information > length) {
-        MsMonVolumeUnavailable(Data, Path, L"invalid_volume_result");
+        MsMonVolumeUnavailable(Data, Context, L"invalid_volume_result");
         return;
     }
     if (information > MSMON_VOLUME_MAX_BYTES) {
-        MsMonVolumeUnavailable(Data, Path, L"volume_result_too_large");
+        MsMonVolumeUnavailable(Data, Context, L"volume_result_too_large");
         return;
     }
     if (KeGetCurrentIrql() > PASSIVE_LEVEL) {
-        MsMonVolumeUnavailable(Data, Path, L"unsafe_irql");
+        MsMonVolumeUnavailable(Data, Context, L"unsafe_irql");
         return;
     }
     /*
@@ -183,7 +281,7 @@ static VOID MsMonCaptureVolume(PFLT_CALLBACK_DATA Data, PCUNICODE_STRING Path)
      */
     if (FltGetRequestorProcessId(Data) != HandleToUlong(PsGetCurrentProcessId()) &&
         (ULONG_PTR)buffer < (ULONG_PTR)MmUserProbeAddress) {
-        MsMonVolumeUnavailable(Data, Path, L"foreign_process_context");
+        MsMonVolumeUnavailable(Data, Context, L"foreign_process_context");
         return;
     }
     __try {
@@ -196,12 +294,12 @@ static VOID MsMonCaptureVolume(PFLT_CALLBACK_DATA Data, PCUNICODE_STRING Path)
         copied = FALSE;
     }
     if (!copied) {
-        MsMonVolumeUnavailable(Data, Path, L"unsafe_result_buffer");
+        MsMonVolumeUnavailable(Data, Context, L"unsafe_result_buffer");
         return;
     }
-    (VOID)MsMonLogPayloadSeries(MsMonFileQueryVolumeInformation, PsGetCurrentProcessId(),
-                                PsGetCurrentThreadId(), 0, Data->IoStatus.Status, category,
-                                MsMonEventValue(Data, FALSE), 0, Path, NULL,
+    (VOID)MsMonLogPayloadSeries(MsMonFileQueryVolumeInformation, Context->ProcessId,
+                                Context->ThreadId, 0, Data->IoStatus.Status, category,
+                                MsMonEventValue(Data, FALSE), 0, path, NULL,
                                 MsMonPayloadVolumeInformation, MsMonNextOperationId(),
                                 information, local, information);
 }
@@ -213,22 +311,25 @@ static FLT_POSTOP_CALLBACK_STATUS MsMonPostOperation(
     FLT_POST_OPERATION_FLAGS Flags
 )
 {
-    PFLT_FILE_NAME_INFORMATION nameInfo = (PFLT_FILE_NAME_INFORMATION)CompletionContext;
-    PCUNICODE_STRING path = nameInfo != NULL ? &nameInfo->Name : NULL;
+    PMSMon_FILE_CONTEXT context = (PMSMon_FILE_CONTEXT)CompletionContext;
+    PCUNICODE_STRING path;
     UNREFERENCED_PARAMETER(FltObjects);
-    if ((Flags & FLTFL_POST_OPERATION_DRAINING) == 0 &&
-        (MsMonIsTracked(PsGetCurrentProcessId(), 0) || MsMonCurrentIsBlackCat())) {
+
+    if (context == NULL) return FLT_POSTOP_FINISHED_PROCESSING;
+    path = context->NameInfo != NULL ? &context->NameInfo->Name : NULL;
+
+    if ((Flags & FLTFL_POST_OPERATION_DRAINING) == 0 && context->Tracked) {
         if (Data->Iopb->MajorFunction == IRP_MJ_QUERY_VOLUME_INFORMATION && MsMonPayloadEnabled()) {
-            MsMonCaptureVolume(Data, path);
+            MsMonCaptureVolume(Data, context);
         } else {
             (VOID)MsMonLogEvent(MsMonEventType(Data->Iopb->MajorFunction),
-                                PsGetCurrentProcessId(), NULL, PsGetCurrentThreadId(), NULL, 0,
+                                context->ProcessId, NULL, context->ThreadId, NULL, 0,
                                 path == NULL ? MsMonFlagMissingPath : 0, Data->IoStatus.Status, 0,
                                 MsMonFileCategory(path), MsMonEventValue(Data, FALSE),
                                 MsMonEventValue(Data, TRUE), path, NULL);
         }
     }
-    if (nameInfo != NULL) FltReleaseFileNameInformation(nameInfo);
+    MsMonFreeFileContext(context);
     return FLT_POSTOP_FINISHED_PROCESSING;
 }
 
@@ -239,53 +340,60 @@ static FLT_POSTOP_CALLBACK_STATUS MsMonPostCreate(
     FLT_POST_OPERATION_FLAGS Flags
 )
 {
-    PFLT_FILE_NAME_INFORMATION nameInfo = (PFLT_FILE_NAME_INFORMATION)CompletionContext;
+    PMSMon_FILE_CONTEXT context = (PMSMon_FILE_CONTEXT)CompletionContext;
+    PFLT_FILE_NAME_INFORMATION nameInfo;
     PFLT_FILE_NAME_INFORMATION tunneled = NULL;
-    PCUNICODE_STRING path = nameInfo != NULL ? &nameInfo->Name : NULL;
-    ULONG desiredAccess = 0;
+    PCUNICODE_STRING path;
     UNREFERENCED_PARAMETER(FltObjects);
+
+    if (context == NULL) return FLT_POSTOP_FINISHED_PROCESSING;
+    nameInfo = context->NameInfo;
+    path = nameInfo != NULL ? &nameInfo->Name : NULL;
+
     if (Flags & FLTFL_POST_OPERATION_DRAINING) {
-        if (nameInfo != NULL) FltReleaseFileNameInformation(nameInfo);
+        MsMonFreeFileContext(context);
         return FLT_POSTOP_FINISHED_PROCESSING;
     }
-    if (!MsMonIsTracked(PsGetCurrentProcessId(), 0) && !MsMonCurrentIsBlackCat()) {
-        if (nameInfo != NULL) FltReleaseFileNameInformation(nameInfo);
-        return FLT_POSTOP_FINISHED_PROCESSING;
+    if (context->Tracked) {
+        ULONGLONG options = 0;
+        if (Data->Iopb->MajorFunction == IRP_MJ_CREATE) {
+            /*
+             * A normalized name obtained in pre-create can be invalidated by name
+             * tunneling; FltGetTunneledName returns the name that was actually used.
+             */
+            if (nameInfo != NULL && KeGetCurrentIrql() == PASSIVE_LEVEL &&
+                NT_SUCCESS(FltGetTunneledName(Data, nameInfo, &tunneled)) && tunneled != NULL) {
+                path = &tunneled->Name;
+            }
+            options = Data->Iopb->Parameters.Create.Options;
+        }
+        (VOID)MsMonLogEvent(MsMonFileCreate, context->ProcessId, NULL, context->ThreadId,
+                            NULL, 0, path == NULL ? MsMonFlagMissingPath : 0, Data->IoStatus.Status,
+                            context->DesiredAccess, MsMonFileCategory(path),
+                            options, Data->IoStatus.Information, path, NULL);
     }
-    /*
-     * A normalized name obtained in pre-create can be invalidated by name
-     * tunneling; FltGetTunneledName returns the name that was actually used.
-     */
-    if (nameInfo != NULL && KeGetCurrentIrql() == PASSIVE_LEVEL &&
-        NT_SUCCESS(FltGetTunneledName(Data, nameInfo, &tunneled)) && tunneled != NULL) {
-        path = &tunneled->Name;
-    }
-    /*
-     * SecurityContext belongs to the create request. Only trust it when the
-     * create itself succeeded.
-     */
-    if (NT_SUCCESS(Data->IoStatus.Status) &&
-        Data->Iopb->Parameters.Create.SecurityContext != NULL) {
-        desiredAccess = Data->Iopb->Parameters.Create.SecurityContext->DesiredAccess;
-    }
-    (VOID)MsMonLogEvent(MsMonFileCreate, PsGetCurrentProcessId(), NULL, PsGetCurrentThreadId(),
-                        NULL, 0, path == NULL ? MsMonFlagMissingPath : 0, Data->IoStatus.Status,
-                        desiredAccess,
-                        MsMonFileCategory(path),
-                        Data->Iopb->Parameters.Create.Options, Data->IoStatus.Information, path, NULL);
     if (tunneled != NULL) FltReleaseFileNameInformation(tunneled);
-    if (nameInfo != NULL) FltReleaseFileNameInformation(nameInfo);
+    MsMonFreeFileContext(context);
     return FLT_POSTOP_FINISHED_PROCESSING;
 }
 
 static const FLT_OPERATION_REGISTRATION gOperations[] = {
     { IRP_MJ_CREATE, 0, MsMonPreCreate, MsMonPostCreate, NULL },
+    { IRP_MJ_CREATE_NAMED_PIPE, 0, MsMonPreCreate, MsMonPostCreate, NULL },
+    { IRP_MJ_CREATE_MAILSLOT, 0, MsMonPreCreate, MsMonPostCreate, NULL },
     { IRP_MJ_READ, FLTFL_OPERATION_REGISTRATION_SKIP_PAGING_IO, MsMonPreOperation, MsMonPostOperation, NULL },
     { IRP_MJ_WRITE, FLTFL_OPERATION_REGISTRATION_SKIP_PAGING_IO, MsMonPreOperation, MsMonPostOperation, NULL },
     { IRP_MJ_SET_INFORMATION, 0, MsMonPreOperation, MsMonPostOperation, NULL },
     { IRP_MJ_QUERY_INFORMATION, 0, MsMonPreOperation, MsMonPostOperation, NULL },
     { IRP_MJ_DIRECTORY_CONTROL, 0, MsMonPreOperation, MsMonPostOperation, NULL },
     { IRP_MJ_CLEANUP, 0, MsMonPreOperation, MsMonPostOperation, NULL },
+    { IRP_MJ_CLOSE, 0, MsMonPreOperation, MsMonPostOperation, NULL },
+    { IRP_MJ_FLUSH_BUFFERS, 0, MsMonPreOperation, MsMonPostOperation, NULL },
+    { IRP_MJ_QUERY_SECURITY, 0, MsMonPreOperation, MsMonPostOperation, NULL },
+    { IRP_MJ_SET_SECURITY, 0, MsMonPreOperation, MsMonPostOperation, NULL },
+    { IRP_MJ_QUERY_EA, 0, MsMonPreOperation, MsMonPostOperation, NULL },
+    { IRP_MJ_SET_EA, 0, MsMonPreOperation, MsMonPostOperation, NULL },
+    { IRP_MJ_ACQUIRE_FOR_SECTION_SYNCHRONIZATION, 0, MsMonPreOperation, MsMonPostOperation, NULL },
     { IRP_MJ_DEVICE_CONTROL, 0, MsMonPreOperation, MsMonPostOperation, NULL },
     { IRP_MJ_INTERNAL_DEVICE_CONTROL, 0, MsMonPreOperation, MsMonPostOperation, NULL },
     { IRP_MJ_FILE_SYSTEM_CONTROL, 0, MsMonPreOperation, MsMonPostOperation, NULL },
@@ -306,7 +414,8 @@ static NTSTATUS FLTAPI MsMonFilterUnload(FLT_FILTER_UNLOAD_FLAGS Flags)
 }
 
 static const FLT_REGISTRATION gFilterRegistration = {
-    sizeof(FLT_REGISTRATION), FLT_REGISTRATION_VERSION, 0, NULL, gOperations,
+    sizeof(FLT_REGISTRATION), FLT_REGISTRATION_VERSION, FLTFL_REGISTRATION_SUPPORT_NPFS_MSFS,
+    NULL, gOperations,
     MsMonFilterUnload, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
 };
 

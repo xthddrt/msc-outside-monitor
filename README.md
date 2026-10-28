@@ -2,7 +2,7 @@
 
 Application-scoped Windows telemetry for the MapleStoryCW client, with a WDM kernel/minifilter driver, an elevated Win32 collector, ETW correlation, chained JSONL output, and a static inventory of the supplied installation.
 
-The monitor observes an exact client installation, its descendants, and configured Nexon helpers. It does not inject code, hook SSDTs, patch the client, bypass GRAP/Nexon security, disable driver signing, or decrypt network traffic. By default it records exact registry values and volume-information results; these payloads can contain hardware identifiers and registry secrets. Generic file contents and network payloads are not captured.
+The monitor observes an exact client installation, its descendants, and configured Nexon helpers. It does not inject code, hook SSDTs, patch the client, bypass GRAP/Nexon security, disable driver signing, or decrypt network traffic. By default it records registry values (up to 64 KiB each) and volume-information results; these payloads can contain hardware identifiers and registry secrets. Generic file contents and network payloads are not captured.
 
 ## What it captures
 
@@ -10,16 +10,16 @@ The monitor observes an exact client installation, its descendants, and configur
 |---|---|
 | Process/thread/image callbacks | start/exit, PID and creation time, ancestry, image path, command line when available, module base/size |
 | Object callbacks | process/thread handle creation and duplication, target PID/image, requested and granted access, result |
-| Filesystem minifilter | create, read/write, query/set information, directory control, cleanup, visible FS/device controls, volume-information results |
-| Registry callbacks | open/create, query/enumerate, set/delete/rename, key/value names, type/size, operation result, and exact value bytes |
+| Filesystem minifilter | create, non-paging read/write, query/set information, directory control, cleanup/close, flush, security/EA, section acquire, named-pipe/mailslot, visible FS/device controls, volume-information results |
+| Registry callbacks | open/create, query/enumerate, set/delete/rename, key/value names including common enumeration results, type/size, operation result, and value bytes up to 64 KiB |
 | Windows Filtering Platform | IPv4/IPv6 connect/accept and flow establish/close, flow ID, endpoints, protocol, ports, PID |
 | WMI Activity ETW | correlated client PID, namespace/provider/operation, and original query text in full-payload mode |
 | DNS Client ETW | correlated query name and query metadata |
 | RPC ETW | correlated endpoint/operation metadata where client attribution is available |
 
-For `BlackCat64.sys`, the driver maps the kernel image and checks the active kernel stack. Direct matches are emitted with component `BlackCat64.sys` and `stack_resolved` attribution. This proves BlackCat participated in the operation, not that MapleStory requested it. Queued work, shared worker threads, protected code, and BlackCat device IRPs outside existing callbacks remain unattributed.
+For `BlackCat64.sys`, the driver maps the kernel image and checks the active kernel stack. Direct matches are emitted with component `BlackCat64.sys` and `stack_resolved` attribution. This proves BlackCat participated in the operation, not that MapleStory requested it. BlackCat-created children are tracked, and WFP accepts direct BlackCat stack matches. Queued work, shared worker threads, protected code, and BlackCat device IRPs outside existing callbacks remain unattributed.
 
-Registry values are emitted as Base64 bytes with friendly decoding for common string, multi-string, DWORD, and QWORD types. Volume results include raw bytes plus the exact serial number, creation time, and label when the returned structure is valid. Large values use linked 8-KiB chunks.
+Registry values are emitted as Base64 bytes with friendly decoding for common string, multi-string, DWORD, and QWORD types. Volume results include raw bytes plus the exact serial number, creation time, and label when the returned structure is valid. Large values use linked 8-KiB chunks; values larger than 64 KiB are explicitly partial, and values above the 8-MiB protocol limit are marked unavailable.
 
 Records are classified as client data, Windows runtime, external process, browser interaction, hardware identity, user data, registry, network, IPC, or unknown. Capturing a request or returned value does not prove that MapleStory retained or transmitted it. This is broad OS telemetry, not a guarantee of every instruction, function call, service-mediated action, or hardware read.
 
@@ -36,12 +36,16 @@ Outputs:
 - `build\Release\driver\msmon.sys`
 - `build\Release\driver\msmon.inf`
 - `build\Release\agent\msmon-agent.exe`
-- `build\compat\msmon-legacy.sys`
-- `build\compat\msmon-legacyctl.exe`
 
-The compatibility subsystem in `compat/` contains the complete legacy monitor and guard implementation, with inline PatchGuard-dependent hooks disabled by default. Its device is administrator-only, its summary keys include PID, and its legacy process-notification fallback and hook-index defects are corrected. See `compat/README.md` for the active/degraded/disabled matrix. No driver is installed automatically.
+The compatibility subsystem in `compat/` is **not part of the default build**. It is an experimental legacy monitor with PatchGuard-unsafe inline hooks. Build it only when explicitly requested:
 
-The default build is unsigned development output. Do not load it on a production machine. Use the isolated test-VM procedure in `docs/TEST_VM.md`. The current code has been compiled but has not been installed or runtime-tested.
+```bat
+build.cmd --with-compat
+```
+
+It produces `build\compat\msmon-legacy.sys` and `build\compat\msmon-legacyctl.exe`. See `compat/README.md` for the active/degraded/disabled matrix. No driver is installed automatically. Do not load the compat driver for normal coverage work.
+
+The default build is unsigned development output. Do not load it on a production machine. Use the isolated test-VM procedure in `docs/TEST_VM.md`. The user-mode agent and kernel driver both compile cleanly with MSVC `/W4 /WX` against WDK 10.0.26100 (`msmon.sys` is 48,128 bytes; `InfVerif` syntax validation passes). The driver has not been installed or runtime-tested here, and `InfVerif /w` reports DIRID 12 in the legacy minifilter INF, so treat runtime behavior as unverified until the VM checklist passes.
 
 `docs/RELIABILITY.md` records the driver defects found while investigating host bugchecks on stop/unload and under network load, together with the fixes. Read it before loading a build.
 
@@ -50,11 +54,17 @@ The default build is unsigned development output. Do not load it on a production
 Run elevated in the test VM after properly signing and starting the driver. Start the collector before launching the game:
 
 ```bat
-msmon-agent.exe --client "C:\Nexon\Library\maplestorycw\appdata" --output session.jsonl
+msmon-agent.exe --client "C:\Nexon\Library\maplestorycw" --output session.jsonl
 ```
+
+`--client` names the installation/classification root. The agent auto-detects
+`appdata` as the process scope when the executable is there. Use
+`--scope-root` to override the process scope explicitly, or pass the original
+`...\appdata` path directly.
 
 Options:
 
+- `--scope-root DIRECTORY` explicitly sets the process scope (the folder containing the client executable);
 - `--pid PID` explicitly tracks another existing process;
 - `--wait-ms N` sets the empty-queue wait, capped by the driver at one second;
 - `--max-file-mb N` rotates output after the threshold with a continuing hash chain;
@@ -64,7 +74,7 @@ Options:
 - `--no-payloads` disables exact registry/volume payloads and restores sanitized WMI queries;
 - `--once` reads one driver batch and exits.
 
-The default root is `C:\Nexon\Library\maplestorycw\appdata`. Local drive-letter paths are translated to the NT device paths seen by kernel process callbacks. The configured root contains `MapleStory.exe`, `grap\NGService.exe`, `NxOverlay\DwarfAxe.exe`, and `CrashReportClient.exe`; descendants inherit tracking. Existing unrelated browsers and services are logged as interaction targets, not monitored wholesale.
+Local drive-letter paths are translated to the NT device paths seen by kernel process callbacks. The process scope contains `MapleStory.exe` and its helpers; any executable image beneath the scope root is tracked, and descendants inherit tracking. Existing unrelated browsers and services are logged as interaction targets, not monitored wholesale. The session log contains a `coverage_manifest` record listing the scope/inside roots and the sensors that are actually enabled, so a missing event class is not mistaken for proof of no activity.
 
 Every output line has a consecutive record index and a SHA-256 chain. Driver and ETW sequence numbers remain independent; gaps and queue drops are visible. Validate rotated logs in order:
 

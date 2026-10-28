@@ -13,6 +13,7 @@
 #define MSMON_CALLOUT_COUNT 6
 
 BOOLEAN MsMonIsTracked(HANDLE ProcessId, LONGLONG StartTime);
+BOOLEAN MsMonCurrentIsBlackCat(VOID);
 NTSTATUS MsMonLogEvent(ULONG Type, HANDLE ProcessId, HANDLE ParentProcessId, HANDLE ThreadId,
                        HANDLE TargetProcessId, LONGLONG TargetProcessStartTime, ULONG Flags,
                        NTSTATUS Status, ULONG DesiredAccess, ULONG Category,
@@ -246,7 +247,8 @@ static VOID NTAPI MsMonWfpClassify(
     do {
         if (index >= MSMON_CALLOUT_COUNT || InFixedValues == NULL || InMetaValues == NULL) break;
         if ((InMetaValues->currentMetadataValues & FWPS_METADATA_FIELD_PROCESS_ID) == 0) break;
-        if (!MsMonIsTracked(UlongToHandle((ULONG)InMetaValues->processId), 0)) break;
+        if (!MsMonIsTracked(UlongToHandle((ULONG)InMetaValues->processId), 0) &&
+            !MsMonCurrentIsBlackCat()) break;
         MsMonSelectFields(index, &localAddressField, &remoteAddressField,
                           &localPortField, &remotePortField, &protocolField);
         /*

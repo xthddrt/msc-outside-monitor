@@ -37,7 +37,7 @@
  * on a machine that is being used.  Set to 1 only for a short, supervised
  * monitoring session. */
 #ifndef SYSINFO_ENABLE_TRACE_HOOKS
-#define SYSINFO_ENABLE_TRACE_HOOKS 1
+#define SYSINFO_ENABLE_TRACE_HOOKS 0
 #endif
 
 static volatile LONG g_UnsafeHooksEnabled;
@@ -1922,6 +1922,7 @@ TraceInit(VOID)
     if (g_HookCount != 0) return;
 
 #if !SYSINFO_ENABLE_TRACE_HOOKS
+    UNREFERENCED_PARAMETER(i);
     DbgPrint("SysInfo: trace hooks disabled at compile time\n");
     return;
 #else

@@ -2,16 +2,28 @@
 setlocal enabledelayedexpansion
 pushd "%~dp0"
 
-set "VSROOT=C:\Program Files\Microsoft Visual Studio\2022\Community"
 set "KITS=C:\Program Files (x86)\Windows Kits\10"
 set "KITVER=10.0.26100.0"
 set "ROOT=%~dp0"
 set "OUT=%ROOT%..\build\compat"
 set "SYSN=msmon-legacy.sys"
 set "EXEN=msmon-legacyctl.exe"
+set "VSROOT="
+set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
+if exist "%VSWHERE%" (
+    for /f "usebackq delims=" %%i in (`"%VSWHERE%" -latest -products * -property installationPath`) do (
+        if not defined VSROOT set "VSROOT=%%i"
+    )
+)
+if not defined VSROOT if exist "C:\Program Files\Microsoft Visual Studio\2022\Community" set "VSROOT=C:\Program Files\Microsoft Visual Studio\2022\Community"
+if not defined VSROOT if exist "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools" set "VSROOT=C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools"
 
+if not defined VSROOT (
+    echo [!] Visual Studio not found
+    exit /b 1
+)
 if not exist "%VSROOT%\VC\Auxiliary\Build\vcvars64.bat" (
-    echo [!] Visual Studio not found at "%VSROOT%"
+    echo [!] Visual Studio C++ tools not found at "%VSROOT%"
     exit /b 1
 )
 call "%VSROOT%\VC\Auxiliary\Build\vcvars64.bat" >nul

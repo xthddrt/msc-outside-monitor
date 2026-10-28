@@ -6,6 +6,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cwchar>
+#include <wchar.h>
 #include <iostream>
 #include <memory>
 #include <set>
@@ -79,11 +81,6 @@ static bool ProcessIdentity(DWORD pid, std::wstring& path, uint64_t& startTime)
     return ok != 0;
 }
 
-static bool EqualPath(const std::wstring& left, const std::wstring& right)
-{
-    return _wcsicmp(left.c_str(), right.c_str()) == 0;
-}
-
 class DeviceSession {
 public:
     ~DeviceSession()
@@ -152,19 +149,14 @@ private:
     bool started_ = false;
 };
 
-static bool KnownClientImage(const std::wstring& root, const std::wstring& image)
+static bool IsUnderRoot(const std::wstring& root, const std::wstring& path)
 {
-    static const wchar_t* relative[] = {
-        L"\\MapleStory.exe", L"\\grap\\NGService.exe",
-        L"\\NxOverlay\\DwarfAxe.exe", L"\\CrashReportClient.exe"
-    };
-    for (const auto* suffix : relative) {
-        if (EqualPath(image, root + suffix)) return true;
-    }
-    return false;
+    if (path.size() <= root.size()) return false;
+    if (_wcsnicmp(path.c_str(), root.c_str(), root.size()) != 0) return false;
+    return path[root.size()] == L'\\';
 }
 
-static unsigned TrackExisting(DeviceSession& device, const std::wstring& clientRoot,
+static unsigned TrackExisting(DeviceSession& device, const std::wstring& scopeRoot,
                               ProcessScope& scope)
 {
     HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -186,11 +178,12 @@ static unsigned TrackExisting(DeviceSession& device, const std::wstring& clientR
         changed = false;
         for (const auto& process : processes) {
             if (tracked.count(process.th32ProcessID) != 0) continue;
+            if (process.th32ProcessID == GetCurrentProcessId()) continue;
             bool inherited = tracked.count(process.th32ParentProcessID) != 0;
             std::wstring path;
             uint64_t startTime = 0;
             if (!ProcessIdentity(process.th32ProcessID, path, startTime)) continue;
-            if (!inherited && !KnownClientImage(clientRoot, path)) continue;
+            if (!inherited && !IsUnderRoot(scopeRoot, path)) continue;
             ULONG flags = inherited ? MsMonFlagInheritedTrack : MsMonFlagExplicitTrack;
             if (device.Track(process.th32ProcessID, startTime, flags)) {
                 tracked.insert(process.th32ProcessID);
@@ -215,7 +208,7 @@ static std::wstring DefaultOutputPath()
 
 static void Usage()
 {
-    std::cout << "Usage: msmon-agent [--client DIRECTORY] [--output FILE] [--pid PID] "
+    std::cout << "Usage: msmon-agent [--client DIRECTORY] [--scope-root DIRECTORY] [--output FILE] [--pid PID] "
                  "[--wait-ms N] [--max-file-mb N] [--queue-records N] [--queue-mb N] "
                  "[--stop-file FILE] [--no-etw] [--no-payloads] [--once]\n";
 }
@@ -229,7 +222,8 @@ static bool ParseNumber(const wchar_t* text, uint64_t& value)
 
 int wmain(int argc, wchar_t** argv)
 {
-    std::wstring clientRoot = L"C:\\Nexon\\Library\\maplestorycw\\appdata";
+    std::wstring clientRoot = L"C:\\Nexon\\Library\\maplestorycw";
+    std::wstring scopeRootArg;
     std::wstring output = DefaultOutputPath();
     uint64_t waitMs = 100;
     uint64_t maxFileBytes = 64ull * 1024ull * 1024ull;
@@ -256,6 +250,8 @@ int wmain(int argc, wchar_t** argv)
             capturePayloads = false;
         } else if (index + 1 < argc && argument == L"--client") {
             clientRoot = argv[++index];
+        } else if (index + 1 < argc && argument == L"--scope-root") {
+            scopeRootArg = argv[++index];
         } else if (index + 1 < argc && argument == L"--output") {
             output = argv[++index];
         } else if (index + 1 < argc && argument == L"--stop-file") {
@@ -287,10 +283,41 @@ int wmain(int argc, wchar_t** argv)
         std::cerr << "Could not resolve the client root.\n";
         return 1;
     }
+
+    /*
+     * The folder the user names and the folder containing the executable are
+     * not always the same.  The installation root is ...\maplestorycw, while
+     * the game and its helpers live in ...\maplestorycw\appdata.  Keep the
+     * classification root at the named folder, but auto-detect appdata for
+     * the process scope.  An explicit --scope-root always wins.
+     */
+    std::wstring scopeRoot = scopeRootArg.empty() ? clientRoot : FullPath(scopeRootArg);
+    if (scopeRoot.empty()) {
+        std::cerr << "Could not resolve the scope root.\n";
+        return 1;
+    }
+    std::error_code fsError;
+    if (scopeRootArg.empty() &&
+        !std::filesystem::exists(std::filesystem::path(scopeRoot) / L"MapleStory.exe", fsError) &&
+        std::filesystem::exists(std::filesystem::path(scopeRoot) / L"appdata" / L"MapleStory.exe", fsError)) {
+        scopeRoot = (std::filesystem::path(scopeRoot) / L"appdata").wstring();
+    }
+    if (!std::filesystem::exists(std::filesystem::path(scopeRoot) / L"MapleStory.exe", fsError) &&
+        explicitPids.empty()) {
+        std::cerr << "No MapleStory.exe was found under scope root:\n  " << WideToUtf8(scopeRoot)
+                  << "\nUse --scope-root to point at the folder containing the executable, or --pid for an already running process.\n";
+        return 1;
+    }
+
+    std::wstring scopeNt;
     std::wstring clientNt;
     std::string error;
+    if (!DevicePath(scopeRoot, scopeNt, error)) {
+        std::cerr << "Scope root: " << error << "\n";
+        return 1;
+    }
     if (!DevicePath(clientRoot, clientNt, error)) {
-        std::cerr << error << "\n";
+        std::cerr << "Client root: " << error << "\n";
         return 1;
     }
     wchar_t windowsBuffer[32768];
@@ -312,11 +339,11 @@ int wmain(int argc, wchar_t** argv)
     config.QueueRecords = static_cast<ULONG>(queueRecords);
     config.QueueBytes = static_cast<ULONG>(queueBytes);
     config.PayloadMode = capturePayloads ? 1u : 0u;
-    if (clientNt.size() >= MSMON_CLIENT_PATH_CHARS) {
-        std::cerr << "The client NT path is too long for the session configuration.\n";
+    if (scopeNt.size() >= MSMON_CLIENT_PATH_CHARS) {
+        std::cerr << "The scope NT path is too long for the session configuration.\n";
         return 1;
     }
-    wcscpy_s(config.ClientRoot, MSMON_CLIENT_PATH_CHARS, clientNt.c_str());
+    wcscpy_s(config.ClientRoot, MSMON_CLIENT_PATH_CHARS, scopeNt.c_str());
 
     DeviceSession device;
     if (!device.Open()) {
@@ -334,7 +361,7 @@ int wmain(int argc, wchar_t** argv)
     }
 
     ProcessScope scope;
-    unsigned registered = TrackExisting(device, clientRoot, scope);
+    unsigned registered = TrackExisting(device, scopeRoot, scope);
     for (DWORD pid : explicitPids) {
         std::wstring path;
         uint64_t startTime = 0;
@@ -346,6 +373,9 @@ int wmain(int argc, wchar_t** argv)
         }
     }
     std::cout << "Registered " << registered << " client/helper/descendant processes.\n";
+    if (registered == 0) {
+        std::cout << "No client process is running yet; waiting for a tracked image to start.\n";
+    }
 
     JsonlWriter writer(output, maxFileBytes);
     if (!writer.Open()) {
@@ -374,13 +404,25 @@ int wmain(int argc, wchar_t** argv)
         return writer.Write(TelemetryJson(event));
     };
 
-    if (!writeCoverage(L"session_start", L"client_root=" + clientRoot)) return 1;
+    if (!writeCoverage(L"session_start", L"client_root=" + clientRoot + L";scope_root=" + scopeRoot)) return 1;
+    {
+        std::wstring manifest = L"scope_root=" + scopeRoot +
+                                L";inside_root=" + clientRoot +
+                                L";driver_callbacks=process,thread,image,object_process,object_thread,file,file_section,file_security,file_ea,registry,wfp" +
+                                L";minifilter_npfs=true;file_section_acquire=true;registry_enum_names=true;memory=false;ui=false;hardware_direct=false" +
+                                L";etw=";
+        manifest += (enableEtw ? L"wmi,dns,rpc" : L"disabled");
+        manifest += L";etw_level=verbose;payload_mode=";
+        manifest += capturePayloads ? L"full" : L"metadata";
+        manifest += L";blind_spots=per_page_mmap_io,named_pipe_payload,memory_ops,ui_clipboard_input,hardware_direct,brokered_actions,tls_plaintext";
+        if (!writeCoverage(L"coverage_manifest", manifest)) return 1;
+    }
     if (!writeCoverage(capturePayloads ? L"payload_capture_enabled" : L"payload_capture_disabled",
                        capturePayloads ?
-                           L"Exact registry values and volume information will be logged; logs may contain hardware identifiers and registry secrets. WMI result rows, direct adapter-API results, file contents, and network contents remain unavailable" :
+                           L"Exact registry values and volume information will be logged; logs may contain hardware identifiers and registry secrets. Registry values are capped at 64 KiB; WMI result rows, direct adapter-API results, file contents, and network contents remain unavailable" :
                            L"Metadata-only mode; no registry value or volume payload capture")) return 1;
     if (!writeCoverage(L"coverage_limit",
-                       L"Handle-less process/window snapshots, ALPC/COM payloads, brokered existing-browser launches, direct adapter APIs, protected processes, pre-start activity, and dropped events are not guaranteed")) return 1;
+                       L"Handle-less process/window snapshots, per-page mapped I/O, named-pipe/ALPC/COM payloads, brokered existing-browser launches, direct adapter/firmware APIs, protected processes, pre-start activity, and dropped events are not guaranteed")) return 1;
     if (!writeCoverage(L"static_hardware_boundary",
                        L"MachineIdLib.dll imports process/window enumeration, GetVolumeInformationA, and GetAdaptersInfo; static imports do not prove runtime invocation",
                        MsMonAttributionStaticEvidence)) return 1;
@@ -453,6 +495,12 @@ int wmain(int argc, wchar_t** argv)
             }
             previousEtwSequence = event.header.Sequence;
         }
+        if (event.processPath.empty() && event.header.ProcessId != 0) {
+            uint64_t start = scope.StartTime(event.header.ProcessId);
+            if (event.header.ProcessStartTime == 0 || start == 0 || start == event.header.ProcessStartTime) {
+                event.processPath = scope.Path(event.header.ProcessId);
+            }
+        }
         classifier.Classify(event);
         summary.Add(event);
         totalEvents++;
@@ -461,9 +509,13 @@ int wmain(int argc, wchar_t** argv)
 
     auto drainEtw = [&]() {
         std::vector<TelemetryEvent> events;
-        etwQueue.Drain(events, 8192);
-        for (auto& event : events) {
-            if (!writeEvent(event)) return false;
+        for (;;) {
+            events.clear();
+            size_t count = etwQueue.Drain(events, 8192);
+            if (count == 0) break;
+            for (auto& event : events) {
+                if (!writeEvent(event)) return false;
+            }
         }
         return true;
     };
@@ -523,7 +575,9 @@ int wmain(int argc, wchar_t** argv)
             if (event.header.Type == MsMonProcessStart) {
                 uint64_t start = event.header.ProcessStartTime != 0 ? event.header.ProcessStartTime : event.header.Value0;
                 scope.AddProcess(event.header.ProcessId, start, event.text);
+                if (etw) etw->ReplayProcess(event.header.ProcessId);
             } else if (event.header.Type == MsMonProcessExit) {
+                event.processPath = scope.Path(event.header.ProcessId);
                 scope.RemoveProcess(event.header.ProcessId, event.header.ProcessStartTime);
             } else if (event.header.Type == MsMonImageLoad) {
                 scope.AddImage(event.header.ProcessId, event.header.Value0, event.header.Value1, event.text);
@@ -534,6 +588,7 @@ int wmain(int argc, wchar_t** argv)
                 break;
             }
         }
+        if (etw) etw->ExpirePending(GetTickCount64());
         if (result != 0 || !drainEtw()) {
             result = 1;
             break;
@@ -584,8 +639,29 @@ int wmain(int argc, wchar_t** argv)
         }
     } while (!once && (!draining || bytes != 0));
 
-    if (etw != nullptr) etw->Stop();
+    if (etw != nullptr) {
+        /*
+         * The session is ending: any event still waiting for a process-start
+         * record is now permanently unattributed.  Emit those coverage
+         * records before stopping the session so they are not lost.
+         */
+        etw->ExpirePending(~0ull);
+        etw->Stop();
+        /* Stop joins the ETW worker; expire anything it queued in the race. */
+        etw->ExpirePending(~0ull);
+    }
     if (!drainEtw()) result = 1;
+    if (etw != nullptr) {
+        if (!writeCoverage(L"etw_accounting",
+                           L"unattributed=" + std::to_wstring(etw->UnattributedCount()) +
+                           L";pending_overflow=" + std::to_wstring(etw->PendingOverflow()) +
+                           L";pending_after=" + std::to_wstring(etw->PendingCount()) +
+                           L";lost_events=" + std::to_wstring(etw->LostEvents()) +
+                           L";parse_failures=" + std::to_wstring(etw->ParseFailures()) +
+                           L";queue_drops=" + std::to_wstring(etwQueue.Dropped()))) {
+            result = 1;
+        }
+    }
     MSMON_STATISTICS statistics{};
     if (!device.Statistics(statistics)) {
         std::cerr << "Could not read final driver statistics.\n";

@@ -17,8 +17,13 @@ struct TelemetryEvent {
     std::wstring text;
     std::wstring detail;
     std::wstring component;
+    std::wstring processPath;
     std::vector<std::wstring> modules;
     std::vector<BYTE> payload;
+    /* Raw ETW stack, retained until the event is emitted so late image loads
+     * can still be resolved.  Never written to JSON. */
+    DWORD stackPid = 0;
+    std::vector<uint64_t> stackAddresses;
     std::string source = "driver";
     bool outsideClient = true;
 };
@@ -42,6 +47,7 @@ public:
     void AddImage(DWORD pid, uint64_t base, uint64_t size, const std::wstring& path);
     bool IsTracked(DWORD pid) const;
     uint64_t StartTime(DWORD pid) const;
+    std::wstring Path(DWORD pid) const;
     std::vector<std::wstring> ResolveStack(DWORD pid, const uint64_t* addresses, size_t count) const;
 
 private:

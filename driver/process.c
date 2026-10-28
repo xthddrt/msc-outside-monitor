@@ -36,31 +36,29 @@ VOID MsMonRecordStatus(PCWSTR Name, NTSTATUS Status)
     (VOID)ZwClose(key);
 }
 
-static BOOLEAN MsMonImageMatches(PCUNICODE_STRING ImageFileName, PCWSTR RelativePath)
+/*
+ * Track any executable image beneath the configured client root, not a
+ * hard-coded list.  The installation contains PE payloads with non-.exe
+ * extensions (for example the GRAP .aes images) and private-server builds
+ * may rename helpers.  The root is the appdata scope chosen by the agent;
+ * descendants are still inherited separately.
+ */
+static BOOLEAN MsMonImageUnderRoot(PCUNICODE_STRING ImageFileName)
 {
-    UNICODE_STRING relative;
-    UNICODE_STRING candidate;
+    BOOLEAN result = FALSE;
+    USHORT offset;
+    WCHAR boundary;
     if (!gSessionActive || gClientRoot.Buffer == NULL || ImageFileName == NULL || ImageFileName->Buffer == NULL) {
         return FALSE;
     }
-    RtlInitUnicodeString(&relative, RelativePath);
-    if (ImageFileName->Length != gClientRoot.Length + relative.Length) return FALSE;
-    if (ImageFileName->Length < gClientRoot.Length ||
-        !RtlPrefixUnicodeString(&gClientRoot, ImageFileName, TRUE)) return FALSE;
-    candidate.Buffer = (PWSTR)((PUCHAR)ImageFileName->Buffer + gClientRoot.Length);
-    candidate.Length = relative.Length;
-    candidate.MaximumLength = relative.Length;
-    return RtlEqualUnicodeString(&candidate, &relative, TRUE);
-}
-
-static BOOLEAN MsMonKnownImage(PCUNICODE_STRING ImageFileName)
-{
-    BOOLEAN result;
     (VOID)KeWaitForSingleObject(&gRootMutex, Executive, KernelMode, FALSE, NULL);
-    result = MsMonImageMatches(ImageFileName, L"\\MapleStory.exe") ||
-             MsMonImageMatches(ImageFileName, L"\\grap\\NGService.exe") ||
-             MsMonImageMatches(ImageFileName, L"\\NxOverlay\\DwarfAxe.exe") ||
-             MsMonImageMatches(ImageFileName, L"\\CrashReportClient.exe");
+    if (gSessionActive && gClientRoot.Buffer != NULL &&
+        ImageFileName->Length > gClientRoot.Length &&
+        RtlPrefixUnicodeString(&gClientRoot, ImageFileName, TRUE)) {
+        offset = gClientRoot.Length;
+        boundary = ImageFileName->Buffer[offset / sizeof(WCHAR)];
+        result = (boundary == L'\\');
+    }
     KeReleaseMutex(&gRootMutex, FALSE);
     return result;
 }
@@ -259,18 +257,32 @@ static VOID MsMonProcessNotifyInner(PEPROCESS Process, HANDLE ProcessId, PPS_CRE
     }
     if (MsMonIsTracked(CreateInfo->ParentProcessId, 0)) {
         flags = MsMonFlagInheritedTrack;
-    } else if (MsMonKnownImage(CreateInfo->ImageFileName)) {
+    } else if (MsMonImageUnderRoot(CreateInfo->ImageFileName)) {
         flags = MsMonFlagExplicitTrack;
     } else if (MsMonCurrentIsBlackCat()) {
+        /*
+         * A process created by BlackCat is part of the observed application
+         * tree.  Log it and add it to the tracked set so its later file,
+         * registry, network, and handle events are not lost.
+         */
+        flags = MsMonFlagExplicitTrack;
+        status = MsMonTrackProcess(ProcessId, flags);
+        if (!NT_SUCCESS(status)) {
+            MsMonEventsNoteDropped();
+            return;
+        }
         (VOID)MsMonLogEvent(MsMonProcessStart, ProcessId, CreateInfo->ParentProcessId, NULL, NULL, 0,
-                            MsMonFlagExplicitTrack, STATUS_SUCCESS, 0, MsMonCategoryExternalProcess,
+                            flags, STATUS_SUCCESS, 0, MsMonCategoryExternalProcess,
                             (ULONGLONG)startTime, 0, CreateInfo->ImageFileName, CreateInfo->CommandLine);
         return;
     } else {
         return;
     }
     status = MsMonTrackProcess(ProcessId, flags);
-    if (!NT_SUCCESS(status)) return;
+    if (!NT_SUCCESS(status)) {
+        MsMonEventsNoteDropped();
+        return;
+    }
     (VOID)MsMonLogEvent(MsMonProcessStart, ProcessId, CreateInfo->ParentProcessId, NULL, NULL, 0,
                         flags, STATUS_SUCCESS, 0, MsMonCategoryExternalProcess,
                         (ULONGLONG)startTime, 0, CreateInfo->ImageFileName, CreateInfo->CommandLine);

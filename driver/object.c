@@ -28,7 +28,10 @@ static OB_PREOP_CALLBACK_STATUS MsMonObjectPre(PVOID RegistrationContext, POB_PR
         return OB_PREOP_SUCCESS;
     }
     context = ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(*context), MSMON_POOL_TAG);
-    if (context == NULL) return OB_PREOP_SUCCESS;
+    if (context == NULL) {
+        MsMonEventsNoteDropped();
+        return OB_PREOP_SUCCESS;
+    }
     RtlZeroMemory(context, sizeof(*context));
     context->Operation = Information->Operation;
     context->ThreadObject = Information->ObjectType == *PsThreadType;

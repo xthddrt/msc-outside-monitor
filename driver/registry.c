@@ -174,12 +174,12 @@ static VOID MsMonLogRegistryValue(
     const VOID* Data, ULONG DataBytes
 )
 {
-    /*
-     * Never turn a single registry value into an unbounded burst of nonpaged
-     * records. Larger values are recorded as an incomplete payload operation
-     * (MsMonFlagPayloadPartial) with the true total length.
-     */
-    ULONG captured = min(DataBytes, MSMON_REGISTRY_CAPTURE_MAX_BYTES);
+    ULONG captured;
+    if (DataBytes > MSMON_MAX_PAYLOAD_TOTAL_BYTES) {
+        MsMonRegistryUnavailable(Context, Status, L"payload_too_large", 0);
+        return;
+    }
+    captured = min(DataBytes, MSMON_REGISTRY_CAPTURE_MAX_BYTES);
     (VOID)MsMonLogPayloadSeries(Context->Type, Context->ProcessId, Context->ThreadId,
                                 0, Status, MsMonCategoryRegistry,
                                 Context->Value0, Type,
@@ -291,9 +291,19 @@ static VOID MsMonCaptureMultipleValues(
     }
 }
 
+static VOID MsMonSetResultName(
+    PMSMON_REGISTRY_CONTEXT Context, PCWSTR Name, ULONG NameBytes, ULONG AvailableBytes
+)
+{
+    if (Name == NULL || NameBytes > AvailableBytes) return;
+    Context->Detail.Buffer = (PWSTR)Name;
+    Context->Detail.Length = (USHORT)min(NameBytes, MSMON_MAX_EVENT_STRING_BYTES);
+    Context->Detail.MaximumLength = Context->Detail.Length;
+}
+
 static VOID MsMonCaptureRegistryResult(
     REG_NOTIFY_CLASS Operation, PREG_POST_OPERATION_INFORMATION Post,
-    PMSMON_REGISTRY_CONTEXT Context
+    PMSMON_REGISTRY_CONTEXT Context, BOOLEAN CapturePayload
 )
 {
     __try {
@@ -308,8 +318,44 @@ static VOID MsMonCaptureRegistryResult(
         case RegNtPostEnumerateValueKey: {
             PREG_ENUMERATE_VALUE_KEY_INFORMATION info = (PREG_ENUMERATE_VALUE_KEY_INFORMATION)Post->PreInformation;
             ULONG returned = info->ResultLength != NULL ? *info->ResultLength : info->Length;
-            MsMonCaptureSingleValue(Context, Post->Status, info->KeyValueInformationClass,
-                                    info->KeyValueInformation, info->Length, returned);
+            MSMON_REGISTRY_CONTEXT named = *Context;
+            if (NT_SUCCESS(Post->Status) && returned <= info->Length) {
+                if (info->KeyValueInformationClass == KeyValueBasicInformation && returned >= sizeof(KEY_VALUE_BASIC_INFORMATION)) {
+                    PKEY_VALUE_BASIC_INFORMATION value = (PKEY_VALUE_BASIC_INFORMATION)info->KeyValueInformation;
+                    ULONG offset = (ULONG)FIELD_OFFSET(KEY_VALUE_BASIC_INFORMATION, Name);
+                    if (returned >= offset) MsMonSetResultName(&named, value->Name, value->NameLength, returned - offset);
+                } else if ((info->KeyValueInformationClass == KeyValueFullInformation ||
+                            info->KeyValueInformationClass == KeyValueFullInformationAlign64) &&
+                           returned >= sizeof(KEY_VALUE_FULL_INFORMATION)) {
+                    PKEY_VALUE_FULL_INFORMATION value = (PKEY_VALUE_FULL_INFORMATION)info->KeyValueInformation;
+                    ULONG offset = (ULONG)FIELD_OFFSET(KEY_VALUE_FULL_INFORMATION, Name);
+                    if (returned >= offset) MsMonSetResultName(&named, value->Name, value->NameLength, returned - offset);
+                }
+            }
+            if (CapturePayload) {
+                MsMonCaptureSingleValue(&named, Post->Status, info->KeyValueInformationClass,
+                                        info->KeyValueInformation, info->Length, returned);
+            } else {
+                MsMonRegistryMetadata(&named, Post->Status);
+            }
+            return;
+        }
+        case RegNtPostEnumerateKey: {
+            PREG_ENUMERATE_KEY_INFORMATION info = (PREG_ENUMERATE_KEY_INFORMATION)Post->PreInformation;
+            ULONG returned = info->ResultLength != NULL ? *info->ResultLength : info->Length;
+            MSMON_REGISTRY_CONTEXT named = *Context;
+            if (NT_SUCCESS(Post->Status) && returned <= info->Length) {
+                if (info->KeyInformationClass == KeyBasicInformation && returned >= sizeof(KEY_BASIC_INFORMATION)) {
+                    PKEY_BASIC_INFORMATION value = (PKEY_BASIC_INFORMATION)info->KeyInformation;
+                    ULONG offset = (ULONG)FIELD_OFFSET(KEY_BASIC_INFORMATION, Name);
+                    if (returned >= offset) MsMonSetResultName(&named, value->Name, value->NameLength, returned - offset);
+                } else if (info->KeyInformationClass == KeyNameInformation && returned >= sizeof(KEY_NAME_INFORMATION)) {
+                    PKEY_NAME_INFORMATION value = (PKEY_NAME_INFORMATION)info->KeyInformation;
+                    ULONG offset = (ULONG)FIELD_OFFSET(KEY_NAME_INFORMATION, Name);
+                    if (returned >= offset) MsMonSetResultName(&named, value->Name, value->NameLength, returned - offset);
+                }
+            }
+            MsMonRegistryMetadata(&named, Post->Status);
             return;
         }
         case RegNtPostQueryMultipleValueKey:
@@ -341,10 +387,10 @@ static NTSTATUS MsMonRegistryCallback(PVOID CallbackContext, PVOID Argument1, PV
         PREG_POST_OPERATION_INFORMATION post = (PREG_POST_OPERATION_INFORMATION)Argument2;
         context = (PMSMON_REGISTRY_CONTEXT)post->CallContext;
         if (context == NULL) return STATUS_SUCCESS;
-        if (MsMonPayloadEnabled() &&
-            (operation == RegNtPostQueryValueKey || operation == RegNtPostEnumerateValueKey ||
-             operation == RegNtPostQueryMultipleValueKey)) {
-            MsMonCaptureRegistryResult(operation, post, context);
+        BOOLEAN capturePayload = MsMonPayloadEnabled();
+        if (operation == RegNtPostEnumerateKey || operation == RegNtPostEnumerateValueKey ||
+            (capturePayload && (operation == RegNtPostQueryValueKey || operation == RegNtPostQueryMultipleValueKey))) {
+            MsMonCaptureRegistryResult(operation, post, context, capturePayload);
         } else {
             MsMonRegistryMetadata(context, post->Status);
         }
@@ -434,10 +480,17 @@ static NTSTATUS MsMonRegistryCallback(PVOID CallbackContext, PVOID Argument1, PV
     }
 
     context = MsMonCreateContext(type, path, detail, value0, value1, desiredAccess);
-    if (context != NULL) {
-        MsMonSetCallContext(operation, Argument2, context);
-        if (MsMonPayloadEnabled() && operation == RegNtPreSetValueKey) {
-            PREG_SET_VALUE_KEY_INFORMATION info = (PREG_SET_VALUE_KEY_INFORMATION)Argument2;
+    if (context == NULL) {
+        MsMonEventsNoteDropped();
+        return STATUS_SUCCESS;
+    }
+    MsMonSetCallContext(operation, Argument2, context);
+    if (MsMonPayloadEnabled() && operation == RegNtPreSetValueKey) {
+        PREG_SET_VALUE_KEY_INFORMATION info = (PREG_SET_VALUE_KEY_INFORMATION)Argument2;
+        if (info->DataSize > MSMON_MAX_PAYLOAD_TOTAL_BYTES) {
+            MsMonRegistryUnavailable(context, STATUS_PENDING, L"payload_too_large", MsMonFlagPayloadInput);
+        } else {
+            ULONG captured = min(info->DataSize, MSMON_REGISTRY_CAPTURE_MAX_BYTES);
             __try {
                 (VOID)MsMonLogPayloadSeries(MsMonRegistrySetValue, context->ProcessId, context->ThreadId,
                                             MsMonFlagPayloadInput, STATUS_PENDING, MsMonCategoryRegistry,
@@ -445,7 +498,7 @@ static NTSTATUS MsMonRegistryCallback(PVOID CallbackContext, PVOID Argument1, PV
                                             context->Path.Buffer != NULL ? &context->Path : NULL,
                                             context->Detail.Buffer != NULL ? &context->Detail : NULL,
                                             MsMonPayloadRegistryValue, context->OperationId,
-                                            info->DataSize, info->Data, info->DataSize);
+                                            info->DataSize, info->Data, captured);
             } __except (EXCEPTION_EXECUTE_HANDLER) {
                 MsMonRegistryUnavailable(context, STATUS_PENDING, L"unsafe_set_buffer", MsMonFlagPayloadInput);
             }

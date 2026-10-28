@@ -22,6 +22,7 @@ NTSTATUS MsMonEventsStart(ULONGLONG SessionId, ULONG QueueRecords, ULONG QueueBy
 VOID MsMonEventsStop(VOID);
 VOID MsMonEventsWakeAll(VOID);
 BOOLEAN MsMonPayloadEnabled(VOID);
+VOID MsMonEventsNoteDropped(VOID);
 ULONGLONG MsMonNextOperationId(VOID);
 NTSTATUS MsMonLogEvent(
     ULONG Type,

@@ -13,7 +13,7 @@ These paths use inline kernel-text hooks and are not PatchGuard-safe. Both compi
 
 - File open/create/write/rename/delete and directory queries.
 - Registry open/create/read/write/delete/enumeration.
-- Device IOCTL and limited input payload capture.
+- Device IOCTL metadata. The input-payload selection helpers are not wired into the detour and do not capture bytes.
 - Process/thread handles through inline open hooks.
 - Memory read/write/protect/map/create-section and process-memory copies.
 - `NtQuerySystemInformation` classes.
@@ -29,7 +29,7 @@ These paths use inline kernel-text hooks and are not PatchGuard-safe. Both compi
 - Network peers, packet bytes, or DNS; use our main driver's WFP and ETW coverage instead.
 - ALPC ports and full IPC payloads.
 - `CPUID`, MSR, port I/O, direct MMIO, and direct SMBIOS reads.
-- Full payload capture beyond the legacy limits of 8 registry bytes and 32 IOCTL bytes; our main driver provides full registry and volume payloads instead.
+- IOCTL payload capture; the legacy helpers are not connected to the detour. Registry payloads are limited to 8 bytes in the legacy hooks. The main driver provides bounded registry and volume payloads instead.
 - Window/input semantics.
 
 ## Storage and accuracy
