@@ -1,5 +1,5 @@
 #include <fltKernel.h>
-#include "../include/msmon_protocol.h"
+#include "msmon.h"
 
 #define MSMON_POOL_TAG 'noSM'
 
@@ -222,6 +222,7 @@ static const FLT_OPERATION_REGISTRATION gOperations[] = {
 static NTSTATUS FLTAPI MsMonFilterUnload(FLT_FILTER_UNLOAD_FLAGS Flags)
 {
     UNREFERENCED_PARAMETER(Flags);
+    MsMonRecordStatus(L"FilterUnloadCallback", STATUS_SUCCESS);
     return STATUS_SUCCESS;
 }
 
@@ -246,6 +247,7 @@ VOID MsMonFileFilterUninitialize(VOID)
 {
     if (gFilter != NULL) {
         FltUnregisterFilter(gFilter);
+        MsMonRecordStatus(L"FltUnregisterComplete", STATUS_SUCCESS);
         gFilter = NULL;
     }
 }

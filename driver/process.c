@@ -20,7 +20,7 @@ static BOOLEAN gThreadNotifyRegistered;
 static BOOLEAN gImageNotifyRegistered;
 static EX_RUNDOWN_REF gCallbackRundown;
 
-static VOID MsMonRecordStatus(PCWSTR Name, NTSTATUS Status)
+VOID MsMonRecordStatus(PCWSTR Name, NTSTATUS Status)
 {
     UNICODE_STRING path;
     UNICODE_STRING valueName;

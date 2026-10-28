@@ -136,11 +136,17 @@ static NTSTATUS MsMonDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 VOID MsMonDriverUnload(PDRIVER_OBJECT DriverObject)
 {
     UNICODE_STRING dosName;
+    MsMonRecordStatus(L"DriverUnloadStart", STATUS_SUCCESS);
     MsMonNetworkUninitialize();
+    MsMonRecordStatus(L"NetworkStopped", STATUS_SUCCESS);
     MsMonRegistryUninitialize();
+    MsMonRecordStatus(L"RegistryStopped", STATUS_SUCCESS);
     MsMonFileFilterUninitialize();
+    MsMonRecordStatus(L"FileFilterStopped", STATUS_SUCCESS);
     MsMonObjectUninitialize();
+    MsMonRecordStatus(L"ObjectStopped", STATUS_SUCCESS);
     MsMonProcessUninitialize();
+    MsMonRecordStatus(L"ProcessStopped", STATUS_SUCCESS);
     MsMonAttributionStop();
     MsMonEventsUninitialize();
     RtlInitUnicodeString(&dosName, MSMON_DOS_DEVICE_NAME);
@@ -156,7 +162,6 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     NTSTATUS status;
 
     UNREFERENCED_PARAMETER(RegistryPath);
-    DriverObject->DriverUnload = MsMonDriverUnload;
     DriverObject->MajorFunction[IRP_MJ_CREATE] = MsMonCreateClose;
     DriverObject->MajorFunction[IRP_MJ_CLOSE] = MsMonCreateClose;
     DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = MsMonDeviceControl;
@@ -213,5 +218,6 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 
     deviceObject->Flags |= DO_BUFFERED_IO;
     deviceObject->Flags &= ~DO_DEVICE_INITIALIZING;
+    DriverObject->DriverUnload = MsMonDriverUnload;
     return STATUS_SUCCESS;
 }

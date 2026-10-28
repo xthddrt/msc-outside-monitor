@@ -9,6 +9,7 @@
 
 DRIVER_INITIALIZE DriverEntry;
 DRIVER_UNLOAD MsMonDriverUnload;
+VOID MsMonRecordStatus(PCWSTR Name, NTSTATUS Status);
 
 NTSTATUS MsMonAttributionInitialize(VOID);
 NTSTATUS MsMonAttributionRefresh(VOID);
