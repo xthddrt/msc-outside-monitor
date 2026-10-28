@@ -76,11 +76,15 @@ public:
     bool Write(const std::string& json);
     bool Close();
     uint64_t RecordCount() const { return recordIndex_; }
+    uint64_t TotalBytes() const { return totalBytes_; }
+    unsigned PartCount() const { return part_ + 1; }
+    const std::string& ChainHead() const { return chain_; }
 
 private:
     std::filesystem::path basePath_;
     uint64_t maximumBytes_;
     uint64_t bytes_ = 0;
+    uint64_t totalBytes_ = 0;
     uint64_t recordIndex_ = 0;
     unsigned part_ = 0;
     std::ofstream stream_;
@@ -94,6 +98,13 @@ std::string EventTypeName(unsigned long type);
 std::string CategoryName(unsigned long category);
 std::string AttributionName(unsigned long attribution);
 std::string Sha256(const std::string& input);
+std::string Sha256Bytes(const void* data, size_t size);
+std::string Sha256File(const std::wstring& path);
+std::string StatusName(long status);
+std::string StatusHex(long status);
+std::string FlagsNames(unsigned long flags);
+std::string DesiredAccessHex(unsigned long access);
+void SetDecodedFields(bool enabled);
 std::string TelemetryJson(const TelemetryEvent& event);
 bool DecodeDriverEvent(const BYTE* data, DWORD available, TelemetryEvent& event,
                        DWORD& consumed, std::string& error);

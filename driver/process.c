@@ -245,12 +245,14 @@ static VOID MsMonProcessNotifyInner(PEPROCESS Process, HANDLE ProcessId, PPS_CRE
     ULONG flags;
     NTSTATUS status;
 
+    MsMonCoverageEnter(MSMON_SENSOR_PROCESS_NOTIFY);
     if (CreateInfo == NULL) {
         BOOLEAN tracked = MsMonIsTracked(ProcessId, startTime);
         if (tracked || MsMonCurrentIsBlackCat()) {
             (VOID)MsMonLogEvent(MsMonProcessExit, ProcessId, NULL, NULL, NULL, 0, 0,
                                 STATUS_SUCCESS, 0, MsMonCategoryExternalProcess,
                                 (ULONGLONG)startTime, 0, NULL, NULL);
+            MsMonCoverageLogged(MSMON_SENSOR_PROCESS_NOTIFY);
         }
         if (tracked) MsMonForgetProcess(ProcessId, startTime);
         return;
@@ -268,24 +270,28 @@ static VOID MsMonProcessNotifyInner(PEPROCESS Process, HANDLE ProcessId, PPS_CRE
         flags = MsMonFlagExplicitTrack;
         status = MsMonTrackProcess(ProcessId, flags);
         if (!NT_SUCCESS(status)) {
+            MsMonCoverageSkip(MSMON_SKIP_TRACK);
             MsMonEventsNoteDropped();
             return;
         }
         (VOID)MsMonLogEvent(MsMonProcessStart, ProcessId, CreateInfo->ParentProcessId, NULL, NULL, 0,
                             flags, STATUS_SUCCESS, 0, MsMonCategoryExternalProcess,
                             (ULONGLONG)startTime, 0, CreateInfo->ImageFileName, CreateInfo->CommandLine);
+        MsMonCoverageLogged(MSMON_SENSOR_PROCESS_NOTIFY);
         return;
     } else {
         return;
     }
     status = MsMonTrackProcess(ProcessId, flags);
     if (!NT_SUCCESS(status)) {
+        MsMonCoverageSkip(MSMON_SKIP_TRACK);
         MsMonEventsNoteDropped();
         return;
     }
     (VOID)MsMonLogEvent(MsMonProcessStart, ProcessId, CreateInfo->ParentProcessId, NULL, NULL, 0,
                         flags, STATUS_SUCCESS, 0, MsMonCategoryExternalProcess,
                         (ULONGLONG)startTime, 0, CreateInfo->ImageFileName, CreateInfo->CommandLine);
+    MsMonCoverageLogged(MSMON_SENSOR_PROCESS_NOTIFY);
 }
 
 static VOID MsMonProcessNotify(PEPROCESS Process, HANDLE ProcessId, PPS_CREATE_NOTIFY_INFO CreateInfo)
@@ -298,10 +304,12 @@ static VOID MsMonProcessNotify(PEPROCESS Process, HANDLE ProcessId, PPS_CREATE_N
 static VOID MsMonThreadNotify(HANDLE ProcessId, HANDLE ThreadId, BOOLEAN Create)
 {
     if (!ExAcquireRundownProtection(&gCallbackRundown)) return;
+    MsMonCoverageEnter(MSMON_SENSOR_THREAD_NOTIFY);
     if (MsMonIsTracked(ProcessId, 0) || MsMonCurrentIsBlackCat()) {
         (VOID)MsMonLogEvent(Create ? MsMonThreadStart : MsMonThreadExit,
                             ProcessId, NULL, ThreadId, NULL, 0, 0, STATUS_SUCCESS, 0,
                             MsMonCategoryUnknown, 0, 0, NULL, NULL);
+        MsMonCoverageLogged(MSMON_SENSOR_THREAD_NOTIFY);
     }
     ExReleaseRundownProtection(&gCallbackRundown);
 }
@@ -309,10 +317,12 @@ static VOID MsMonThreadNotify(HANDLE ProcessId, HANDLE ThreadId, BOOLEAN Create)
 static VOID MsMonImageNotify(PUNICODE_STRING FullImageName, HANDLE ProcessId, PIMAGE_INFO ImageInfo)
 {
     if (!ExAcquireRundownProtection(&gCallbackRundown)) return;
+    MsMonCoverageEnter(MSMON_SENSOR_IMAGE_NOTIFY);
     if (MsMonIsTracked(ProcessId, 0) || MsMonCurrentIsBlackCat()) {
         (VOID)MsMonLogEvent(MsMonImageLoad, ProcessId, NULL, NULL, NULL, 0, 0,
                             STATUS_SUCCESS, 0, MsMonCategoryUnknown,
                             (ULONGLONG)ImageInfo->ImageBase, ImageInfo->ImageSize, FullImageName, NULL);
+        MsMonCoverageLogged(MSMON_SENSOR_IMAGE_NOTIFY);
     }
     ExReleaseRundownProtection(&gCallbackRundown);
 }
@@ -375,14 +385,20 @@ NTSTATUS MsMonProcessInitialize(VOID)
         gProcessNotifyRegistered = TRUE;
     } else {
         status = PsSetCreateProcessNotifyRoutine(MsMonProcessNotifyLegacy, FALSE);
-        if (!NT_SUCCESS(status)) return status;
+        if (!NT_SUCCESS(status)) {
+            MsMonCoverageRegister(MSMON_SENSOR_REG_PROCESS_NOTIFY, status);
+            return status;
+        }
         gProcessNotifyRegistered = TRUE;
     }
+    MsMonCoverageRegister(MSMON_SENSOR_REG_PROCESS_NOTIFY, status);
     status = PsSetCreateThreadNotifyRoutine(MsMonThreadNotify);
     if (!NT_SUCCESS(status)) {
+        MsMonCoverageRegister(MSMON_SENSOR_REG_THREAD_NOTIFY, status);
         MsMonRemoveProcessNotify();
         return status;
     }
+    MsMonCoverageRegister(MSMON_SENSOR_REG_THREAD_NOTIFY, status);
     gThreadNotifyRegistered = TRUE;
     return STATUS_SUCCESS;
 }
@@ -391,6 +407,7 @@ NTSTATUS MsMonImageInitialize(VOID)
 {
     NTSTATUS status = PsSetLoadImageNotifyRoutine(MsMonImageNotify);
     gImageNotifyRegistered = NT_SUCCESS(status);
+    MsMonCoverageRegister(MSMON_SENSOR_REG_IMAGE_NOTIFY, status);
     MsMonRecordStatus(L"ImageRegisterStatus", status);
     return status;
 }

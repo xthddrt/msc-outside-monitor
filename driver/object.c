@@ -17,18 +17,23 @@ static OB_PREOP_CALLBACK_STATUS MsMonObjectPre(PVOID RegistrationContext, POB_PR
     HANDLE source = PsGetCurrentProcessId();
     ULONG desiredAccess;
     BOOLEAN blackCat;
+    ULONG sensor = Information->ObjectType == *PsThreadType
+                       ? MSMON_SENSOR_OBJECT_THREAD : MSMON_SENSOR_OBJECT_PROCESS;
 
     UNREFERENCED_PARAMETER(RegistrationContext);
     Information->CallContext = NULL;
+    MsMonCoverageEnter(sensor);
     /* One stack lookup per handle operation, not one per test below. */
     blackCat = MsMonCurrentIsBlackCat();
     if (Information->Parameters == NULL ||
         (Information->KernelHandle && !blackCat) ||
         (!MsMonIsTracked(source, 0) && !blackCat)) {
+        MsMonCoverageSkip(MSMON_SKIP_UNTRACKED);
         return OB_PREOP_SUCCESS;
     }
     context = ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(*context), MSMON_POOL_TAG);
     if (context == NULL) {
+        MsMonCoverageSkip(MSMON_SKIP_ALLOC);
         MsMonEventsNoteDropped();
         return OB_PREOP_SUCCESS;
     }
@@ -90,6 +95,7 @@ static VOID MsMonObjectPost(PVOID RegistrationContext, POB_POST_OPERATION_INFORM
                         Information->ReturnStatus, context->DesiredAccess,
                         MsMonCategoryExternalProcess, context->Operation, grantedAccess,
                         imageName, NULL);
+    MsMonCoverageLogged(context->ThreadObject ? MSMON_SENSOR_OBJECT_THREAD : MSMON_SENSOR_OBJECT_PROCESS);
     if (imageName != NULL) ExFreePool(imageName);
     ExFreePoolWithTag(context, MSMON_POOL_TAG);
 }
@@ -118,6 +124,8 @@ NTSTATUS MsMonObjectInitialize(PDRIVER_OBJECT DriverObject)
     registration.Altitude = altitude;
     registration.RegistrationContext = DriverObject;
     gObjectStatus = ObRegisterCallbacks(&registration, &gObjectRegistration);
+    MsMonCoverageRegister(MSMON_SENSOR_REG_OBJECT_PROCESS, gObjectStatus);
+    MsMonCoverageRegister(MSMON_SENSOR_REG_OBJECT_THREAD, gObjectStatus);
     return gObjectStatus;
 }
 

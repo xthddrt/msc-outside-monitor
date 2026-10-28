@@ -4,6 +4,7 @@
 #include <ntstrsafe.h>
 #include <sddl.h>
 #include "../include/msmon_protocol.h"
+#include "../include/msmon_coverage.h"
 
 #define MSMON_POOL_TAG 'noSM'
 
@@ -54,6 +55,13 @@ NTSTATUS MsMonLogPayloadSeries(
 );
 NTSTATUS MsMonReadEvents(PVOID Output, ULONG MaximumBytes, ULONG TimeoutMilliseconds, PULONG BytesRead);
 VOID MsMonGetStatistics(PMSMON_STATISTICS Statistics);
+VOID MsMonCoverageReset(ULONGLONG SessionId);
+VOID MsMonCoverageEnter(ULONG SensorId);
+VOID MsMonCoverageLogged(ULONG SensorId);
+VOID MsMonCoverageSkip(MSMON_SKIP_REASON Reason);
+VOID MsMonCoverageRegister(ULONG SensorId, NTSTATUS Status);
+VOID MsMonCoverageBlackCatMatch(VOID);
+VOID MsMonGetCoverage(PMSMON_COVERAGE Coverage);
 
 NTSTATUS MsMonProcessInitialize(VOID);
 NTSTATUS MsMonImageInitialize(VOID);

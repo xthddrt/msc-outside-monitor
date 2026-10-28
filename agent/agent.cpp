@@ -1,17 +1,23 @@
 #include "telemetry.h"
 #include "classify.h"
 #include "etw.h"
+#include "../include/msmon_coverage.h"
 #include <tlhelp32.h>
+#include <bcrypt.h>
+#include <winver.h>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <cwchar>
 #include <wchar.h>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <set>
 #include <sstream>
+
+#pragma comment(lib, "version.lib")
 
 static std::atomic<bool> gStop(false);
 
@@ -34,6 +40,339 @@ static uint64_t Now()
     FILETIME value;
     GetSystemTimeAsFileTime(&value);
     return FileTimeValue(value);
+}
+
+static std::wstring UtcStamp(uint64_t fileTime)
+{
+    FILETIME value{static_cast<DWORD>(fileTime & 0xffffffff), static_cast<DWORD>(fileTime >> 32)};
+    SYSTEMTIME time{};
+    if (!FileTimeToSystemTime(&value, &time)) return L"unknown";
+    wchar_t buffer[40];
+    swprintf_s(buffer, L"%04u%02u%02uT%02u%02u%02uZ", time.wYear, time.wMonth, time.wDay,
+               time.wHour, time.wMinute, time.wSecond);
+    return buffer;
+}
+
+static std::wstring SanitizeLabel(const std::wstring& input, const wchar_t* fallback)
+{
+    std::wstring output;
+    for (wchar_t c : input) {
+        bool allowed = (c >= L'a' && c <= L'z') || (c >= L'A' && c <= L'Z') ||
+                       (c >= L'0' && c <= L'9') || c == L'-' || c == L'_' || c == L'.';
+        if (allowed) {
+            output.push_back(c);
+        } else if (output.empty() || output.back() != L'-') {
+            output.push_back(L'-');
+        }
+    }
+    while (!output.empty() && (output.back() == L'-' || output.back() == L'.')) output.pop_back();
+    if (output.size() > 64) output.resize(64);
+    return output.empty() ? std::wstring(fallback) : output;
+}
+
+static bool AllowedLabel(const std::wstring& value, std::initializer_list<const wchar_t*> values)
+{
+    for (const wchar_t* item : values) {
+        if (value == item) return true;
+    }
+    return false;
+}
+
+static std::wstring Utf8ToWide(const std::string& value)
+{
+    if (value.empty()) return {};
+    int length = MultiByteToWideChar(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), nullptr, 0);
+    if (length <= 0) return {};
+    std::wstring output(static_cast<size_t>(length), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), output.data(), length);
+    return output;
+}
+
+static std::wstring MachineLabel()
+{
+    wchar_t name[256];
+    DWORD size = static_cast<DWORD>(std::size(name));
+    if (GetComputerNameW(name, &size) == 0) return L"unknown";
+    return SanitizeLabel(name, L"unknown");
+}
+
+static std::string MachineIdHash()
+{
+    std::string material;
+    wchar_t guid[128];
+    DWORD bytes = sizeof(guid);
+    if (RegGetValueW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Cryptography", L"MachineGuid",
+                     RRF_RT_REG_SZ, nullptr, guid, &bytes) == ERROR_SUCCESS) {
+        material += WideToUtf8(guid);
+    }
+    DWORD serial = 0;
+    wchar_t volume[256];
+    wchar_t filesystem[32];
+    if (GetVolumeInformationW(L"C:\\", volume, static_cast<DWORD>(std::size(volume)), &serial,
+                              nullptr, nullptr, filesystem, static_cast<DWORD>(std::size(filesystem)))) {
+        material += ":" + std::to_string(serial);
+    }
+    return material.empty() ? std::string() : "sha256:" + Sha256(material);
+}
+
+static std::string ClientVersion(const std::wstring& path)
+{
+    DWORD handle = 0;
+    DWORD size = GetFileVersionInfoSizeW(path.c_str(), &handle);
+    if (size == 0) return {};
+    std::vector<BYTE> data(size);
+    if (!GetFileVersionInfoW(path.c_str(), 0, size, data.data())) return {};
+    VS_FIXEDFILEINFO* info = nullptr;
+    UINT length = 0;
+    if (!VerQueryValueW(data.data(), L"\\", reinterpret_cast<LPVOID*>(&info), &length) ||
+        info == nullptr || length < sizeof(*info)) return {};
+    char buffer[64];
+    snprintf(buffer, sizeof(buffer), "%u.%u.%u.%u",
+             HIWORD(info->dwFileVersionMS), LOWORD(info->dwFileVersionMS),
+             HIWORD(info->dwFileVersionLS), LOWORD(info->dwFileVersionLS));
+    return buffer;
+}
+
+static std::wstring ExecutablePath()
+{
+    std::vector<wchar_t> path(32768);
+    DWORD size = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
+    if (size == 0 || size >= path.size()) return {};
+    return std::wstring(path.data(), size);
+}
+
+static std::wstring DriverFilePath()
+{
+    wchar_t system[32768];
+    UINT size = GetSystemDirectoryW(system, static_cast<UINT>(std::size(system)));
+    if (size == 0 || size >= std::size(system)) return {};
+    return std::wstring(system, size) + L"\\drivers\\msmon.sys";
+}
+
+static bool ReadTextFile(const std::filesystem::path& path, std::string& output)
+{
+    std::ifstream file(path, std::ios::binary);
+    if (!file) return false;
+    std::ostringstream buffer;
+    buffer << file.rdbuf();
+    output = buffer.str();
+    return true;
+}
+
+static std::string JsonField(const std::string& text, const std::string& key)
+{
+    const std::string needle = "\"" + key + "\"";
+    size_t position = text.find(needle);
+    if (position == std::string::npos) return {};
+    position = text.find(':', position + needle.size());
+    if (position == std::string::npos) return {};
+    position = text.find('"', position + 1);
+    if (position == std::string::npos) return {};
+    size_t end = position + 1;
+    while (end < text.size() && text[end] != '"') {
+        if (text[end] == '\\') end++;
+        end++;
+    }
+    if (end >= text.size()) return {};
+    return text.substr(position + 1, end - position - 1);
+}
+
+static bool ReadBuildInfo(std::string& text, std::string& hash)
+{
+    std::wstring executable = ExecutablePath();
+    std::error_code error;
+    std::vector<std::filesystem::path> candidates;
+    if (!executable.empty()) {
+        std::filesystem::path directory = std::filesystem::path(executable).parent_path();
+        candidates.push_back(directory / L".." / L".." / L"build-info.json");
+        candidates.push_back(directory / L"build-info.json");
+    }
+    candidates.push_back(std::filesystem::current_path(error) / L"build" / L"build-info.json");
+    candidates.push_back(std::filesystem::current_path(error) / L"build-info.json");
+    for (const auto& candidate : candidates) {
+        if (ReadTextFile(candidate, text)) {
+            hash = Sha256(text);
+            return true;
+        }
+    }
+    return false;
+}
+
+static void WriteTextFile(const std::filesystem::path& path, const std::string& content)
+{
+    std::ofstream file(path, std::ios::binary | std::ios::trunc);
+    if (file) file << content;
+}
+
+static bool GenerateUuid(std::wstring& uuid, std::wstring& shortId, uint64_t& numericId)
+{
+    BYTE bytes[16]{};
+    if (BCryptGenRandom(nullptr, bytes, sizeof(bytes), BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) return false;
+    bytes[6] = static_cast<BYTE>((bytes[6] & 0x0F) | 0x40);
+    bytes[8] = static_cast<BYTE>((bytes[8] & 0x3F) | 0x80);
+    wchar_t buffer[40];
+    swprintf_s(buffer, L"%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+               bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+               bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]);
+    uuid = buffer;
+    shortId = uuid.substr(0, 8);
+    numericId = 0;
+    for (int index = 0; index < 8; index++) numericId = (numericId << 8) | bytes[index];
+    if (numericId == 0) numericId = 1;
+    return true;
+}
+
+struct SessionLabels {
+    std::wstring uuid;
+    std::wstring uuidShort;
+    uint64_t id = 0;
+    std::wstring label;
+    std::wstring testId;
+    std::wstring scenario;
+    std::wstring phase;
+    std::wstring machine;
+    std::string machineHash;
+    uint64_t iteration = 1;
+    std::wstring started;
+};
+
+struct SessionBinaryInfo {
+    std::string agentHash;
+    std::string driverHash;
+    std::string buildInfoHash;
+    std::string buildCommit;
+    std::string clientVersion;
+    std::string clientHash;
+    bool buildInfoPresent = false;
+    std::string buildInfoRaw;
+};
+
+static std::string BuildCoverageJson(
+    const MSMON_COVERAGE& coverage, const MSMON_COVERAGE* start, bool supported, const EtwCollector* etw,
+    uint64_t queueDrops, unsigned parts, uint64_t bytes, const std::wstring& sessionUuid,
+    const std::unordered_map<unsigned long, uint64_t>& eventCounts)
+{
+    auto delta = [&](unsigned __int64 end, unsigned __int64 begin) { return end - begin; };
+    std::ostringstream json;
+    json << "{\"schema_version\":1,\"session_uuid\":\"" << WideToUtf8(sessionUuid) << "\""
+         << ",\"driver_supported\":" << (supported ? "true" : "false")
+         << ",\"driver\":{\"version\":" << coverage.Version
+         << ",\"registration_ok\":" << coverage.RegistrationOk
+         << ",\"registration_failed\":" << coverage.RegistrationFailed
+         << ",\"event_attempted\":[";
+    for (unsigned index = 0; index < MSMON_EVENT_SLOTS; index++) {
+        if (index != 0) json << ',';
+        json << delta(coverage.EventAttempted[index], start ? start->EventAttempted[index] : 0);
+    }
+    json << "],\"event_dropped\":[";
+    for (unsigned index = 0; index < MSMON_EVENT_SLOTS; index++) {
+        if (index != 0) json << ',';
+        json << delta(coverage.EventDropped[index], start ? start->EventDropped[index] : 0);
+    }
+    json << "],\"sensor_entered\":[";
+    for (unsigned index = 0; index < MSMON_SENSOR_SLOTS; index++) {
+        if (index != 0) json << ',';
+        json << delta(coverage.SensorEntered[index], start ? start->SensorEntered[index] : 0);
+    }
+    json << "],\"sensor_logged\":[";
+    for (unsigned index = 0; index < MSMON_SENSOR_SLOTS; index++) {
+        if (index != 0) json << ',';
+        json << delta(coverage.SensorLogged[index], start ? start->SensorLogged[index] : 0);
+    }
+    json << "],\"registration_status\":[";
+    for (unsigned index = 0; index < MSMON_SENSOR_SLOTS; index++) {
+        if (index != 0) json << ',';
+        json << coverage.RegistrationStatus[index];
+    }
+    json << "],\"skip_untracked\":" << delta(coverage.SkipUntracked, start ? start->SkipUntracked : 0)
+         << ",\"skip_irql\":" << delta(coverage.SkipIrql, start ? start->SkipIrql : 0)
+         << ",\"skip_no_name\":" << delta(coverage.SkipNoName, start ? start->SkipNoName : 0)
+         << ",\"alloc_failures\":" << delta(coverage.AllocFailures, start ? start->AllocFailures : 0)
+         << ",\"track_failures\":" << delta(coverage.TrackFailures, start ? start->TrackFailures : 0)
+         << ",\"queue_drops\":" << delta(coverage.QueueDrops, start ? start->QueueDrops : 0)
+         << ",\"blackcat_matches\":" << delta(coverage.BlackCatMatches, start ? start->BlackCatMatches : 0)
+         << "},\"agent\":{\"writer_parts\":" << parts
+         << ",\"writer_bytes\":" << bytes
+         << ",\"etw_queue_drops\":" << queueDrops;
+    if (etw != nullptr) {
+        static const char* providers[3] = {"wmi", "dns", "rpc"};
+        json << ",\"etw_lost\":" << etw->LostEvents()
+             << ",\"etw_parse_failures\":" << etw->ParseFailures()
+             << ",\"etw_unattributed\":" << etw->UnattributedCount()
+             << ",\"etw_pending_overflow\":" << etw->PendingOverflow()
+             << ",\"etw_providers\":[";
+        for (int index = 0; index < 3; index++) {
+            if (index != 0) json << ',';
+            json << "{\"name\":\"" << providers[index] << "\""
+                 << ",\"received\":" << etw->Received(index)
+                 << ",\"parsed\":" << etw->Parsed(index)
+                 << ",\"emitted\":" << etw->Emitted(index)
+                 << ",\"deferred\":" << etw->Deferred(index)
+                 << ",\"expired\":" << etw->Expired(index) << "}";
+        }
+        json << "]";
+    } else {
+        json << ",\"etw_lost\":0,\"etw_parse_failures\":0,\"etw_unattributed\":0"
+             << ",\"etw_pending_overflow\":0,\"etw_providers\":[]";
+    }
+    json << ",\"event_counts\":{";
+    bool firstCount = true;
+    for (const auto& item : eventCounts) {
+        if (!firstCount) json << ',';
+        firstCount = false;
+        json << "\"" << item.first << "\":" << item.second;
+    }
+    json << "}}";
+    return json.str();
+}
+
+static std::string BuildSessionMeta(
+    const SessionLabels& labels, const SessionBinaryInfo& binaries,
+    const std::wstring& clientRoot, const std::wstring& scopeRoot,
+    bool payload, bool etw, uint64_t queueRecords, uint64_t queueBytes,
+    const std::wstring& outcome, const std::wstring& ended,
+    uint64_t events, uint64_t dropped, uint64_t driverGaps, uint64_t etwGaps,
+    uint64_t records, uint64_t bytes, unsigned parts)
+{
+    std::ostringstream json;
+    json << "{\"schema_version\":1"
+         << ",\"session_uuid\":\"" << WideToUtf8(labels.uuid) << "\""
+         << ",\"session_id\":" << labels.id
+         << ",\"session_label\":\"" << JsonEscape(WideToUtf8(labels.label)) << "\""
+         << ",\"test_id\":\"" << JsonEscape(WideToUtf8(labels.testId)) << "\""
+         << ",\"scenario\":\"" << WideToUtf8(labels.scenario) << "\""
+         << ",\"phase\":\"" << WideToUtf8(labels.phase) << "\""
+         << ",\"iteration\":" << labels.iteration
+         << ",\"machine_label\":\"" << WideToUtf8(labels.machine) << "\""
+         << ",\"machine_id_hash\":\"" << labels.machineHash << "\""
+         << ",\"started_utc\":\"" << WideToUtf8(labels.started) << "\""
+         << ",\"ended_utc\":\"" << WideToUtf8(ended) << "\""
+         << ",\"outcome\":\"" << WideToUtf8(outcome) << "\""
+         << ",\"client_root\":\"" << JsonEscape(WideToUtf8(clientRoot)) << "\""
+         << ",\"scope_root\":\"" << JsonEscape(WideToUtf8(scopeRoot)) << "\""
+         << ",\"client_version\":\"" << binaries.clientVersion << "\""
+         << ",\"client_sha256\":\"" << binaries.clientHash << "\""
+         << ",\"agent_sha256\":\"" << binaries.agentHash << "\""
+         << ",\"driver_sha256\":\"" << binaries.driverHash << "\""
+         << ",\"build_info_present\":" << (binaries.buildInfoPresent ? "true" : "false")
+         << ",\"build_info_sha256\":\"" << binaries.buildInfoHash << "\""
+         << ",\"build_commit\":\"" << JsonEscape(binaries.buildCommit) << "\""
+         << ",\"config\":{\"payload_mode\":\"" << (payload ? "full" : "metadata") << "\""
+         << ",\"etw\":" << (etw ? "true" : "false")
+         << ",\"queue_records\":" << queueRecords
+         << ",\"queue_bytes\":" << queueBytes << "}"
+         << ",\"events\":" << events
+         << ",\"driver_dropped_events\":" << dropped
+         << ",\"driver_sequence_gaps\":" << driverGaps
+         << ",\"etw_sequence_gaps\":" << etwGaps
+         << ",\"record_count\":" << records
+         << ",\"raw_bytes\":" << bytes
+         << ",\"part_count\":" << parts;
+    if (binaries.buildInfoPresent) {
+        json << ",\"build_info_raw\":\"" << JsonEscape(binaries.buildInfoRaw) << "\"";
+    }
+    json << "}";
+    return json.str();
 }
 
 static std::wstring FullPath(const std::wstring& input)
@@ -144,6 +483,15 @@ public:
                                &statistics, sizeof(statistics), &bytes, nullptr) != 0;
     }
 
+    bool Coverage(MSMON_COVERAGE& coverage)
+    {
+        DWORD bytes = 0;
+        std::memset(&coverage, 0, sizeof(coverage));
+        return DeviceIoControl(handle_, MSMON_IOCTL_COVERAGE, nullptr, 0,
+                               &coverage, sizeof(coverage), &bytes, nullptr) != 0 &&
+               bytes >= sizeof(coverage);
+    }
+
 private:
     HANDLE handle_ = INVALID_HANDLE_VALUE;
     bool started_ = false;
@@ -209,6 +557,8 @@ static std::wstring DefaultOutputPath()
 static void Usage()
 {
     std::cout << "Usage: msmon-agent [--client DIRECTORY] [--scope-root DIRECTORY] [--output FILE] [--pid PID] "
+                 "[--log-dir DIR] [--session-label LABEL] [--test-id ID] [--scenario NAME] [--phase NAME] "
+                 "[--iteration N] [--machine-label NAME] [--outcome-override NAME] [--compact] "
                  "[--wait-ms N] [--max-file-mb N] [--queue-records N] [--queue-mb N] "
                  "[--stop-file FILE] [--no-etw] [--no-payloads] [--once]\n";
 }
@@ -225,6 +575,16 @@ int wmain(int argc, wchar_t** argv)
     std::wstring clientRoot = L"C:\\Nexon\\Library\\maplestorycw";
     std::wstring scopeRootArg;
     std::wstring output = DefaultOutputPath();
+    std::wstring logDir;
+    std::wstring sessionLabel;
+    std::wstring testId;
+    std::wstring scenario = L"mixed";
+    std::wstring phase = L"steady";
+    std::wstring machineLabelArg;
+    std::wstring outcomeOverride;
+    uint64_t iteration = 1;
+    bool compact = false;
+    bool outputSet = false;
     uint64_t waitMs = 100;
     uint64_t maxFileBytes = 64ull * 1024ull * 1024ull;
     uint64_t queueRecords = MSMON_DEFAULT_QUEUE_RECORDS;
@@ -254,6 +614,26 @@ int wmain(int argc, wchar_t** argv)
             scopeRootArg = argv[++index];
         } else if (index + 1 < argc && argument == L"--output") {
             output = argv[++index];
+            outputSet = true;
+        } else if (index + 1 < argc && (argument == L"--log-dir" || argument == L"--session-dir")) {
+            logDir = argv[++index];
+        } else if (index + 1 < argc && argument == L"--session-label") {
+            sessionLabel = argv[++index];
+        } else if (index + 1 < argc && argument == L"--test-id") {
+            testId = argv[++index];
+        } else if (index + 1 < argc && argument == L"--scenario") {
+            scenario = argv[++index];
+        } else if (index + 1 < argc && argument == L"--phase") {
+            phase = argv[++index];
+        } else if (index + 1 < argc && argument == L"--machine-label") {
+            machineLabelArg = argv[++index];
+        } else if (index + 1 < argc && argument == L"--outcome-override") {
+            outcomeOverride = argv[++index];
+        } else if (index + 1 < argc && argument == L"--iteration" && ParseNumber(argv[index + 1], value)) {
+            iteration = value;
+            index++;
+        } else if (argument == L"--compact") {
+            compact = true;
         } else if (index + 1 < argc && argument == L"--stop-file") {
             stopFile = argv[++index];
             stopFileEnabled = true;
@@ -277,6 +657,35 @@ int wmain(int argc, wchar_t** argv)
             return 2;
         }
     }
+
+    if (!AllowedLabel(scenario, {L"startup", L"login", L"gameplay", L"cash_shop", L"file_io",
+                                 L"registry", L"wmi", L"dns", L"rpc", L"network", L"ipc",
+                                 L"idle", L"shutdown", L"mixed", L"other"})) {
+        std::cerr << "Invalid --scenario value.\n";
+        return 2;
+    }
+    if (!AllowedLabel(phase, {L"startup", L"steady", L"shutdown"})) {
+        std::cerr << "Invalid --phase value.\n";
+        return 2;
+    }
+    if (!outcomeOverride.empty() &&
+        !AllowedLabel(outcomeOverride, {L"completed", L"agent_stopped", L"agent_killed",
+                                        L"driver_stopped", L"crash", L"timeout", L"unknown"})) {
+        std::cerr << "Invalid --outcome-override value.\n";
+        return 2;
+    }
+    if (iteration == 0) iteration = 1;
+    SetDecodedFields(!compact);
+    std::wstring sessionUuid;
+    std::wstring uuidShort;
+    uint64_t sessionId = 0;
+    if (!GenerateUuid(sessionUuid, uuidShort, sessionId)) {
+        std::cerr << "Could not generate a session UUID.\n";
+        return 1;
+    }
+    if (sessionLabel.empty()) sessionLabel = scenario;
+    sessionLabel = SanitizeLabel(sessionLabel, L"session");
+    machineLabelArg = machineLabelArg.empty() ? MachineLabel() : SanitizeLabel(machineLabelArg, L"unknown");
 
     clientRoot = FullPath(clientRoot);
     if (clientRoot.empty()) {
@@ -332,8 +741,75 @@ int wmain(int argc, wchar_t** argv)
         return 1;
     }
 
-    uint64_t sessionId = Now() ^ (static_cast<uint64_t>(GetCurrentProcessId()) << 32) ^ GetTickCount64();
-    if (sessionId == 0) sessionId = 1;
+    std::wstring startedUtc = UtcStamp(Now());
+    std::wstring resolvedTestId = testId.empty() ? std::wstring() : SanitizeLabel(testId, L"session");
+    wchar_t iterationText[8];
+    swprintf_s(iterationText, L"%02llu", static_cast<unsigned long long>(iteration));
+    std::filesystem::path sessionDir;
+    if (!logDir.empty()) {
+        if (outputSet) {
+            std::cerr << "Use either --output or --log-dir, not both.\n";
+            return 2;
+        }
+        std::wstring base = FullPath(logDir);
+        if (base.empty()) {
+            std::cerr << "Could not resolve --log-dir.\n";
+            return 1;
+        }
+        if (resolvedTestId.empty()) {
+            resolvedTestId = startedUtc + L"__" + machineLabelArg + L"__" + scenario +
+                             L"__iter" + iterationText + L"__" + uuidShort;
+        }
+        sessionDir = std::filesystem::path(base) / resolvedTestId;
+        std::error_code createError;
+        std::filesystem::create_directories(sessionDir, createError);
+        if (createError) {
+            std::cerr << "Could not create the session directory: " << createError.message() << "\n";
+            return 1;
+        }
+        output = (sessionDir / L"events.jsonl").wstring();
+    } else if (resolvedTestId.empty()) {
+        resolvedTestId = startedUtc + L"__" + machineLabelArg + L"__" + scenario +
+                         L"__iter" + iterationText + L"__" + uuidShort;
+    }
+
+    SessionLabels labels;
+    labels.uuid = sessionUuid;
+    labels.uuidShort = uuidShort;
+    labels.id = sessionId;
+    labels.label = sessionLabel;
+    labels.testId = resolvedTestId;
+    labels.scenario = scenario;
+    labels.phase = phase;
+    labels.machine = machineLabelArg;
+    labels.machineHash = MachineIdHash();
+    labels.iteration = iteration;
+    labels.started = startedUtc;
+
+    SessionBinaryInfo binaries;
+    std::string buildText;
+    std::string buildHash;
+    binaries.buildInfoPresent = ReadBuildInfo(buildText, buildHash);
+    binaries.buildInfoRaw = buildText;
+    binaries.buildInfoHash = buildHash;
+    binaries.buildCommit = JsonField(buildText, "commit");
+    if (binaries.buildCommit.empty()) binaries.buildCommit = "unknown";
+    binaries.agentHash = Sha256File(ExecutablePath());
+    binaries.driverHash = Sha256File(DriverFilePath());
+    std::filesystem::path clientExe = std::filesystem::path(scopeRoot) / L"MapleStory.exe";
+    std::error_code clientError;
+    if (std::filesystem::exists(clientExe, clientError)) {
+        binaries.clientVersion = ClientVersion(clientExe.wstring());
+        binaries.clientHash = Sha256File(clientExe.wstring());
+    }
+
+    if (!sessionDir.empty()) {
+        WriteTextFile(sessionDir / L"session_meta.json",
+                      BuildSessionMeta(labels, binaries, clientRoot, scopeRoot, capturePayloads,
+                                       enableEtw, queueRecords, queueBytes, L"in_progress", L"",
+                                       0, 0, 0, 0, 0, 0, 0));
+    }
+
     MSMON_SESSION_CONFIG config{};
     config.SessionId = sessionId;
     config.QueueRecords = static_cast<ULONG>(queueRecords);
@@ -359,6 +835,8 @@ int wmain(int argc, wchar_t** argv)
         std::cerr << "Could not refresh kernel module attribution: Win32 error " << GetLastError() << "\n";
         return 1;
     }
+    MSMON_COVERAGE startCoverage{};
+    bool startCoverageSupported = device.Coverage(startCoverage);
 
     ProcessScope scope;
     unsigned registered = TrackExisting(device, scopeRoot, scope);
@@ -405,6 +883,24 @@ int wmain(int argc, wchar_t** argv)
     };
 
     if (!writeCoverage(L"session_start", L"client_root=" + clientRoot + L";scope_root=" + scopeRoot)) return 1;
+    {
+        std::wstring context = L"schema_version=1;session_uuid=" + sessionUuid +
+                               L";session_label=" + sessionLabel +
+                               L";test_id=" + resolvedTestId +
+                               L";scenario=" + scenario +
+                               L";phase=" + phase +
+                               L";iteration=" + std::to_wstring(iteration) +
+                               L";machine_label=" + machineLabelArg +
+                               L";machine_id_hash=" + Utf8ToWide(labels.machineHash) +
+                               L";started_utc=" + startedUtc +
+                               L";client_version=" + Utf8ToWide(binaries.clientVersion) +
+                               L";client_sha256=" + Utf8ToWide(binaries.clientHash) +
+                               L";agent_sha256=" + Utf8ToWide(binaries.agentHash) +
+                               L";driver_sha256=" + Utf8ToWide(binaries.driverHash) +
+                               L";build_commit=" + Utf8ToWide(binaries.buildCommit) +
+                               L";build_info_present=" + (binaries.buildInfoPresent ? L"true" : L"false");
+        if (!writeCoverage(L"session_context", context)) return 1;
+    }
     {
         std::wstring manifest = L"scope_root=" + scopeRoot +
                                 L";inside_root=" + clientRoot +
@@ -473,6 +969,7 @@ int wmain(int argc, wchar_t** argv)
     uint64_t driverGaps = 0;
     uint64_t etwGaps = 0;
     uint64_t totalEvents = 0;
+    std::unordered_map<unsigned long, uint64_t> eventCounts;
     uint64_t nextModuleRefresh = GetTickCount64() + 1000;
     uint64_t nextStatistics = GetTickCount64() + 30000;
     bool moduleRefreshWarning = false;
@@ -504,6 +1001,7 @@ int wmain(int argc, wchar_t** argv)
         classifier.Classify(event);
         summary.Add(event);
         totalEvents++;
+        eventCounts[event.header.Type]++;
         return writer.Write(TelemetryJson(event));
     };
 
@@ -522,10 +1020,12 @@ int wmain(int argc, wchar_t** argv)
 
     DWORD bytes = 0;
     bool draining = false;
+    std::wstring outcome = once ? L"completed" : L"unknown";
     do {
         std::error_code stopError;
         bool stopFileRequested = stopFileEnabled && std::filesystem::exists(stopFile, stopError);
         if (!once && !draining && (gStop.load() || stopFileRequested)) {
+            outcome = gStop.load() ? L"agent_stopped" : L"completed";
             if (!device.StopTracking()) {
                 std::cerr << "Could not stop driver tracking: Win32 error " << GetLastError() << "\n";
                 result = 1;
@@ -535,6 +1035,7 @@ int wmain(int argc, wchar_t** argv)
         }
         if (!device.Read(draining ? 0 : static_cast<DWORD>(waitMs), buffer, bytes)) {
             std::cerr << "Driver read failed: Win32 error " << GetLastError() << "\n";
+            outcome = L"driver_stopped";
             result = 1;
             break;
         }
@@ -662,15 +1163,86 @@ int wmain(int argc, wchar_t** argv)
             result = 1;
         }
     }
+    MSMON_COVERAGE coverage{};
+    bool coverageSupported = device.Coverage(coverage);
+    const MSMON_COVERAGE* startCoveragePtr =
+        (startCoverageSupported && coverageSupported) ? &startCoverage : nullptr;
+    if (!coverageSupported) {
+        (VOID)writeCoverage(L"coverage_unsupported",
+                            L"The driver does not expose MSMON_IOCTL_COVERAGE; sensor counters are unavailable");
+    }
+    uint64_t coverageAttempted = 0;
+    uint64_t coverageDropped = 0;
+    uint64_t coverageEntered = 0;
+    uint64_t coverageLogged = 0;
+    for (unsigned index = 0; index < MSMON_EVENT_SLOTS; index++) {
+        coverageAttempted += coverage.EventAttempted[index] -
+                             (startCoveragePtr ? startCoveragePtr->EventAttempted[index] : 0);
+        coverageDropped += coverage.EventDropped[index] -
+                           (startCoveragePtr ? startCoveragePtr->EventDropped[index] : 0);
+    }
+    for (unsigned index = 0; index < MSMON_SENSOR_SLOTS; index++) {
+        coverageEntered += coverage.SensorEntered[index] -
+                           (startCoveragePtr ? startCoveragePtr->SensorEntered[index] : 0);
+        coverageLogged += coverage.SensorLogged[index] -
+                          (startCoveragePtr ? startCoveragePtr->SensorLogged[index] : 0);
+    }
+    if (!sessionDir.empty()) {
+        WriteTextFile(sessionDir / L"coverage.json",
+                      BuildCoverageJson(coverage, startCoveragePtr, coverageSupported, etw.get(),
+                                        etwQueue.Dropped(), writer.PartCount(), writer.TotalBytes(),
+                                        sessionUuid, eventCounts));
+    }
+    {
+        std::wstring detail = L"schema_version=1;driver_supported=" +
+                              std::wstring(coverageSupported ? L"true" : L"false") +
+                              L";event_attempted=" + std::to_wstring(coverageAttempted) +
+                              L";event_dropped=" + std::to_wstring(coverageDropped) +
+                              L";sensor_entered=" + std::to_wstring(coverageEntered) +
+                              L";sensor_logged=" + std::to_wstring(coverageLogged) +
+                              L";registration_failed=" + std::to_wstring(coverage.RegistrationFailed) +
+                              L";blackcat_matches=" + std::to_wstring(coverage.BlackCatMatches) +
+                              L";etw_unattributed=" + std::to_wstring(etw ? etw->UnattributedCount() : 0) +
+                              L";etw_queue_drops=" + std::to_wstring(etwQueue.Dropped());
+        TelemetryEvent event;
+        event.source = "agent";
+        event.header.Size = sizeof(event.header);
+        event.header.Version = MSMON_PROTOCOL_VERSION;
+        event.header.Type = MsMonCoverageUsage;
+        event.header.Flags = MsMonFlagObserverRecord;
+        event.header.Timestamp = Now();
+        event.header.SessionId = sessionId;
+        event.header.Value0 = coverageDropped;
+        event.header.Value1 = coverageAttempted;
+        event.header.Attribution = MsMonAttributionUnknown;
+        event.text = L"coverage_usage";
+        event.detail = detail;
+        event.outsideClient = false;
+        if (!writeEvent(event)) result = 1;
+    }
     MSMON_STATISTICS statistics{};
     if (!device.Statistics(statistics)) {
         std::cerr << "Could not read final driver statistics.\n";
         result = 1;
     } else {
-        if (!writer.Write(summary.Json(statistics, etwQueue.Dropped(), driverGaps, etwGaps))) result = 1;
+        std::string summaryJson = summary.Json(statistics, etwQueue.Dropped(), driverGaps, etwGaps);
+        if (!writer.Write(summaryJson)) result = 1;
+        if (!sessionDir.empty()) {
+            WriteTextFile(sessionDir / L"summary.json", summaryJson);
+        }
         std::cout << "Events written: " << totalEvents << "; driver gaps: " << driverGaps
                   << "; ETW gaps: " << etwGaps << "; driver drops: " << statistics.DroppedEvents
                   << "; ETW queue drops: " << etwQueue.Dropped() << "\n";
+    }
+    if (outcome == L"unknown" && once) outcome = L"completed";
+    if (!outcomeOverride.empty()) outcome = outcomeOverride;
+    if (!sessionDir.empty()) {
+        WriteTextFile(sessionDir / L"session_meta.json",
+                      BuildSessionMeta(labels, binaries, clientRoot, scopeRoot, capturePayloads,
+                                       enableEtw, queueRecords, queueBytes, outcome, UtcStamp(Now()),
+                                       totalEvents, statistics.DroppedEvents, driverGaps, etwGaps,
+                                       writer.RecordCount(), writer.TotalBytes(), writer.PartCount()));
+        std::cout << "Session bundle: " << WideToUtf8(sessionDir.wstring()) << "\n";
     }
     if (!writer.Close()) result = 1;
     SetConsoleCtrlHandler(ConsoleHandler, FALSE);

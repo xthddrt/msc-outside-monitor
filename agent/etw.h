@@ -24,6 +24,11 @@ public:
     uint64_t PendingOverflow() const { return pendingOverflow_.load(); }
     uint64_t LostEvents() const { return lostEvents_.load(); }
     uint64_t ParseFailures() const { return parseFailures_.load(); }
+    uint64_t Received(int index) const { return index >= 0 && index < 3 ? received_[index].load() : 0; }
+    uint64_t Parsed(int index) const { return index >= 0 && index < 3 ? parsed_[index].load() : 0; }
+    uint64_t Emitted(int index) const { return index >= 0 && index < 3 ? emitted_[index].load() : 0; }
+    uint64_t Deferred(int index) const { return index >= 0 && index < 3 ? deferred_[index].load() : 0; }
+    uint64_t Expired(int index) const { return index >= 0 && index < 3 ? expired_[index].load() : 0; }
 
 private:
     static ULONG WINAPI BufferCallback(PEVENT_TRACE_LOGFILEW logfile);
@@ -51,6 +56,11 @@ private:
     std::atomic<uint64_t> pendingOverflow_{0};
     std::atomic<uint64_t> lostEvents_{0};
     std::atomic<uint64_t> parseFailures_{0};
+    std::atomic<uint64_t> received_[3]{};
+    std::atomic<uint64_t> parsed_[3]{};
+    std::atomic<uint64_t> emitted_[3]{};
+    std::atomic<uint64_t> deferred_[3]{};
+    std::atomic<uint64_t> expired_[3]{};
     mutable std::mutex pendingMutex_;
     std::mutex emitMutex_;
     std::deque<PendingEvent> pending_;

@@ -45,7 +45,7 @@ build.cmd --with-compat
 
 It produces `build\compat\msmon-legacy.sys` and `build\compat\msmon-legacyctl.exe`. See `compat/README.md` for the active/degraded/disabled matrix. No driver is installed automatically. Do not load the compat driver for normal coverage work.
 
-The default build is unsigned development output. Do not load it on a production machine. Use the isolated test-VM procedure in `docs/TEST_VM.md`. The user-mode agent and kernel driver both compile cleanly with MSVC `/W4 /WX` against WDK 10.0.26100 (`msmon.sys` is 48,128 bytes; `InfVerif` syntax validation passes). The driver has not been installed or runtime-tested here, and `InfVerif /w` reports DIRID 12 in the legacy minifilter INF, so treat runtime behavior as unverified until the VM checklist passes.
+The default build is unsigned development output. Do not load it on a production machine. Use the isolated test-VM procedure in `docs/TEST_VM.md`. The user-mode agent and kernel driver both compile cleanly with MSVC `/W4 /WX` against WDK 10.0.26100 (`msmon.sys` is 49,152 bytes; `InfVerif` syntax validation passes). The driver has not been installed or runtime-tested here, and `InfVerif /w` reports DIRID 12 in the legacy minifilter INF, so treat runtime behavior as unverified until the VM checklist passes.
 
 `docs/RELIABILITY.md` records the driver defects found while investigating host bugchecks on stop/unload and under network load, together with the fixes. Read it before loading a build.
 
@@ -54,16 +54,24 @@ The default build is unsigned development output. Do not load it on a production
 Run elevated in the test VM after properly signing and starting the driver. Start the collector before launching the game:
 
 ```bat
-msmon-agent.exe --client "C:\Nexon\Library\maplestorycw" --output session.jsonl
+msmon-agent.exe --client "C:\Nexon\Library\maplestorycw" ^
+    --log-dir "C:\msmon-sessions" --session-label "login-01" ^
+    --scenario login --phase steady --iteration 1 --machine-label "vm-win11-01"
 ```
 
 `--client` names the installation/classification root. The agent auto-detects
 `appdata` as the process scope when the executable is there. Use
 `--scope-root` to override the process scope explicitly, or pass the original
-`...\appdata` path directly.
+`...\appdata` path directly. `--output` still writes a single log outside a
+bundle for compatibility.
 
 Options:
 
+- `--log-dir DIRECTORY` writes an immutable session bundle with labels, summary, coverage, and metadata;
+- `--session-label LABEL`, `--scenario NAME`, `--phase NAME`, `--iteration N`, `--machine-label NAME` label the session;
+- `--test-id ID` overrides the generated bundle directory/test ID;
+- `--outcome-override NAME` overrides the computed outcome (use only for killed sessions);
+- `--compact` omits decoded status/flag/access fields;
 - `--scope-root DIRECTORY` explicitly sets the process scope (the folder containing the client executable);
 - `--pid PID` explicitly tracks another existing process;
 - `--wait-ms N` sets the empty-queue wait, capped by the driver at one second;
@@ -83,6 +91,29 @@ python tools\verify_log.py session.jsonl session.jsonl.1
 ```
 
 The verifier checks the chain, Base64 payloads, chunk ordering/completeness, and friendly decoded values. The final observer summary groups events by category, process, target process, and resolved module and reports complete and incomplete payload operations. Keep the final chain separately if later modification detection matters.
+
+## Session bundles
+
+Finalize a bundle after the agent stops:
+
+```bat
+python tools\session_pack.py "C:\msmon-sessions\<bundle>"
+python tools\validate_schema.py --session "C:\msmon-sessions\<bundle>"
+python tools\compare_sessions.py <bundle-a> <bundle-b>
+```
+
+`session_pack.py` verifies the chain, writes `manifest.json`, `checksums.json`, `environment.json`, `notes.md`, and `derived/census.json`, and creates a compressed copy. The schema and field dictionary are in `docs/LOG_SCHEMA.md`; transfer/retention rules are in `docs/STORAGE.md`. Raw logs can contain registry values, hardware identifiers, DNS names, and WMI query text; transfer is explicit, never automatic.
+
+## Sensor coverage
+
+The driver exposes `MSMON_IOCTL_COVERAGE`; the agent writes `coverage.json` and a chained `coverage_usage` record. Build the report:
+
+```bat
+python tools\sensor_report.py <bundle> --scenario file_io --write
+python tools\scenario_check.py <bundle> --scenario file_io --write
+```
+
+`coverage/sensor-map.json` maps sensor IDs to source implementation and expected scenarios; `tools/check_sensor_map.py` verifies completeness. Build the controlled fixture with `build.cmd --with-fixtures`, run it under the matching scenario, and use `tools/oracle_diff.py` against a Procmon export to find operation classes the monitor never saw. See `docs/COVERAGE.md` for the activity/health/verification model and limits.
 
 ## Static client inventory
 
