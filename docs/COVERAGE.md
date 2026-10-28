@@ -59,6 +59,7 @@ build\fixtures\sensor_probe.exe file
 build\fixtures\sensor_probe.exe registry
 build\fixtures\sensor_probe.exe ipc
 build\fixtures\sensor_probe.exe network
+powershell -NoProfile -ExecutionPolicy Bypass -File tests\fixtures\wmi_probe.ps1
 ```
 
 Run the fixture while collecting with the matching `--scenario`. `sensor_report.py` then marks expected sensors `verified` or `failing`.
