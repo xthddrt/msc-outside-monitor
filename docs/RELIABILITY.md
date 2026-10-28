@@ -17,9 +17,10 @@ the routine stayed in the kernel's notification list, pointing into a driver
 image that was about to be unmapped.
 
 Effect: the next image load anywhere on the system (any DLL in any process)
-jumps into unmapped code. This is the expected cause of the bugcheck that
-appears shortly after `sc stop msmon`, and it is exactly what Driver Verifier
-reports as "driver unloaded without cancelling ... notification routine".
+jumps into unmapped code. This shows up as a fault in an unloaded module
+(`PAGE_FAULT_IN_NONPAGED_AREA`, `IRQL_NOT_LESS_OR_EQUAL`), or under Driver
+Verifier as `0xC4` with the "driver unloaded without cancelling a notification
+routine" subcode.
 
 Fixed in `driver/process.c`.
 
@@ -28,10 +29,13 @@ Fixed in `driver/process.c`.
 The read IOCTL sleeps up to one second waiting for events. Nothing made
 `DriverUnload` wait for that in-flight IRP or wake it, so the device object was
 deleted while a dispatch routine was still executing, and teardown raced with a
-live `gQueue`.
+live `gQueue`. This is `0xCE` `DRIVER_UNLOADED_WITHOUT_CANCELLING_PENDING_OPERATIONS`,
+the signature reported for this driver.
 
 Fixed with an `EX_RUNDOWN_REF` around every dispatch plus an explicit wake:
-unload completes the rundown and waits for in-flight IRPs after waking readers
+after waking readers, unload calls `ExWaitForRundownProtectionRelease` (which
+refuses new acquisitions and blocks until the in-flight IRPs finish) and only
+then `ExRundownCompleted`, which is the documented order
 (`driver/driver.c`, `driver/events.c`). Session stop also wakes readers.
 
 ### 3. Minifilter could be detached twice
