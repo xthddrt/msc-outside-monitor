@@ -219,9 +219,15 @@ static const FLT_OPERATION_REGISTRATION gOperations[] = {
     { IRP_MJ_OPERATION_END, 0, NULL, NULL, NULL }
 };
 
+static NTSTATUS FLTAPI MsMonFilterUnload(FLT_FILTER_UNLOAD_FLAGS Flags)
+{
+    UNREFERENCED_PARAMETER(Flags);
+    return STATUS_SUCCESS;
+}
+
 static const FLT_REGISTRATION gFilterRegistration = {
     sizeof(FLT_REGISTRATION), FLT_REGISTRATION_VERSION, 0, NULL, gOperations,
-    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
+    MsMonFilterUnload, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
 };
 
 NTSTATUS MsMonFileFilterInitialize(PDRIVER_OBJECT DriverObject)

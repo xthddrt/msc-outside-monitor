@@ -15,6 +15,24 @@ static UNICODE_STRING gClientRoot;
 static KMUTEX gRootMutex;
 static BOOLEAN gSessionActive;
 static BOOLEAN gProcessNotifyEx;
+static BOOLEAN gProcessNotifyRegistered;
+static BOOLEAN gThreadNotifyRegistered;
+static BOOLEAN gImageNotifyRegistered;
+static EX_RUNDOWN_REF gCallbackRundown;
+
+static VOID MsMonRecordStatus(PCWSTR Name, NTSTATUS Status)
+{
+    UNICODE_STRING path;
+    UNICODE_STRING valueName;
+    OBJECT_ATTRIBUTES attributes;
+    HANDLE key = NULL;
+    RtlInitUnicodeString(&path, L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Services\\msmon");
+    InitializeObjectAttributes(&attributes, &path, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+    if (!NT_SUCCESS(ZwOpenKey(&key, KEY_SET_VALUE, &attributes))) return;
+    RtlInitUnicodeString(&valueName, Name);
+    (VOID)ZwSetValueKey(key, &valueName, 0, REG_DWORD, &Status, sizeof(Status));
+    (VOID)ZwClose(key);
+}
 
 static BOOLEAN MsMonImageMatches(PCUNICODE_STRING ImageFileName, PCWSTR RelativePath)
 {
@@ -221,7 +239,7 @@ static VOID MsMonForgetProcess(HANDLE ProcessId, LONGLONG StartTime)
     if (removed != NULL) ExFreePoolWithTag(removed, MSMON_POOL_TAG);
 }
 
-static VOID MsMonProcessNotify(PEPROCESS Process, HANDLE ProcessId, PPS_CREATE_NOTIFY_INFO CreateInfo)
+static VOID MsMonProcessNotifyInner(PEPROCESS Process, HANDLE ProcessId, PPS_CREATE_NOTIFY_INFO CreateInfo)
 {
     LONGLONG startTime = PsGetProcessCreateTimeQuadPart(Process);
     ULONG flags;
@@ -256,51 +274,69 @@ static VOID MsMonProcessNotify(PEPROCESS Process, HANDLE ProcessId, PPS_CREATE_N
                         (ULONGLONG)startTime, 0, CreateInfo->ImageFileName, CreateInfo->CommandLine);
 }
 
+static VOID MsMonProcessNotify(PEPROCESS Process, HANDLE ProcessId, PPS_CREATE_NOTIFY_INFO CreateInfo)
+{
+    if (!ExAcquireRundownProtection(&gCallbackRundown)) return;
+    MsMonProcessNotifyInner(Process, ProcessId, CreateInfo);
+    ExReleaseRundownProtection(&gCallbackRundown);
+}
+
 static VOID MsMonThreadNotify(HANDLE ProcessId, HANDLE ThreadId, BOOLEAN Create)
 {
-    if (!MsMonIsTracked(ProcessId, 0) && !MsMonCurrentIsBlackCat()) return;
-    (VOID)MsMonLogEvent(Create ? MsMonThreadStart : MsMonThreadExit,
-                        ProcessId, NULL, ThreadId, NULL, 0, 0, STATUS_SUCCESS, 0,
-                        MsMonCategoryUnknown, 0, 0, NULL, NULL);
+    if (!ExAcquireRundownProtection(&gCallbackRundown)) return;
+    if (MsMonIsTracked(ProcessId, 0) || MsMonCurrentIsBlackCat()) {
+        (VOID)MsMonLogEvent(Create ? MsMonThreadStart : MsMonThreadExit,
+                            ProcessId, NULL, ThreadId, NULL, 0, 0, STATUS_SUCCESS, 0,
+                            MsMonCategoryUnknown, 0, 0, NULL, NULL);
+    }
+    ExReleaseRundownProtection(&gCallbackRundown);
 }
 
 static VOID MsMonImageNotify(PUNICODE_STRING FullImageName, HANDLE ProcessId, PIMAGE_INFO ImageInfo)
 {
-    if (!MsMonIsTracked(ProcessId, 0) && !MsMonCurrentIsBlackCat()) return;
-    (VOID)MsMonLogEvent(MsMonImageLoad, ProcessId, NULL, NULL, NULL, 0, 0,
-                        STATUS_SUCCESS, 0, MsMonCategoryUnknown,
-                        (ULONGLONG)ImageInfo->ImageBase, ImageInfo->ImageSize, FullImageName, NULL);
+    if (!ExAcquireRundownProtection(&gCallbackRundown)) return;
+    if (MsMonIsTracked(ProcessId, 0) || MsMonCurrentIsBlackCat()) {
+        (VOID)MsMonLogEvent(MsMonImageLoad, ProcessId, NULL, NULL, NULL, 0, 0,
+                            STATUS_SUCCESS, 0, MsMonCategoryUnknown,
+                            (ULONGLONG)ImageInfo->ImageBase, ImageInfo->ImageSize, FullImageName, NULL);
+    }
+    ExReleaseRundownProtection(&gCallbackRundown);
 }
 
 static VOID MsMonProcessNotifyLegacy(HANDLE ParentId, HANDLE ProcessId, BOOLEAN Create)
 {
     PEPROCESS process = NULL;
-    if (!NT_SUCCESS(PsLookupProcessByProcessId(ProcessId, &process))) return;
-    if (Create) {
-        PUNICODE_STRING imageName = NULL;
-        if (NT_SUCCESS(SeLocateProcessImageName(process, &imageName))) {
-            PS_CREATE_NOTIFY_INFO info;
-            RtlZeroMemory(&info, sizeof(info));
-            info.ParentProcessId = ParentId;
-            info.ImageFileName = imageName;
-            MsMonProcessNotify(process, ProcessId, &info);
-            ExFreePool(imageName);
+    if (!ExAcquireRundownProtection(&gCallbackRundown)) return;
+    if (NT_SUCCESS(PsLookupProcessByProcessId(ProcessId, &process))) {
+        if (Create) {
+            PUNICODE_STRING imageName = NULL;
+            if (NT_SUCCESS(SeLocateProcessImageName(process, &imageName))) {
+                PS_CREATE_NOTIFY_INFO info;
+                RtlZeroMemory(&info, sizeof(info));
+                info.ParentProcessId = ParentId;
+                info.ImageFileName = imageName;
+                MsMonProcessNotifyInner(process, ProcessId, &info);
+                ExFreePool(imageName);
+            } else {
+                MsMonProcessNotifyInner(process, ProcessId, NULL);
+            }
         } else {
-            MsMonProcessNotify(process, ProcessId, NULL);
+            MsMonProcessNotifyInner(process, ProcessId, NULL);
         }
-    } else {
-        MsMonProcessNotify(process, ProcessId, NULL);
+        ObDereferenceObject(process);
     }
-    ObDereferenceObject(process);
+    ExReleaseRundownProtection(&gCallbackRundown);
 }
 
 static VOID MsMonRemoveProcessNotify(VOID)
 {
+    if (!gProcessNotifyRegistered) return;
     if (gProcessNotifyEx) {
         (VOID)PsSetCreateProcessNotifyRoutineEx(MsMonProcessNotify, TRUE);
     } else {
         (VOID)PsSetCreateProcessNotifyRoutine(MsMonProcessNotifyLegacy, TRUE);
     }
+    gProcessNotifyRegistered = FALSE;
 }
 
 NTSTATUS MsMonProcessInitialize(VOID)
@@ -313,30 +349,52 @@ NTSTATUS MsMonProcessInitialize(VOID)
     gClientRoot.Buffer = NULL;
     gSessionActive = FALSE;
     gProcessNotifyEx = FALSE;
+    gProcessNotifyRegistered = FALSE;
+    gThreadNotifyRegistered = FALSE;
+    gImageNotifyRegistered = FALSE;
+    ExInitializeRundownProtection(&gCallbackRundown);
     status = PsSetCreateProcessNotifyRoutineEx(MsMonProcessNotify, FALSE);
     if (NT_SUCCESS(status)) {
         gProcessNotifyEx = TRUE;
+        gProcessNotifyRegistered = TRUE;
     } else {
         status = PsSetCreateProcessNotifyRoutine(MsMonProcessNotifyLegacy, FALSE);
         if (!NT_SUCCESS(status)) return status;
+        gProcessNotifyRegistered = TRUE;
     }
     status = PsSetCreateThreadNotifyRoutine(MsMonThreadNotify);
     if (!NT_SUCCESS(status)) {
         MsMonRemoveProcessNotify();
         return status;
     }
-    status = PsSetLoadImageNotifyRoutine(MsMonImageNotify);
-    if (!NT_SUCCESS(status)) {
-        (VOID)PsRemoveCreateThreadNotifyRoutine(MsMonThreadNotify);
-        MsMonRemoveProcessNotify();
-    }
+    gThreadNotifyRegistered = TRUE;
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS MsMonImageInitialize(VOID)
+{
+    NTSTATUS status = PsSetLoadImageNotifyRoutine(MsMonImageNotify);
+    gImageNotifyRegistered = NT_SUCCESS(status);
+    MsMonRecordStatus(L"ImageRegisterStatus", status);
     return status;
 }
 
 VOID MsMonProcessUninitialize(VOID)
 {
-    (VOID)PsSetLoadImageNotifyRoutine(MsMonImageNotify);
-    (VOID)PsRemoveCreateThreadNotifyRoutine(MsMonThreadNotify);
+    MsMonRecordStatus(L"ProcessUninitializeStart", STATUS_SUCCESS);
+    if (gImageNotifyRegistered) {
+        NTSTATUS status = PsSetLoadImageNotifyRoutine(MsMonImageNotify);
+        MsMonRecordStatus(L"ImageRemoveStatus", status);
+        gImageNotifyRegistered = FALSE;
+    } else {
+        MsMonRecordStatus(L"ImageRemoveStatus", STATUS_PROCEDURE_NOT_FOUND);
+    }
+    if (gThreadNotifyRegistered) {
+        (VOID)PsRemoveCreateThreadNotifyRoutine(MsMonThreadNotify);
+        gThreadNotifyRegistered = FALSE;
+    }
     MsMonRemoveProcessNotify();
+    ExWaitForRundownProtectionRelease(&gCallbackRundown);
+    MsMonRecordStatus(L"RundownComplete", STATUS_SUCCESS);
     MsMonProcessStopSession();
 }

@@ -263,7 +263,7 @@ bool JsonlWriter::Write(const std::string& json)
 {
     if (json.empty() || json.back() != '}') return false;
     if (maximumBytes_ != 0 && bytes_ != 0 && bytes_ >= maximumBytes_) {
-        stream_.close();
+        if (!Close()) return false;
         std::filesystem::path rotated = basePath_;
         rotated += L"." + std::to_wstring(++part_);
         stream_.open(rotated, std::ios::binary | std::ios::trunc);
@@ -276,9 +276,17 @@ bool JsonlWriter::Write(const std::string& json)
     if (chain_.empty()) return false;
     std::string line = indexed.substr(0, indexed.size() - 1) + ",\"chain\":\"" + chain_ + "\"}\n";
     stream_.write(line.data(), static_cast<std::streamsize>(line.size()));
-    stream_.flush();
     bytes_ += line.size();
     return static_cast<bool>(stream_);
+}
+
+bool JsonlWriter::Close()
+{
+    if (!stream_.is_open()) return true;
+    stream_.flush();
+    bool result = static_cast<bool>(stream_);
+    stream_.close();
+    return result;
 }
 
 static std::string Base64(const std::vector<BYTE>& data)
@@ -350,11 +358,6 @@ static void AppendDecodedValue(std::ostringstream& json, const TelemetryEvent& e
                 }
                 if (end + 1 >= event.payload.size()) break;
                 offset = end + 2;
-                if (offset + 1 < event.payload.size()) {
-                    wchar_t c;
-                    std::memcpy(&c, event.payload.data() + offset, sizeof(c));
-                    if (c == L'\0') break;
-                }
             }
             json << "]";
         } else if (type == REG_DWORD && event.payload.size() == sizeof(uint32_t)) {

@@ -57,6 +57,7 @@ Options:
 - `--wait-ms N` sets the empty-queue wait, capped by the driver at one second;
 - `--max-file-mb N` rotates output after the threshold with a continuing hash chain;
 - `--queue-records N` and `--queue-mb N` adjust bounded driver buffering;
+- `--stop-file FILE` stops tracking, drains queued events, and writes the final summary when the file appears;
 - `--no-etw` disables the private ETW session and records a coverage warning;
 - `--no-payloads` disables exact registry/volume payloads and restores sanitized WMI queries;
 - `--once` reads one driver batch and exits.

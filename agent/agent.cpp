@@ -217,7 +217,7 @@ static void Usage()
 {
     std::cout << "Usage: msmon-agent [--client DIRECTORY] [--output FILE] [--pid PID] "
                  "[--wait-ms N] [--max-file-mb N] [--queue-records N] [--queue-mb N] "
-                 "[--no-etw] [--no-payloads] [--once]\n";
+                 "[--stop-file FILE] [--no-etw] [--no-payloads] [--once]\n";
 }
 
 static bool ParseNumber(const wchar_t* text, uint64_t& value)
@@ -238,6 +238,8 @@ int wmain(int argc, wchar_t** argv)
     bool once = false;
     bool enableEtw = true;
     bool capturePayloads = true;
+    std::filesystem::path stopFile;
+    bool stopFileEnabled = false;
     std::vector<DWORD> explicitPids;
 
     for (int index = 1; index < argc; index++) {
@@ -256,6 +258,9 @@ int wmain(int argc, wchar_t** argv)
             clientRoot = argv[++index];
         } else if (index + 1 < argc && argument == L"--output") {
             output = argv[++index];
+        } else if (index + 1 < argc && argument == L"--stop-file") {
+            stopFile = argv[++index];
+            stopFileEnabled = true;
         } else if (index + 1 < argc && argument == L"--wait-ms" && ParseNumber(argv[index + 1], value)) {
             waitMs = value;
             index++;
@@ -379,6 +384,31 @@ int wmain(int argc, wchar_t** argv)
     if (!writeCoverage(L"static_hardware_boundary",
                        L"MachineIdLib.dll imports process/window enumeration, GetVolumeInformationA, and GetAdaptersInfo; static imports do not prove runtime invocation",
                        MsMonAttributionStaticEvidence)) return 1;
+    {
+        DWORD required = QueryDosDeviceW(nullptr, nullptr, 0);
+        unsigned discovered = 0;
+        if (required != 0) {
+            std::vector<wchar_t> devices(required);
+            DWORD length = QueryDosDeviceW(nullptr, devices.data(), required);
+            if (length != 0) {
+                for (const wchar_t* cursor = devices.data(); *cursor != L'\0'; cursor += std::wcslen(cursor) + 1) {
+                    std::wstring name = cursor;
+                    if (name.find(L"BlackCat") == std::wstring::npos &&
+                        name.find(L"blackcat") == std::wstring::npos &&
+                        name.find(L"NGS") == std::wstring::npos &&
+                        name.find(L"ngs") == std::wstring::npos) continue;
+                    wchar_t targetBuffer[32768];
+                    DWORD targetLength = QueryDosDeviceW(name.c_str(), targetBuffer,
+                                                         static_cast<DWORD>(std::size(targetBuffer)));
+                    std::wstring target = targetLength != 0 ? targetBuffer : L"<unavailable>";
+                    discovered++;
+                    if (!writeCoverage(L"blackcat_device_discovered", name + L" -> " + target)) return 1;
+                }
+            }
+        }
+        if (!writeCoverage(L"blackcat_device_discovery",
+                           L"matches=" + std::to_wstring(discovered))) return 1;
+    }
     if (enableEtw) {
         etw = std::make_unique<EtwCollector>(scope, etwQueue, sessionId, capturePayloads);
         if (!etw->Start(error)) {
@@ -440,7 +470,9 @@ int wmain(int argc, wchar_t** argv)
     DWORD bytes = 0;
     bool draining = false;
     do {
-        if (!once && !draining && gStop.load()) {
+        std::error_code stopError;
+        bool stopFileRequested = stopFileEnabled && std::filesystem::exists(stopFile, stopError);
+        if (!once && !draining && (gStop.load() || stopFileRequested)) {
             if (!device.StopTracking()) {
                 std::cerr << "Could not stop driver tracking: Win32 error " << GetLastError() << "\n";
                 result = 1;
@@ -530,6 +562,7 @@ int wmain(int argc, wchar_t** argv)
                   << "; ETW gaps: " << etwGaps << "; driver drops: " << statistics.DroppedEvents
                   << "; ETW queue drops: " << etwQueue.Dropped() << "\n";
     }
+    if (!writer.Close()) result = 1;
     SetConsoleCtrlHandler(ConsoleHandler, FALSE);
     return result;
 }

@@ -28,21 +28,33 @@ VOID MsMonAttributionStop(VOID)
     KeReleaseSpinLock(&gAttributionLock, oldIrql);
 }
 
+static CHAR MsMonLowerChar(CHAR Value)
+{
+    return Value >= 'A' && Value <= 'Z' ? Value + ('a' - 'A') : Value;
+}
+
 static BOOLEAN MsMonBlackCatName(PCSTR Path)
 {
-    static const CHAR name[] = "BlackCat64.sys";
+    static const CHAR prefix[] = "blackcat";
+    static const CHAR suffix[] = ".sys";
     PCSTR base = Path;
     PCSTR cursor;
-    STRING component;
-    STRING expected;
+    ULONG index;
     if (Path == NULL) return FALSE;
     for (cursor = Path; cursor - Path < AUX_KLIB_MODULE_PATH_LEN && *cursor != '\0'; cursor++) {
         if (*cursor == '\\' || *cursor == '/') base = cursor + 1;
     }
     if (cursor - Path == AUX_KLIB_MODULE_PATH_LEN) return FALSE;
-    RtlInitString(&component, base);
-    RtlInitString(&expected, name);
-    return RtlEqualString(&component, &expected, TRUE);
+    for (index = 0; index < ARRAYSIZE(prefix) - 1; index++) {
+        if (base[index] == '\0' || MsMonLowerChar(base[index]) != prefix[index]) return FALSE;
+    }
+    cursor = base + ARRAYSIZE(prefix) - 1;
+    if (*cursor < '0' || *cursor > '9') return FALSE;
+    while (*cursor >= '0' && *cursor <= '9') cursor++;
+    for (index = 0; index < ARRAYSIZE(suffix); index++) {
+        if (cursor[index] == '\0' || MsMonLowerChar(cursor[index]) != suffix[index]) return FALSE;
+    }
+    return TRUE;
 }
 
 NTSTATUS MsMonAttributionRefresh(VOID)
@@ -56,6 +68,7 @@ NTSTATUS MsMonAttributionRefresh(VOID)
     ULONG imageSize = 0;
     BOOLEAN loaded = FALSE;
     BOOLEAN changed;
+    WCHAR moduleName[64] = L"";
     KIRQL oldIrql;
 
     if (!NT_SUCCESS(status) && status != STATUS_BUFFER_TOO_SMALL) return status;
@@ -71,6 +84,12 @@ NTSTATUS MsMonAttributionRefresh(VOID)
     for (index = 0; index < count; index++) {
         PCSTR path = (PCSTR)modules[index].FullPathName;
         if (MsMonBlackCatName(path)) {
+            PCSTR name = path;
+            PCSTR cursor;
+            for (cursor = path; *cursor != '\0'; cursor++) {
+                if (*cursor == '\\' || *cursor == '/') name = cursor + 1;
+            }
+            (VOID)RtlStringCchPrintfW(moduleName, RTL_NUMBER_OF(moduleName), L"%hs", name);
             base = (ULONG_PTR)modules[index].BasicInfo.ImageBase;
             imageSize = modules[index].ImageSize;
             loaded = TRUE;
@@ -89,12 +108,12 @@ NTSTATUS MsMonAttributionRefresh(VOID)
     KeReleaseSpinLock(&gAttributionLock, oldIrql);
 
     if (changed) {
-        WCHAR detail[128];
+        WCHAR detail[160];
         UNICODE_STRING text;
         UNICODE_STRING detailString;
         RtlInitUnicodeString(&text, loaded ? L"blackcat_loaded" : L"blackcat_not_loaded");
-        (VOID)RtlStringCchPrintfW(detail, RTL_NUMBER_OF(detail), L"base=0x%p;size=0x%lx",
-                                  (PVOID)base, imageSize);
+        (VOID)RtlStringCchPrintfW(detail, RTL_NUMBER_OF(detail), L"name=%ws;base=0x%p;size=0x%lx",
+                                  moduleName, (PVOID)base, imageSize);
         RtlInitUnicodeString(&detailString, detail);
         (VOID)MsMonLogEvent(MsMonCoverage, PsGetCurrentProcessId(), NULL, PsGetCurrentThreadId(),
                             NULL, 0, MsMonFlagObserverRecord, STATUS_SUCCESS, 0,

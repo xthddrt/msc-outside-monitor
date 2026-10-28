@@ -48,6 +48,8 @@ static LIST_ENTRY gFlows;
 static KSPIN_LOCK gFlowLock;
 static BOOLEAN gFlowListInitialized;
 static BOOLEAN gNetworkActive;
+static ULONG gNetworkLayerMask;
+static NTSTATUS gNetworkLayerStatus[MSMON_CALLOUT_COUNT];
 
 static VOID NTAPI MsMonWfpFlowDelete(UINT16 LayerId, UINT32 CalloutId, UINT64 FlowContext);
 
@@ -355,12 +357,27 @@ static NTSTATUS MsMonAddCallout(
 
 NTSTATUS MsMonNetworkInitialize(PDEVICE_OBJECT DeviceObject)
 {
+    const GUID* layers[MSMON_CALLOUT_COUNT] = {
+        &FWPM_LAYER_ALE_AUTH_CONNECT_V4,
+        &FWPM_LAYER_ALE_AUTH_CONNECT_V6,
+        &FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V4,
+        &FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V6,
+        &FWPM_LAYER_ALE_FLOW_ESTABLISHED_V4,
+        &FWPM_LAYER_ALE_FLOW_ESTABLISHED_V6
+    };
+    PCWSTR names[MSMON_CALLOUT_COUNT] = {
+        L"MsMon connect IPv4", L"MsMon connect IPv6",
+        L"MsMon accept IPv4", L"MsMon accept IPv6",
+        L"MsMon flow IPv4", L"MsMon flow IPv6"
+    };
     FWPM_SESSION session;
     NTSTATUS status;
+    ULONG index;
     KeInitializeSpinLock(&gFlowLock);
     InitializeListHead(&gFlows);
     gFlowListInitialized = TRUE;
     gNetworkActive = FALSE;
+    gNetworkLayerMask = 0;
 
     RtlZeroMemory(&session, sizeof(session));
     session.displayData.name = (PWSTR)L"MsMon dynamic session";
@@ -369,18 +386,27 @@ NTSTATUS MsMonNetworkInitialize(PDEVICE_OBJECT DeviceObject)
     status = FwpmEngineOpen(NULL, RPC_C_AUTHN_WINNT, NULL, &session, &gEngine);
     if (!NT_SUCCESS(status)) return status;
 
-    status = MsMonAddCallout(DeviceObject, 0, &FWPM_LAYER_ALE_AUTH_CONNECT_V4, L"MsMon connect IPv4");
-    if (NT_SUCCESS(status)) status = MsMonAddCallout(DeviceObject, 1, &FWPM_LAYER_ALE_AUTH_CONNECT_V6, L"MsMon connect IPv6");
-    if (NT_SUCCESS(status)) status = MsMonAddCallout(DeviceObject, 2, &FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V4, L"MsMon accept IPv4");
-    if (NT_SUCCESS(status)) status = MsMonAddCallout(DeviceObject, 3, &FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V6, L"MsMon accept IPv6");
-    if (NT_SUCCESS(status)) status = MsMonAddCallout(DeviceObject, 4, &FWPM_LAYER_ALE_FLOW_ESTABLISHED_V4, L"MsMon flow IPv4");
-    if (NT_SUCCESS(status)) status = MsMonAddCallout(DeviceObject, 5, &FWPM_LAYER_ALE_FLOW_ESTABLISHED_V6, L"MsMon flow IPv6");
-    if (!NT_SUCCESS(status)) {
-        MsMonNetworkUninitialize();
-        return status;
+    for (index = 0; index < MSMON_CALLOUT_COUNT; index++) {
+        status = MsMonAddCallout(DeviceObject, index, layers[index], names[index]);
+        gNetworkLayerStatus[index] = status;
+        if (NT_SUCCESS(status)) {
+            gNetworkLayerMask |= 1u << index;
+        } else {
+            DbgPrint("MsMon: WFP layer %lu initialization failed 0x%08X\n", index, status);
+        }
     }
-    gNetworkActive = TRUE;
+    gNetworkActive = gNetworkLayerMask != 0;
     return STATUS_SUCCESS;
+}
+
+BOOLEAN MsMonNetworkAvailable(VOID)
+{
+    return gNetworkActive;
+}
+
+ULONG MsMonNetworkCoverage(VOID)
+{
+    return gNetworkLayerMask;
 }
 
 VOID MsMonNetworkUninitialize(VOID)
@@ -415,5 +441,7 @@ VOID MsMonNetworkUninitialize(VOID)
             (VOID)FwpsCalloutUnregisterById(gCalloutIds[index]);
             gCalloutRegistered[index] = FALSE;
         }
+        gNetworkLayerStatus[index] = STATUS_SUCCESS;
     }
+    gNetworkLayerMask = 0;
 }

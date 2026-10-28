@@ -31,10 +31,19 @@ static NTSTATUS MsMonStartSession(PMSMON_SESSION_CONFIG Config)
         UNICODE_STRING text;
         UNICODE_STRING detail;
         RtlInitUnicodeString(&text, L"object_callbacks_unavailable");
-        RtlInitUnicodeString(&detail, L"Process and thread handle events are disabled; other monitoring remains active");
+        RtlInitUnicodeString(&detail, L"Process and thread handle events are disabled; status is in value0");
         (VOID)MsMonLogEvent(MsMonCoverage, PsGetCurrentProcessId(), NULL, PsGetCurrentThreadId(),
                             NULL, 0, MsMonFlagObserverRecord, STATUS_SUCCESS, 0,
-                            MsMonCategoryUnknown, 0, 0, &text, &detail);
+                            MsMonCategoryUnknown, (ULONG)MsMonObjectStatus(), 0, &text, &detail);
+    }
+    if (NT_SUCCESS(status) && MsMonNetworkCoverage() != 0x3f) {
+        UNICODE_STRING text;
+        UNICODE_STRING detail;
+        RtlInitUnicodeString(&text, MsMonNetworkAvailable() ? L"network_callbacks_partial" : L"network_callbacks_unavailable");
+        RtlInitUnicodeString(&detail, L"WFP layer availability bitmask is in value0; other monitoring remains active");
+        (VOID)MsMonLogEvent(MsMonCoverage, PsGetCurrentProcessId(), NULL, PsGetCurrentThreadId(),
+                            NULL, 0, MsMonFlagObserverRecord, STATUS_SUCCESS, 0,
+                            MsMonCategoryUnknown, MsMonNetworkCoverage(), 0, &text, &detail);
     }
     if (!NT_SUCCESS(status)) {
         MsMonProcessStopSession();
@@ -182,7 +191,14 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     }
     if (NT_SUCCESS(status)) status = MsMonFileFilterInitialize(DriverObject);
     if (NT_SUCCESS(status)) status = MsMonRegistryInitialize(DriverObject);
-    if (NT_SUCCESS(status)) status = MsMonNetworkInitialize(deviceObject);
+    if (NT_SUCCESS(status)) {
+        status = MsMonNetworkInitialize(deviceObject);
+        if (!NT_SUCCESS(status)) {
+            DbgPrint("MsMon: WFP initialization failed 0x%08X; continuing without network events\n", status);
+            status = STATUS_SUCCESS;
+        }
+    }
+    if (NT_SUCCESS(status)) status = MsMonImageInitialize();
     if (!NT_SUCCESS(status)) {
         MsMonNetworkUninitialize();
         MsMonRegistryUninitialize();

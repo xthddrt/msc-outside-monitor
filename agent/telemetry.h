@@ -68,6 +68,7 @@ public:
     JsonlWriter(std::filesystem::path basePath, uint64_t maximumBytes);
     bool Open();
     bool Write(const std::string& json);
+    bool Close();
     uint64_t RecordCount() const { return recordIndex_; }
 
 private:

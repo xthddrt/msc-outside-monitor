@@ -53,6 +53,7 @@ NTSTATUS MsMonReadEvents(PVOID Output, ULONG MaximumBytes, ULONG TimeoutMillisec
 VOID MsMonGetStatistics(PMSMON_STATISTICS Statistics);
 
 NTSTATUS MsMonProcessInitialize(VOID);
+NTSTATUS MsMonImageInitialize(VOID);
 VOID MsMonProcessUninitialize(VOID);
 NTSTATUS MsMonProcessStartSession(PCUNICODE_STRING ClientRoot);
 VOID MsMonProcessStopSession(VOID);
@@ -64,6 +65,7 @@ ULONG MsMonTrackedProcessCount(VOID);
 NTSTATUS MsMonObjectInitialize(PDRIVER_OBJECT DriverObject);
 VOID MsMonObjectUninitialize(VOID);
 BOOLEAN MsMonObjectAvailable(VOID);
+NTSTATUS MsMonObjectStatus(VOID);
 
 NTSTATUS MsMonFileFilterInitialize(PDRIVER_OBJECT DriverObject);
 VOID MsMonFileFilterUninitialize(VOID);
@@ -73,3 +75,5 @@ VOID MsMonRegistryUninitialize(VOID);
 
 NTSTATUS MsMonNetworkInitialize(PDEVICE_OBJECT DeviceObject);
 VOID MsMonNetworkUninitialize(VOID);
+BOOLEAN MsMonNetworkAvailable(VOID);
+ULONG MsMonNetworkCoverage(VOID);

@@ -1,6 +1,7 @@
 #include "msmon.h"
 
 static PVOID gObjectRegistration;
+static NTSTATUS gObjectStatus = STATUS_SUCCESS;
 
 typedef struct _MSMON_OBJECT_CONTEXT {
     HANDLE TargetProcessId;
@@ -104,12 +105,18 @@ NTSTATUS MsMonObjectInitialize(PDRIVER_OBJECT DriverObject)
     RtlInitUnicodeString(&altitude, L"380011");
     registration.Altitude = altitude;
     registration.RegistrationContext = DriverObject;
-    return ObRegisterCallbacks(&registration, &gObjectRegistration);
+    gObjectStatus = ObRegisterCallbacks(&registration, &gObjectRegistration);
+    return gObjectStatus;
 }
 
 BOOLEAN MsMonObjectAvailable(VOID)
 {
     return gObjectRegistration != NULL;
+}
+
+NTSTATUS MsMonObjectStatus(VOID)
+{
+    return gObjectStatus;
 }
 
 VOID MsMonObjectUninitialize(VOID)
