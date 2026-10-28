@@ -68,6 +68,20 @@ static PMSMON_REGISTRY_CONTEXT MsMonCreateContext(
     return context;
 }
 
+/*
+ * NtQueryValueKey and NtEnumerateValueKey use a two-pass protocol: the first
+ * call returns BUFFER_OVERFLOW/BUFFER_TOO_SMALL with the required size, and
+ * enumeration terminates with NO_MORE_ENTRIES. Those results carry no value
+ * and the follow-up call carries the real one, so they are logged as metadata
+ * instead of as an unavailable payload. The recorded session produced ~2,100 of
+ * them that looked like genuine failures.
+ */
+static BOOLEAN MsMonRetryStatus(NTSTATUS Status)
+{
+    return Status == STATUS_BUFFER_OVERFLOW || Status == STATUS_BUFFER_TOO_SMALL ||
+           Status == STATUS_MORE_ENTRIES || Status == STATUS_NO_MORE_ENTRIES;
+}
+
 static VOID MsMonRegistryUnavailable(
     PMSMON_REGISTRY_CONTEXT Context, NTSTATUS Status, PCWSTR Reason, ULONG ExtraFlags
 )
@@ -180,6 +194,10 @@ static VOID MsMonCaptureSingleValue(
     PVOID Information, ULONG BufferLength, ULONG ReturnedLength
 )
 {
+    if (MsMonRetryStatus(Status)) {
+        MsMonRegistryMetadata(Context, Status);
+        return;
+    }
     if (!NT_SUCCESS(Status)) {
         MsMonRegistryUnavailable(Context, Status, L"query_failed", 0);
         return;
@@ -237,6 +255,10 @@ static VOID MsMonCaptureMultipleValues(
     ULONG returned;
     ULONG capacity;
     ULONG index;
+    if (MsMonRetryStatus(Status)) {
+        MsMonRegistryMetadata(Context, Status);
+        return;
+    }
     if (!NT_SUCCESS(Status)) {
         MsMonRegistryUnavailable(Context, Status, L"multi_query_failed", 0);
         return;

@@ -432,6 +432,7 @@ int wmain(int argc, wchar_t** argv)
     uint64_t etwGaps = 0;
     uint64_t totalEvents = 0;
     uint64_t nextModuleRefresh = GetTickCount64() + 1000;
+    uint64_t nextStatistics = GetTickCount64() + 30000;
     bool moduleRefreshWarning = false;
     int result = 0;
 
@@ -547,6 +548,39 @@ int wmain(int argc, wchar_t** argv)
                 moduleRefreshWarning = true;
             }
             nextModuleRefresh = GetTickCount64() + 1000;
+        }
+        if (!draining && GetTickCount64() >= nextStatistics) {
+            /*
+             * Periodic statistics keep drop and queue pressure visible even if
+             * the session ends abruptly (bugcheck, kill, power loss), where the
+             * final summary is never written.
+             */
+            MSMON_STATISTICS statistics{};
+            if (device.Statistics(statistics)) {
+                TelemetryEvent event;
+                event.source = "agent";
+                event.header.Size = sizeof(event.header);
+                event.header.Version = MSMON_PROTOCOL_VERSION;
+                event.header.Type = MsMonCoverage;
+                event.header.Flags = MsMonFlagObserverRecord;
+                event.header.Timestamp = Now();
+                event.header.SessionId = sessionId;
+                event.header.Value0 = statistics.DroppedEvents;
+                event.header.Value1 = statistics.QueuedEvents;
+                event.text = L"driver_statistics";
+                event.detail = L"queued=" + std::to_wstring(statistics.QueuedEvents) +
+                               L";queued_bytes=" + std::to_wstring(statistics.QueuedBytes) +
+                               L";dropped=" + std::to_wstring(statistics.DroppedEvents) +
+                               L";tracked=" + std::to_wstring(statistics.TrackedProcesses) +
+                               L";queue_record_limit=" + std::to_wstring(statistics.QueueRecordLimit) +
+                               L";queue_byte_limit=" + std::to_wstring(statistics.QueueByteLimit);
+                event.outsideClient = false;
+                if (!writeEvent(event)) {
+                    result = 1;
+                    break;
+                }
+            }
+            nextStatistics = GetTickCount64() + 30000;
         }
     } while (!once && (!draining || bytes != 0));
 
