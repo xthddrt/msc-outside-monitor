@@ -45,7 +45,7 @@ build.cmd --with-compat
 
 It produces `build\compat\msmon-legacy.sys` and `build\compat\msmon-legacyctl.exe`. See `compat/README.md` for the active/degraded/disabled matrix. No driver is installed automatically. Do not load the compat driver for normal coverage work.
 
-The default build is unsigned development output. Do not load it on a production machine. Use the isolated test-VM procedure in `docs/TEST_VM.md`. The user-mode agent and kernel driver both compile cleanly with MSVC `/W4 /WX` against WDK 10.0.26100 (`msmon.sys` is 49,152 bytes; `InfVerif` syntax validation passes). The driver has not been installed or runtime-tested here, and `InfVerif /w` reports DIRID 12 in the legacy minifilter INF, so treat runtime behavior as unverified until the VM checklist passes.
+The default build is unsigned development output. Do not load it on a production machine. Use the isolated test-VM procedure in `docs/TEST_VM.md`. The user-mode agent and kernel driver both compile cleanly with MSVC `/W4 /WX` against WDK 10.0.26100, and `InfVerif` syntax validation passes. Limited installation and callback-registration measurements are recorded in `docs/SIGNING_GATE.md`; they are not a substitute for the full VM checklist. `InfVerif /w` also reports DIRID 12 in the legacy minifilter INF.
 
 `docs/RELIABILITY.md` records the driver defects found while investigating host bugchecks on stop/unload and under network load, together with the fixes. Read it before loading a build.
 

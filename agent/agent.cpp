@@ -908,11 +908,64 @@ int wmain(int argc, wchar_t** argv)
         if (!writeCoverage(L"session_context", context)) return 1;
     }
     {
+        std::wstring callbacks;
+        bool firstCallback = true;
+        auto appendCallback = [&](const wchar_t* name) {
+            if (!firstCallback) callbacks += L',';
+            callbacks += name;
+            firstCallback = false;
+        };
+        auto registrationSucceeded = [&](unsigned slot) {
+            const unsigned __int64 bit = 1ull << slot;
+            return startCoverageSupported &&
+                   (startCoverage.RegistrationOk & bit) != 0 &&
+                   (startCoverage.RegistrationFailed & bit) == 0;
+        };
+        bool fileRegistered = false;
+        bool registryRegistered = false;
+        if (startCoverageSupported) {
+            if (registrationSucceeded(MSMON_SENSOR_REG_PROCESS_NOTIFY)) appendCallback(L"process");
+            if (registrationSucceeded(MSMON_SENSOR_REG_THREAD_NOTIFY)) appendCallback(L"thread");
+            if (registrationSucceeded(MSMON_SENSOR_REG_IMAGE_NOTIFY)) appendCallback(L"image");
+            if (registrationSucceeded(MSMON_SENSOR_REG_OBJECT_PROCESS)) appendCallback(L"object_process");
+            if (registrationSucceeded(MSMON_SENSOR_REG_OBJECT_THREAD)) appendCallback(L"object_thread");
+            fileRegistered = registrationSucceeded(MSMON_SENSOR_REG_FILTER_REGISTER) &&
+                             registrationSucceeded(MSMON_SENSOR_REG_FILTER_START);
+            if (fileRegistered) {
+                appendCallback(L"file");
+                appendCallback(L"file_section");
+                appendCallback(L"file_security");
+                appendCallback(L"file_ea");
+            }
+            registryRegistered = registrationSucceeded(MSMON_SENSOR_REG_REGISTRY);
+            if (registryRegistered) appendCallback(L"registry");
+            static const unsigned wfpSlots[] = {
+                MSMON_SENSOR_REG_WFP_0, MSMON_SENSOR_REG_WFP_1,
+                MSMON_SENSOR_REG_WFP_2, MSMON_SENSOR_REG_WFP_3,
+                MSMON_SENSOR_REG_WFP_4, MSMON_SENSOR_REG_WFP_5
+            };
+            static const wchar_t* wfpNames[] = {
+                L"wfp_connect_v4", L"wfp_connect_v6", L"wfp_accept_v4",
+                L"wfp_accept_v6", L"wfp_flow_v4", L"wfp_flow_v6"
+            };
+            for (size_t index = 0; index < std::size(wfpSlots); index++) {
+                if (registrationSucceeded(wfpSlots[index])) appendCallback(wfpNames[index]);
+            }
+            if (callbacks.empty()) callbacks = L"none";
+        } else {
+            callbacks = L"unknown";
+        }
+        const wchar_t* fileState = !startCoverageSupported ? L"unknown" : (fileRegistered ? L"true" : L"false");
+        const wchar_t* registryState = !startCoverageSupported ? L"unknown" : (registryRegistered ? L"true" : L"false");
         std::wstring manifest = L"scope_root=" + scopeRoot +
                                 L";inside_root=" + clientRoot +
-                                L";driver_callbacks=process,thread,image,object_process,object_thread,file,file_section,file_security,file_ea,registry,wfp" +
-                                L";minifilter_npfs=true;file_section_acquire=true;registry_enum_names=true;memory=false;ui=false;hardware_direct=false" +
-                                L";etw=";
+                                L";driver_callbacks=" + callbacks +
+                                L";minifilter_npfs=" + fileState +
+                                L";file_section_acquire=" + fileState +
+                                L";registry_enum_names=" + registryState +
+                                L";memory=false;ui=false;hardware_direct=false";
+        if (!startCoverageSupported) manifest += L";driver_registration=unknown";
+        manifest += L";etw=";
         manifest += (enableEtw ? L"wmi,dns,rpc" : L"disabled");
         manifest += L";etw_level=verbose;payload_mode=";
         manifest += capturePayloads ? L"full" : L"metadata";

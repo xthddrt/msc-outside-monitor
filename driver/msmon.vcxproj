@@ -27,7 +27,7 @@
   <PropertyGroup><OutDir>$(SolutionDir)build\$(Configuration)\driver\</OutDir><IntDir>$(SolutionDir)build\obj\driver\$(Configuration)\</IntDir><TargetName>msmon</TargetName></PropertyGroup>
   <ItemDefinitionGroup>
     <ClCompile><WarningLevel>Level4</WarningLevel><TreatWarningAsError>true</TreatWarningAsError><PreprocessorDefinitions>_AMD64_;POOL_NX_OPTIN=1;%(PreprocessorDefinitions)</PreprocessorDefinitions></ClCompile>
-    <Link><AdditionalDependencies>ntoskrnl.lib;fltmgr.lib;fwpkclnt.lib;Wdmsec.lib;aux_klib.lib;uuid.lib;%(AdditionalDependencies)</AdditionalDependencies></Link>
+    <Link><AdditionalDependencies>ntoskrnl.lib;fltmgr.lib;fwpkclnt.lib;Wdmsec.lib;aux_klib.lib;uuid.lib;%(AdditionalDependencies)</AdditionalDependencies><AdditionalOptions>/INTEGRITYCHECK %(AdditionalOptions)</AdditionalOptions></Link>
     <DriverSign><SignMode>Off</SignMode></DriverSign>
   </ItemDefinitionGroup>
   <ItemGroup>

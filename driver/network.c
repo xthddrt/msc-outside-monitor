@@ -377,6 +377,7 @@ static NTSTATUS MsMonAddCallout(
     managerCallout.calloutKey = MSMON_CALLOUT_KEYS[Index];
     managerCallout.displayData.name = (PWSTR)Name;
     managerCallout.displayData.description = (PWSTR)L"MapleStory application network metadata monitor";
+    managerCallout.applicableLayer = *LayerKey;
     managerCallout.calloutId = gCalloutIds[Index];
     status = FwpmCalloutAdd(gEngine, &managerCallout, NULL, NULL);
     if (!NT_SUCCESS(status)) return status;
