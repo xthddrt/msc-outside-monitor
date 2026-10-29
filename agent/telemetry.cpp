@@ -6,6 +6,13 @@
 #include <set>
 #include <sstream>
 
+static bool gDecodedFields = true;
+
+void SetDecodedFields(bool enabled)
+{
+    gDecodedFields = enabled;
+}
+
 void ProcessScope::AddProcess(DWORD pid, uint64_t startTime, const std::wstring& path)
 {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -188,6 +195,7 @@ std::string EventTypeName(unsigned long type)
     case MsMonEtwRpc: return "etw_rpc";
     case MsMonEtwUnattributed: return "etw_unattributed";
     case MsMonCoverage: return "coverage";
+    case MsMonCoverageUsage: return "coverage_usage";
     default: return "unknown";
     }
 }
@@ -264,6 +272,155 @@ std::string Sha256(const std::string& input)
     return hex.str();
 }
 
+static std::string HexDigest(const unsigned char* digest, size_t size)
+{
+    std::ostringstream hex;
+    hex << std::hex << std::setfill('0');
+    for (size_t index = 0; index < size; index++) hex << std::setw(2) << static_cast<unsigned>(digest[index]);
+    return hex.str();
+}
+
+std::string Sha256Bytes(const void* data, size_t size)
+{
+    BCRYPT_ALG_HANDLE algorithm = nullptr;
+    BCRYPT_HASH_HANDLE hash = nullptr;
+    DWORD objectSize = 0;
+    DWORD resultSize = 0;
+    std::vector<unsigned char> object;
+    unsigned char digest[32];
+    if (BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0) != 0) return {};
+    if (BCryptGetProperty(algorithm, BCRYPT_OBJECT_LENGTH, reinterpret_cast<PUCHAR>(&objectSize),
+                          sizeof(objectSize), &resultSize, 0) != 0) {
+        BCryptCloseAlgorithmProvider(algorithm, 0);
+        return {};
+    }
+    object.resize(objectSize);
+    if (BCryptCreateHash(algorithm, &hash, object.data(), objectSize, nullptr, 0, 0) != 0 ||
+        BCryptHashData(hash, reinterpret_cast<PUCHAR>(const_cast<void*>(data)),
+                       static_cast<ULONG>(size), 0) != 0 ||
+        BCryptFinishHash(hash, digest, sizeof(digest), 0) != 0) {
+        if (hash != nullptr) BCryptDestroyHash(hash);
+        BCryptCloseAlgorithmProvider(algorithm, 0);
+        return {};
+    }
+    BCryptDestroyHash(hash);
+    BCryptCloseAlgorithmProvider(algorithm, 0);
+    return HexDigest(digest, sizeof(digest));
+}
+
+std::string Sha256File(const std::wstring& path)
+{
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                              nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return {};
+    BCRYPT_ALG_HANDLE algorithm = nullptr;
+    BCRYPT_HASH_HANDLE hash = nullptr;
+    DWORD objectSize = 0;
+    DWORD resultSize = 0;
+    std::vector<unsigned char> object;
+    unsigned char digest[32];
+    std::vector<unsigned char> buffer(1u << 20);
+    std::string result;
+    if (BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0) == 0 &&
+        BCryptGetProperty(algorithm, BCRYPT_OBJECT_LENGTH, reinterpret_cast<PUCHAR>(&objectSize),
+                          sizeof(objectSize), &resultSize, 0) == 0) {
+        object.resize(objectSize);
+        if (BCryptCreateHash(algorithm, &hash, object.data(), objectSize, nullptr, 0, 0) == 0) {
+            bool ok = true;
+            for (;;) {
+                DWORD read = 0;
+                if (!ReadFile(file, buffer.data(), static_cast<DWORD>(buffer.size()), &read, nullptr)) {
+                    ok = false;
+                    break;
+                }
+                if (read == 0) break;
+                if (BCryptHashData(hash, buffer.data(), read, 0) != 0) {
+                    ok = false;
+                    break;
+                }
+            }
+            if (ok && BCryptFinishHash(hash, digest, sizeof(digest), 0) == 0) {
+                result = HexDigest(digest, sizeof(digest));
+            }
+            BCryptDestroyHash(hash);
+        }
+    }
+    if (algorithm != nullptr) BCryptCloseAlgorithmProvider(algorithm, 0);
+    CloseHandle(file);
+    return result;
+}
+
+std::string StatusName(long status)
+{
+    struct Entry { unsigned long code; const char* name; };
+    static const Entry entries[] = {
+        {0x00000000, "STATUS_SUCCESS"},
+        {0x00000103, "STATUS_PENDING"},
+        {0x80000005, "STATUS_BUFFER_OVERFLOW"},
+        {0x80000006, "STATUS_NO_MORE_FILES"},
+        {0xC0000023, "STATUS_BUFFER_TOO_SMALL"},
+        {0x8000001A, "STATUS_NO_MORE_ENTRIES"},
+        {0xC000000F, "STATUS_NO_SUCH_FILE"},
+        {0xC0000022, "STATUS_ACCESS_DENIED"},
+        {0xC0000033, "STATUS_OBJECT_NAME_INVALID"},
+        {0xC0000034, "STATUS_OBJECT_NAME_NOT_FOUND"},
+        {0xC0000035, "STATUS_OBJECT_NAME_COLLISION"},
+        {0xC0000056, "STATUS_DELETE_PENDING"},
+        {0xC00000BA, "STATUS_FILE_IS_A_DIRECTORY"},
+        {0xC0000101, "STATUS_DIRECTORY_NOT_EMPTY"},
+        {0xC0000225, "STATUS_NOT_FOUND"},
+        {0xC00000CC, "STATUS_BAD_NETWORK_NAME"},
+    };
+    for (const auto& entry : entries) {
+        if (entry.code == static_cast<unsigned long>(status)) return entry.name;
+    }
+    return {};
+}
+
+std::string StatusHex(long status)
+{
+    char buffer[16];
+    snprintf(buffer, sizeof(buffer), "0x%08X", static_cast<unsigned long>(status));
+    return buffer;
+}
+
+std::string FlagsNames(unsigned long flags)
+{
+    struct Entry { unsigned long bit; const char* name; };
+    static const Entry entries[] = {
+        {MsMonFlagExplicitTrack, "explicit_track"},
+        {MsMonFlagInheritedTrack, "inherited_track"},
+        {MsMonFlagTruncatedPath, "truncated_path"},
+        {MsMonFlagMissingPath, "missing_path"},
+        {MsMonFlagServiceCorrelated, "service_correlated"},
+        {MsMonFlagObserverRecord, "observer_record"},
+        {MsMonFlagPayloadPresent, "payload_present"},
+        {MsMonFlagPayloadUnavailable, "payload_unavailable"},
+        {MsMonFlagPayloadFinalChunk, "payload_final_chunk"},
+        {MsMonFlagPayloadInput, "payload_input"},
+        {MsMonFlagPayloadPartial, "payload_partial"},
+    };
+    std::string output = "[";
+    bool first = true;
+    for (const auto& entry : entries) {
+        if ((flags & entry.bit) == 0) continue;
+        if (!first) output += ",";
+        first = false;
+        output += "\"";
+        output += entry.name;
+        output += "\"";
+    }
+    output += "]";
+    return output;
+}
+
+std::string DesiredAccessHex(unsigned long access)
+{
+    char buffer[16];
+    snprintf(buffer, sizeof(buffer), "0x%08X", access);
+    return buffer;
+}
+
 JsonlWriter::JsonlWriter(std::filesystem::path basePath, uint64_t maximumBytes)
     : basePath_(std::move(basePath)), maximumBytes_(maximumBytes), chain_(64, '0') {}
 
@@ -292,6 +449,7 @@ bool JsonlWriter::Write(const std::string& json)
     std::string line = indexed.substr(0, indexed.size() - 1) + ",\"chain\":\"" + chain_ + "\"}\n";
     stream_.write(line.data(), static_cast<std::streamsize>(line.size()));
     bytes_ += line.size();
+    totalBytes_ += line.size();
     return static_cast<bool>(stream_);
 }
 
@@ -406,8 +564,11 @@ static void AppendDecodedValue(std::ostringstream& json, const TelemetryEvent& e
 std::string TelemetryJson(const TelemetryEvent& event)
 {
     const auto& header = event.header;
+    const std::string statusName = StatusName(header.Status);
+    const std::string statusText = statusName.empty() ? StatusHex(header.Status) : statusName;
     std::ostringstream json;
     json << "{\"protocol\":" << header.Version
+         << ",\"schema_version\":1"
          << ",\"source\":\"" << JsonEscape(event.source)
          << "\",\"sequence\":" << header.Sequence
          << ",\"timestamp\":\"" << Timestamp(header.Timestamp)
@@ -421,10 +582,14 @@ std::string TelemetryJson(const TelemetryEvent& event)
          << ",\"thread_id\":" << header.ThreadId
          << ",\"target_process_id\":" << header.TargetProcessId
          << ",\"target_process_start_time\":" << header.TargetProcessStartTime
-         << ",\"flags\":" << header.Flags
-         << ",\"status\":" << static_cast<int32_t>(header.Status)
-         << ",\"desired_access\":" << header.DesiredAccess
-         << ",\"category\":\"" << CategoryName(header.Category)
+         << ",\"flags\":" << header.Flags;
+    if (gDecodedFields) json << ",\"flags_names\":" << FlagsNames(header.Flags);
+    json << ",\"status\":" << static_cast<int32_t>(header.Status)
+         << ",\"status_name\":\"" << JsonEscape(statusText) << "\""
+         << ",\"status_hex\":\"" << StatusHex(header.Status) << "\""
+         << ",\"desired_access\":" << header.DesiredAccess;
+    if (gDecodedFields) json << ",\"desired_access_hex\":\"" << DesiredAccessHex(header.DesiredAccess) << "\"";
+    json << ",\"category\":\"" << CategoryName(header.Category)
          << "\",\"outside_client\":" << (event.outsideClient ? "true" : "false")
          << ",\"attribution\":\"" << AttributionName(header.Attribution)
          << "\",\"value0\":" << header.Value0

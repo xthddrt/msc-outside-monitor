@@ -22,6 +22,7 @@ typedef struct _MSMON_EVENT_QUEUE {
 
 static MSMON_EVENT_QUEUE gQueue;
 static BOOLEAN gQueueInitialized;
+static MSMON_COVERAGE gCoverage;
 
 /* Upper bound on chunks emitted for one payload operation (8 MiB). */
 #define MSMON_MAX_PAYLOAD_CHUNKS 1024u
@@ -86,6 +87,7 @@ NTSTATUS MsMonEventsStart(ULONGLONG SessionId, ULONG QueueRecords, ULONG QueueBy
     gQueue.QueueByteLimit = QueueBytes;
     gQueue.PayloadEnabled = PayloadMode != 0;
     KeReleaseSpinLock(&gQueue.Lock, oldIrql);
+    MsMonCoverageReset(SessionId);
     return STATUS_SUCCESS;
 }
 
@@ -128,6 +130,96 @@ VOID MsMonEventsNoteDropped(VOID)
     KeReleaseSpinLock(&gQueue.Lock, oldIrql);
 }
 
+static VOID MsMonCoverageEventAttempt(ULONG Type)
+{
+    if (Type < MSMON_EVENT_SLOTS) {
+        InterlockedIncrement64((volatile LONG64*)&gCoverage.EventAttempted[Type]);
+    }
+}
+
+static VOID MsMonCoverageEventDrop(ULONG Type)
+{
+    if (Type < MSMON_EVENT_SLOTS) {
+        InterlockedIncrement64((volatile LONG64*)&gCoverage.EventDropped[Type]);
+    }
+}
+
+VOID MsMonCoverageReset(ULONGLONG SessionId)
+{
+    /*
+     * Registration happens once at load, so RegistrationOk/Failed/Status are
+     * deliberately kept: the coverage report is read after a session, and
+     * clearing them here would report every registration as never attempted.
+     */
+    RtlZeroMemory(gCoverage.EventAttempted, sizeof(gCoverage.EventAttempted));
+    RtlZeroMemory(gCoverage.EventDropped, sizeof(gCoverage.EventDropped));
+    RtlZeroMemory(gCoverage.SensorEntered, sizeof(gCoverage.SensorEntered));
+    RtlZeroMemory(gCoverage.SensorLogged, sizeof(gCoverage.SensorLogged));
+    RtlZeroMemory(gCoverage.PayloadCaptured, sizeof(gCoverage.PayloadCaptured));
+    gCoverage.SkipUntracked = 0;
+    gCoverage.SkipIrql = 0;
+    gCoverage.SkipNoName = 0;
+    gCoverage.AllocFailures = 0;
+    gCoverage.TrackFailures = 0;
+    gCoverage.QueueDrops = 0;
+    gCoverage.BlackCatMatches = 0;
+    gCoverage.Version = MSMON_COVERAGE_VERSION;
+    gCoverage.Size = sizeof(gCoverage);
+    gCoverage.SessionId = SessionId;
+}
+
+VOID MsMonCoverageEnter(ULONG SensorId)
+{
+    if (SensorId < MSMON_SENSOR_SLOTS) {
+        InterlockedIncrement64((volatile LONG64*)&gCoverage.SensorEntered[SensorId]);
+    }
+}
+
+VOID MsMonCoverageLogged(ULONG SensorId)
+{
+    if (SensorId < MSMON_SENSOR_SLOTS) {
+        InterlockedIncrement64((volatile LONG64*)&gCoverage.SensorLogged[SensorId]);
+    }
+}
+
+VOID MsMonCoverageSkip(MSMON_SKIP_REASON Reason)
+{
+    switch (Reason) {
+    case MSMON_SKIP_UNTRACKED: InterlockedIncrement64((volatile LONG64*)&gCoverage.SkipUntracked); break;
+    case MSMON_SKIP_IRQL: InterlockedIncrement64((volatile LONG64*)&gCoverage.SkipIrql); break;
+    case MSMON_SKIP_NO_NAME: InterlockedIncrement64((volatile LONG64*)&gCoverage.SkipNoName); break;
+    case MSMON_SKIP_ALLOC: InterlockedIncrement64((volatile LONG64*)&gCoverage.AllocFailures); break;
+    case MSMON_SKIP_TRACK: InterlockedIncrement64((volatile LONG64*)&gCoverage.TrackFailures); break;
+    case MSMON_SKIP_QUEUE: InterlockedIncrement64((volatile LONG64*)&gCoverage.QueueDrops); break;
+    default: break;
+    }
+}
+
+VOID MsMonCoverageRegister(ULONG SensorId, NTSTATUS Status)
+{
+    if (SensorId >= MSMON_SENSOR_SLOTS) return;
+    if (NT_SUCCESS(Status)) {
+        InterlockedOr64((volatile LONG64*)&gCoverage.RegistrationOk, (LONG64)(1ull << SensorId));
+        gCoverage.RegistrationStatus[SensorId] = 0;
+    } else {
+        InterlockedOr64((volatile LONG64*)&gCoverage.RegistrationFailed, (LONG64)(1ull << SensorId));
+        gCoverage.RegistrationStatus[SensorId] = Status;
+    }
+}
+
+VOID MsMonCoverageBlackCatMatch(VOID)
+{
+    InterlockedIncrement64((volatile LONG64*)&gCoverage.BlackCatMatches);
+}
+
+VOID MsMonGetCoverage(PMSMON_COVERAGE Coverage)
+{
+    if (Coverage == NULL) return;
+    RtlCopyMemory(Coverage, &gCoverage, sizeof(gCoverage));
+    Coverage->Version = MSMON_COVERAGE_VERSION;
+    Coverage->Size = sizeof(gCoverage);
+}
+
 ULONGLONG MsMonNextOperationId(VOID)
 {
     return (ULONGLONG)InterlockedIncrement64((volatile LONG64*)&gQueue.OperationId);
@@ -159,13 +251,20 @@ static NTSTATUS MsMonLogEventInternal(
     ULONG allocationBytes = sizeof(LIST_ENTRY) + recordBytes;
     PWSTR destination;
 
+    MsMonCoverageEventAttempt(Type);
     if (recordBytes > MSMON_MAX_EVENT_RECORD_BYTES ||
         (Payload != NULL && Payload->ByteCount != 0 && Payload->Data == NULL)) {
+        MsMonCoverageEventDrop(Type);
         return STATUS_INVALID_PARAMETER;
     }
-    if (!gQueueInitialized) return STATUS_DEVICE_NOT_READY;
+    if (!gQueueInitialized) {
+        MsMonCoverageEventDrop(Type);
+        return STATUS_DEVICE_NOT_READY;
+    }
     block = ExAllocatePool2(POOL_FLAG_NON_PAGED, allocationBytes, MSMON_POOL_TAG);
     if (block == NULL) {
+        MsMonCoverageEventDrop(Type);
+        MsMonCoverageSkip(MSMON_SKIP_ALLOC);
         KeAcquireSpinLock(&gQueue.Lock, &oldIrql);
         if (gQueue.SessionId != 0) gQueue.Sequence++;
         InterlockedIncrement64(&gQueue.Dropped);
@@ -234,6 +333,7 @@ static NTSTATUS MsMonLogEventInternal(
     if (gQueue.SessionId == 0) {
         KeReleaseSpinLock(&gQueue.Lock, oldIrql);
         ExFreePoolWithTag(block, MSMON_POOL_TAG);
+        MsMonCoverageEventDrop(Type);
         return STATUS_DEVICE_NOT_READY;
     }
     block->Event.SessionId = gQueue.SessionId;
@@ -243,6 +343,8 @@ static NTSTATUS MsMonLogEventInternal(
         InterlockedIncrement64(&gQueue.Dropped);
         KeReleaseSpinLock(&gQueue.Lock, oldIrql);
         ExFreePoolWithTag(block, MSMON_POOL_TAG);
+        MsMonCoverageEventDrop(Type);
+        MsMonCoverageSkip(MSMON_SKIP_QUEUE);
         return STATUS_QUOTA_EXCEEDED;
     }
     InsertTailList(&gQueue.Head, &block->Link);
@@ -250,6 +352,9 @@ static NTSTATUS MsMonLogEventInternal(
     InterlockedAdd64(&gQueue.QueuedBytes, recordBytes);
     KeSetEvent(&gQueue.DataAvailable, IO_NO_INCREMENT, FALSE);
     KeReleaseSpinLock(&gQueue.Lock, oldIrql);
+    if (Payload != NULL && Payload->Kind < RTL_NUMBER_OF(gCoverage.PayloadCaptured)) {
+        InterlockedIncrement64((volatile LONG64*)&gCoverage.PayloadCaptured[Payload->Kind]);
+    }
     return STATUS_SUCCESS;
 }
 

@@ -8,6 +8,12 @@
 #include <fwpmk.h>
 #include <ntstrsafe.h>
 #include "../include/msmon_protocol.h"
+#include "../include/msmon_coverage.h"
+
+VOID MsMonCoverageEnter(ULONG SensorId);
+VOID MsMonCoverageLogged(ULONG SensorId);
+VOID MsMonCoverageSkip(MSMON_SKIP_REASON Reason);
+VOID MsMonCoverageRegister(ULONG SensorId, NTSTATUS Status);
 
 #define MSMON_POOL_TAG 'noSM'
 #define MSMON_CALLOUT_COUNT 6
@@ -242,13 +248,17 @@ static VOID NTAPI MsMonWfpClassify(
     UNREFERENCED_PARAMETER(LayerData);
     UNREFERENCED_PARAMETER(ClassifyContext);
     UNREFERENCED_PARAMETER(FlowContext);
+    MsMonCoverageEnter(MSMON_SENSOR_WFP_CLASSIFY);
     if (ClassifyOut == NULL) return;
     index = Filter != NULL ? MsMonCalloutIndex(Filter) : MSMON_CALLOUT_COUNT;
     do {
         if (index >= MSMON_CALLOUT_COUNT || InFixedValues == NULL || InMetaValues == NULL) break;
         if ((InMetaValues->currentMetadataValues & FWPS_METADATA_FIELD_PROCESS_ID) == 0) break;
         if (!MsMonIsTracked(UlongToHandle((ULONG)InMetaValues->processId), 0) &&
-            !MsMonCurrentIsBlackCat()) break;
+            !MsMonCurrentIsBlackCat()) {
+            MsMonCoverageSkip(MSMON_SKIP_UNTRACKED);
+            break;
+        }
         MsMonSelectFields(index, &localAddressField, &remoteAddressField,
                           &localPortField, &remotePortField, &protocolField);
         /*
@@ -292,6 +302,7 @@ static VOID NTAPI MsMonWfpClassify(
         }
         MsMonLogNetwork(type, UlongToHandle((ULONG)InMetaValues->processId), flowId,
                         protocol, localPort, remotePort, endpoints, direction);
+        MsMonCoverageLogged(MSMON_SENSOR_WFP_CLASSIFY);
         if (index >= 4 && FlowContext == 0) {
             MsMonAssociateFlow(InFixedValues, InMetaValues, index, flowId,
                                protocol, localPort, remotePort, endpoints);
@@ -311,6 +322,7 @@ static NTSTATUS NTAPI MsMonWfpNotify(
     UNREFERENCED_PARAMETER(NotifyType);
     UNREFERENCED_PARAMETER(FilterKey);
     UNREFERENCED_PARAMETER(Filter);
+    MsMonCoverageEnter(MSMON_SENSOR_WFP_NOTIFY);
     return STATUS_SUCCESS;
 }
 
@@ -408,10 +420,12 @@ NTSTATUS MsMonNetworkInitialize(PDEVICE_OBJECT DeviceObject)
     session.displayData.description = (PWSTR)L"Passive application network monitoring";
     session.flags = FWPM_SESSION_FLAG_DYNAMIC;
     status = FwpmEngineOpen(NULL, RPC_C_AUTHN_WINNT, NULL, &session, &gEngine);
+    MsMonCoverageRegister(MSMON_SENSOR_REG_WFP_ENGINE, status);
     if (!NT_SUCCESS(status)) return status;
 
     for (index = 0; index < MSMON_CALLOUT_COUNT; index++) {
         status = MsMonAddCallout(DeviceObject, index, layers[index], names[index]);
+        MsMonCoverageRegister(MSMON_SENSOR_REG_WFP_0 + index, status);
         gNetworkLayerStatus[index] = status;
         if (NT_SUCCESS(status)) {
             gNetworkLayerMask |= 1u << index;

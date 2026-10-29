@@ -287,6 +287,9 @@ void EtwCollector::Emit(TelemetryEvent&& event)
      */
     std::lock_guard<std::mutex> lock(emitMutex_);
     event.header.Sequence = sequence_.fetch_add(1) + 1;
+    if (event.header.Type >= MsMonEtwWmi && event.header.Type <= MsMonEtwRpc) {
+        emitted_[event.header.Type - MsMonEtwWmi].fetch_add(1);
+    }
     queue_.Push(std::move(event));
 }
 
@@ -302,6 +305,7 @@ void EtwCollector::OnRecord(PEVENT_RECORD record)
     } else {
         return;
     }
+    received_[type - MsMonEtwWmi].fetch_add(1);
 
     ULONG infoSize = 0;
     (void)TdhGetEventInformation(record, 0, nullptr, nullptr, &infoSize);
@@ -315,6 +319,7 @@ void EtwCollector::OnRecord(PEVENT_RECORD record)
         parseFailures_.fetch_add(1);
         return;
     }
+    parsed_[type - MsMonEtwWmi].fetch_add(1);
 
     DWORD nativePid = record->EventHeader.ProcessId;
     DWORD attributedPid = nativePid;
@@ -413,6 +418,7 @@ void EtwCollector::OnRecord(PEVENT_RECORD record)
             pendingOverflow_.fetch_add(1);
         }
         pending_.push_back({ std::move(event), deadline });
+        deferred_[type - MsMonEtwWmi].fetch_add(1);
         return;
     }
 
@@ -457,6 +463,9 @@ void EtwCollector::ExpirePending(uint64_t nowTick)
         }
     }
     for (auto& original : expired) {
+        if (original.header.Type >= MsMonEtwWmi && original.header.Type <= MsMonEtwRpc) {
+            expired_[original.header.Type - MsMonEtwWmi].fetch_add(1);
+        }
         TelemetryEvent event;
         event.source = "etw";
         event.header.Size = sizeof(event.header);

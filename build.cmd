@@ -20,8 +20,19 @@ if not defined MSBUILD (
 )
 "%MSBUILD%" "%~dp0ms-monitor.sln" /m /p:Configuration=Release /p:Platform=x64
 if errorlevel 1 exit /b 1
+where powershell >nul 2>nul
+if not errorlevel 1 (
+  powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0tools\write_build_info.ps1" -Root "%~dp0."
+  if errorlevel 1 echo [warn] build-info.json was not written
+)
 if /I "%~1"=="--with-compat" (
   call "%~dp0compat\build.cmd"
   if errorlevel 1 exit /b 1
+)
+for %%a in (%*) do (
+  if /I "%%a"=="--with-fixtures" (
+    call "%~dp0tests\fixtures\build.cmd"
+    if errorlevel 1 exit /b 1
+  )
 )
 exit /b 0

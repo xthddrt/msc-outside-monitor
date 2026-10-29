@@ -131,6 +131,7 @@ BOOLEAN MsMonCurrentIsBlackCat(VOID)
     USHORT index;
     KIRQL oldIrql;
 
+    MsMonCoverageEnter(MSMON_SENSOR_BLACKCAT_CHECK);
     KeAcquireSpinLock(&gAttributionLock, &oldIrql);
     base = gBlackCatBase;
     size = gBlackCatSize;
@@ -139,7 +140,10 @@ BOOLEAN MsMonCurrentIsBlackCat(VOID)
     count = RtlCaptureStackBackTrace(1, RTL_NUMBER_OF(frames), frames, NULL);
     for (index = 0; index < count; index++) {
         ULONG_PTR address = (ULONG_PTR)frames[index];
-        if (address >= base && address - base < size) return TRUE;
+        if (address >= base && address - base < size) {
+            MsMonCoverageBlackCatMatch();
+            return TRUE;
+        }
     }
     return FALSE;
 }

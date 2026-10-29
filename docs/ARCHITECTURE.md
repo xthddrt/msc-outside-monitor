@@ -8,6 +8,10 @@ The driver assigns session, source-sequence, and operation IDs and queues record
 
 A single agent writer assigns consecutive record indexes and chains every JSON object with SHA-256. Rotated files continue the chain. Payloads are Base64 encoded, and complete operations can be reconstructed in chunk order. Friendly decodings are provided only when the entire value is present in one chunk. The chain detects later modification only when the trusted final hash is retained separately.
 
+The agent writes an immutable session bundle when `--log-dir` is used: events, summary, coverage, metadata, environment, notes, a manifest of parts/hashes, and checksums. The session UUID is separate from the 64-bit binary session ID; event identity is `(session_uuid, source, sequence)`. The field dictionary is `docs/LOG_SCHEMA.md`; bundle/transfer rules are `docs/STORAGE.md`.
+
+The driver exposes `MSMON_IOCTL_COVERAGE` with per-event-type attempted/dropped counters, per-callback entered/logged counters, skip reasons, and registration status for each init call. The agent writes `coverage.json` and a chained `coverage_usage` record. This is execution evidence, not proof of correctness; `docs/COVERAGE.md` defines the activity/health/verification model.
+
 ## Process scope and identity
 
 The collector translates the configured DOS **scope root** to an NT device path. `--client` names the installation/classification root; if the executable is in an `appdata` child, the agent auto-detects that child as the scope root. `--scope-root` overrides it explicitly. The driver tracks any executable image beneath the scope root, not a hard-coded filename list; this includes PE payloads with non-`.exe` extensions such as the GRAP `.aes` images. Children of tracked processes inherit tracking, including processes created while BlackCat is on the stack. At startup, the collector resolves full image paths and creation times, then registers matching processes and descendants iteratively. Explicit `--pid` scope is separate. PID + creation time is the intended process key; PID-only metadata still has weaker identity during PID reuse.

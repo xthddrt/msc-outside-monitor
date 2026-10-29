@@ -109,8 +109,12 @@ static PFLT_FILE_NAME_INFORMATION MsMonAcquireName(PFLT_CALLBACK_DATA Data, ULON
      * instead of letting the filter manager query the file system at a raised
      * IRQL.
      */
-    if (KeGetCurrentIrql() > APC_LEVEL) return NULL;
+    if (KeGetCurrentIrql() > APC_LEVEL) {
+        MsMonCoverageSkip(MSMON_SKIP_IRQL);
+        return NULL;
+    }
     if (!NT_SUCCESS(FltGetFileNameInformation(Data, FLT_FILE_NAME_NORMALIZED | QueryFlags, &nameInfo))) {
+        MsMonCoverageSkip(MSMON_SKIP_NO_NAME);
         return NULL;
     }
     return nameInfo;
@@ -130,10 +134,14 @@ static PMSMon_FILE_CONTEXT MsMonCreateFileContext(PFLT_CALLBACK_DATA Data, ULONG
     requestorId = FltGetRequestorProcessId(Data);
     if (requestorId == 0) requestorId = HandleToUlong(PsGetCurrentProcessId());
     requestor = UlongToHandle(requestorId);
-    if (!MsMonIsTracked(requestor, 0) && !MsMonCurrentIsBlackCat()) return NULL;
+    if (!MsMonIsTracked(requestor, 0) && !MsMonCurrentIsBlackCat()) {
+        MsMonCoverageSkip(MSMON_SKIP_UNTRACKED);
+        return NULL;
+    }
 
     context = ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(*context), MSMON_POOL_TAG);
     if (context == NULL) {
+        MsMonCoverageSkip(MSMON_SKIP_ALLOC);
         MsMonEventsNoteDropped();
         return NULL;
     }
@@ -164,6 +172,7 @@ static FLT_PREOP_CALLBACK_STATUS MsMonPreCreate(
     PMSMon_FILE_CONTEXT context;
     UNREFERENCED_PARAMETER(FltObjects);
     *CompletionContext = NULL;
+    MsMonCoverageEnter(MSMON_SENSOR_FILE_PRE_CREATE);
 
     context = MsMonCreateFileContext(Data, FLT_FILE_NAME_QUERY_DEFAULT);
     if (context == NULL) return FLT_PREOP_SUCCESS_NO_CALLBACK;
@@ -195,6 +204,7 @@ static FLT_PREOP_CALLBACK_STATUS MsMonPreOperation(
     ULONG queryFlags;
     UNREFERENCED_PARAMETER(FltObjects);
     *CompletionContext = NULL;
+    MsMonCoverageEnter(MSMON_SENSOR_FILE_PRE_OP);
 
     /*
      * Section acquisition runs in the memory-manager path.  Even though a name
@@ -328,6 +338,7 @@ static FLT_POSTOP_CALLBACK_STATUS MsMonPostOperation(
                                 MsMonFileCategory(path), MsMonEventValue(Data, FALSE),
                                 MsMonEventValue(Data, TRUE), path, NULL);
         }
+        MsMonCoverageLogged(MSMON_SENSOR_FILE_POST_OP);
     }
     MsMonFreeFileContext(context);
     return FLT_POSTOP_FINISHED_PROCESSING;
@@ -371,6 +382,7 @@ static FLT_POSTOP_CALLBACK_STATUS MsMonPostCreate(
                             NULL, 0, path == NULL ? MsMonFlagMissingPath : 0, Data->IoStatus.Status,
                             context->DesiredAccess, MsMonFileCategory(path),
                             options, Data->IoStatus.Information, path, NULL);
+        MsMonCoverageLogged(MSMON_SENSOR_FILE_POST_CREATE);
     }
     if (tunneled != NULL) FltReleaseFileNameInformation(tunneled);
     MsMonFreeFileContext(context);
@@ -422,8 +434,10 @@ static const FLT_REGISTRATION gFilterRegistration = {
 NTSTATUS MsMonFileFilterInitialize(PDRIVER_OBJECT DriverObject)
 {
     NTSTATUS status = FltRegisterFilter(DriverObject, &gFilterRegistration, &gFilter);
+    MsMonCoverageRegister(MSMON_SENSOR_REG_FILTER_REGISTER, status);
     if (!NT_SUCCESS(status)) return status;
     status = FltStartFiltering(gFilter);
+    MsMonCoverageRegister(MSMON_SENSOR_REG_FILTER_START, status);
     if (!NT_SUCCESS(status)) {
         FltUnregisterFilter(gFilter);
         gFilter = NULL;

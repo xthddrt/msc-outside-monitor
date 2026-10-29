@@ -383,6 +383,7 @@ static NTSTATUS MsMonRegistryCallback(PVOID CallbackContext, PVOID Argument1, PV
     ULONGLONG value1 = 0;
 
     UNREFERENCED_PARAMETER(CallbackContext);
+    MsMonCoverageEnter(MSMON_SENSOR_REGISTRY_CALLBACK);
     if (MsMonIsPostOperation(operation)) {
         PREG_POST_OPERATION_INFORMATION post = (PREG_POST_OPERATION_INFORMATION)Argument2;
         context = (PMSMON_REGISTRY_CONTEXT)post->CallContext;
@@ -394,10 +395,14 @@ static NTSTATUS MsMonRegistryCallback(PVOID CallbackContext, PVOID Argument1, PV
         } else {
             MsMonRegistryMetadata(context, post->Status);
         }
+        MsMonCoverageLogged(MSMON_SENSOR_REGISTRY_CALLBACK);
         ExFreePoolWithTag(context, MSMON_POOL_TAG);
         return STATUS_SUCCESS;
     }
-    if (!MsMonIsTracked(PsGetCurrentProcessId(), 0) && !MsMonCurrentIsBlackCat()) return STATUS_SUCCESS;
+    if (!MsMonIsTracked(PsGetCurrentProcessId(), 0) && !MsMonCurrentIsBlackCat()) {
+        MsMonCoverageSkip(MSMON_SKIP_UNTRACKED);
+        return STATUS_SUCCESS;
+    }
 
     switch (operation) {
     case RegNtPreOpenKeyEx:
@@ -481,6 +486,7 @@ static NTSTATUS MsMonRegistryCallback(PVOID CallbackContext, PVOID Argument1, PV
 
     context = MsMonCreateContext(type, path, detail, value0, value1, desiredAccess);
     if (context == NULL) {
+        MsMonCoverageSkip(MSMON_SKIP_ALLOC);
         MsMonEventsNoteDropped();
         return STATUS_SUCCESS;
     }
@@ -515,6 +521,7 @@ NTSTATUS MsMonRegistryInitialize(PDRIVER_OBJECT DriverObject)
     status = CmRegisterCallbackEx(MsMonRegistryCallback, &altitude, DriverObject,
                                   NULL, &gRegistryCookie, NULL);
     gRegistryRegistered = NT_SUCCESS(status);
+    MsMonCoverageRegister(MSMON_SENSOR_REG_REGISTRY, status);
     return status;
 }
 

@@ -82,6 +82,7 @@ static NTSTATUS MsMonDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
     if (!ExAcquireRundownProtection(&gIoRundown)) {
         return MsMonCompleteIrp(Irp, STATUS_DELETE_PENDING, 0);
     }
+    MsMonCoverageEnter(MSMON_SENSOR_IOCTL_DISPATCH);
     switch (code) {
     case MSMON_IOCTL_START_SESSION:
         if (inputLength < sizeof(MSMON_SESSION_CONFIG)) {
@@ -141,6 +142,15 @@ static NTSTATUS MsMonDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
         }
         MsMonGetStatistics((PMSMON_STATISTICS)Irp->AssociatedIrp.SystemBuffer);
         information = sizeof(MSMON_STATISTICS);
+        status = STATUS_SUCCESS;
+        break;
+    case MSMON_IOCTL_COVERAGE:
+        if (outputLength < sizeof(MSMON_COVERAGE)) {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+        MsMonGetCoverage((PMSMON_COVERAGE)Irp->AssociatedIrp.SystemBuffer);
+        information = sizeof(MSMON_COVERAGE);
         status = STATUS_SUCCESS;
         break;
     default:
@@ -220,6 +230,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     }
 
     status = MsMonAttributionInitialize();
+    MsMonCoverageRegister(MSMON_SENSOR_REG_ATTRIBUTION, status);
     if (!NT_SUCCESS(status)) {
         (VOID)IoDeleteSymbolicLink(&dosName);
         IoDeleteDevice(deviceObject);
