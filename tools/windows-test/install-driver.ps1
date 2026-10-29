@@ -13,7 +13,7 @@ $info = Get-Content (Join-Path $repo 'build\build-info.json') -Raw | ConvertFrom
 if ((Get-FileHash $build -Algorithm SHA256).Hash.ToLower() -ne ([string]$info.driver_sha256).ToLower()) { throw 'Build hash does not match build-info.json; rerun build.cmd.' }
 if ($info.driver_force_integrity -ne $true) { throw 'Build was not linked with /INTEGRITYCHECK; rerun build.cmd.' }
 $signtool = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin' -Recurse -Filter signtool.exe |
-            Where-Object { $_.FullName -match '\x64\' } | Sort-Object FullName -Descending | Select-Object -First 1
+            Where-Object { $_.FullName -match '\\x64\\' } | Sort-Object FullName -Descending | Select-Object -First 1
 if (-not $signtool) { throw 'x64 signtool.exe not found.' }
 $cert = Get-ChildItem Cert:\LocalMachine\My | Where-Object Subject -eq 'CN=msmon test signing' | Sort-Object NotAfter -Descending | Select-Object -First 1
 if (-not $cert) {
