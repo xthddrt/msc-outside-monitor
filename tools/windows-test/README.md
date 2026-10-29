@@ -2,13 +2,13 @@
 
 Local, machine-specific scripts used to load, run and tear down the driver on a
 Windows 11 test host. They are **not** part of the product build and are not portable:
-paths (`C:\Nexon\ms-test`, `C:\msmon-sessions`, this repo) and the test certificate
-names are hardcoded to the machine they were written for. Read `docs/SIGNING_GATE.md`
+the client path (`C:\Nexon\Library\maplestorycw`), `C:\Nexon\ms-test` and
+`C:\msmon-sessions` are hardcoded. The repo path is taken from the script location. Read `docs/SIGNING_GATE.md`
 before expecting handle or network events.
 
 | Script | Purpose |
 |---|---|
-| `install-driver.ps1` | test-sign the build, register the service as a minifilter (altitude 370030, `FltMgr`), start it; stages outside `System32` if the deployment path is not writable |
+| `install-driver.ps1` | first install: create the test certificate if missing, test-sign the build, register the service as a minifilter (altitude 370030, `FltMgr`), start it; stages outside `System32` if the deployment path is not writable |
 | `swap-driver.ps1` | replace a running build with the current one: verify hash against `build/build-info.json`, sign, stop, deploy, start |
 | `start-agent.ps1` | start `msmon-agent.exe` detached with a stop file |
 | `stop-collector.ps1` | create the stop file, wait for a clean drain, print the summary, verify the chain |

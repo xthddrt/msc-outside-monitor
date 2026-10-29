@@ -1,7 +1,7 @@
 # Elevated: probe object-callback and WFP registration with a verified /INTEGRITYCHECK build.
 $ErrorActionPreference = 'Stop'
 function Say($m) { Write-Host $m }
-$repo = 'C:\Users\richa\Documents\Default Project\msc-outside-monitor'
+$repo = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $build = Join-Path $repo 'build\Release\driver\msmon.sys'
 $info = Get-Content (Join-Path $repo 'build\build-info.json') -Raw | ConvertFrom-Json
 $target = Join-Path $env:SystemRoot 'System32\drivers\msmon.sys'

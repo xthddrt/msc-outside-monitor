@@ -1,10 +1,37 @@
-# Elevated: diagnose the write denial, then register the driver (fallback path if needed).
+# Elevated: test-sign the current build, diagnose any write denial, then register the driver (fallback path if needed).
 $ErrorActionPreference = 'Continue'
 function Say($m) { Write-Host $m }
 
 Say "elevated: $(([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator))  user: $env:USERNAME"
 $target = Join-Path $env:SystemRoot 'System32\drivers\msmon.sys'
 $src = Join-Path $env:TEMP 'msmon-sign\msmon.sys'
+$repo = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
+$build = Join-Path $repo 'build\Release\driver\msmon.sys'
+
+Say "== sign current build =="
+$info = Get-Content (Join-Path $repo 'build\build-info.json') -Raw | ConvertFrom-Json
+if ((Get-FileHash $build -Algorithm SHA256).Hash.ToLower() -ne ([string]$info.driver_sha256).ToLower()) { throw 'Build hash does not match build-info.json; rerun build.cmd.' }
+if ($info.driver_force_integrity -ne $true) { throw 'Build was not linked with /INTEGRITYCHECK; rerun build.cmd.' }
+$signtool = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin' -Recurse -Filter signtool.exe |
+            Where-Object { $_.FullName -match '\x64\' } | Sort-Object FullName -Descending | Select-Object -First 1
+if (-not $signtool) { throw 'x64 signtool.exe not found.' }
+$cert = Get-ChildItem Cert:\LocalMachine\My | Where-Object Subject -eq 'CN=msmon test signing' | Sort-Object NotAfter -Descending | Select-Object -First 1
+if (-not $cert) {
+    $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject 'CN=msmon test signing' `
+        -KeyAlgorithm RSA -KeyLength 2048 -HashAlgorithm SHA256 -NotAfter (Get-Date).AddYears(3) `
+        -CertStoreLocation Cert:\LocalMachine\My
+    $cer = Join-Path $env:TEMP 'msmon-test-signing.cer'
+    Export-Certificate -Cert $cert -FilePath $cer -Force | Out-Null
+    foreach ($s in 'Root','TrustedPublisher') { Import-Certificate -FilePath $cer -CertStoreLocation "Cert:\LocalMachine\$s" | Out-Null }
+    Say "created test certificate $($cert.Thumbprint)"
+}
+New-Item -ItemType Directory -Force -Path (Split-Path $src) | Out-Null
+Copy-Item $build $src -Force
+& $signtool.FullName sign /sm /s My /sha1 $cert.Thumbprint /fd sha256 $src | Out-Host
+if ($LASTEXITCODE -ne 0) { throw "signtool failed with exit code $LASTEXITCODE." }
+$signature = Get-AuthenticodeSignature $src
+if ($signature.Status -ne 'Valid') { throw "Signed build signature status is $($signature.Status)." }
+Say "signed $src"
 
 Say "== current destination state =="
 $f = Get-Item $target -ErrorAction SilentlyContinue
