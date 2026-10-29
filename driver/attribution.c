@@ -6,6 +6,7 @@ static ULONG_PTR gBlackCatBase;
 static ULONG gBlackCatSize;
 static BOOLEAN gBlackCatLoaded;
 static BOOLEAN gRefreshCompleted;
+static WCHAR gBlackCatName[64];
 
 NTSTATUS MsMonAttributionInitialize(VOID)
 {
@@ -14,6 +15,7 @@ NTSTATUS MsMonAttributionInitialize(VOID)
     gBlackCatSize = 0;
     gBlackCatLoaded = FALSE;
     gRefreshCompleted = FALSE;
+    gBlackCatName[0] = L'\0';
     return AuxKlibInitialize();
 }
 
@@ -25,6 +27,7 @@ VOID MsMonAttributionStop(VOID)
     gBlackCatSize = 0;
     gBlackCatLoaded = FALSE;
     gRefreshCompleted = FALSE;
+    gBlackCatName[0] = L'\0';
     KeReleaseSpinLock(&gAttributionLock, oldIrql);
 }
 
@@ -33,28 +36,122 @@ static CHAR MsMonLowerChar(CHAR Value)
     return Value >= 'A' && Value <= 'Z' ? Value + ('a' - 'A') : Value;
 }
 
-static BOOLEAN MsMonBlackCatName(PCSTR Path)
+/* BlackCat images are named BlackCat<digits>.sys, for example BlackCat1.sys or BlackCat64.sys. */
+static BOOLEAN MsMonBlackCatBaseName(PCSTR Base)
 {
     static const CHAR prefix[] = "blackcat";
     static const CHAR suffix[] = ".sys";
-    PCSTR base = Path;
     PCSTR cursor;
     ULONG index;
+    for (index = 0; index < ARRAYSIZE(prefix) - 1; index++) {
+        if (Base[index] == '\0' || MsMonLowerChar(Base[index]) != prefix[index]) return FALSE;
+    }
+    cursor = Base + ARRAYSIZE(prefix) - 1;
+    if (*cursor < '0' || *cursor > '9') return FALSE;
+    while (*cursor >= '0' && *cursor <= '9') cursor++;
+    /*
+     * Compare the suffix characters, then require the terminator.  Looping over
+     * ARRAYSIZE(suffix) also visited the terminator, where the '\0' test
+     * returned FALSE, so no name ever matched and BlackCat was never detected.
+     */
+    for (index = 0; index < ARRAYSIZE(suffix) - 1; index++) {
+        if (cursor[index] == '\0' || MsMonLowerChar(cursor[index]) != suffix[index]) return FALSE;
+    }
+    return cursor[ARRAYSIZE(suffix) - 1] == '\0';
+}
+
+static BOOLEAN MsMonBlackCatName(PCSTR Path)
+{
+    PCSTR base = Path;
+    PCSTR cursor;
     if (Path == NULL) return FALSE;
     for (cursor = Path; cursor - Path < AUX_KLIB_MODULE_PATH_LEN && *cursor != '\0'; cursor++) {
         if (*cursor == '\\' || *cursor == '/') base = cursor + 1;
     }
     if (cursor - Path == AUX_KLIB_MODULE_PATH_LEN) return FALSE;
-    for (index = 0; index < ARRAYSIZE(prefix) - 1; index++) {
-        if (base[index] == '\0' || MsMonLowerChar(base[index]) != prefix[index]) return FALSE;
+    return MsMonBlackCatBaseName(base);
+}
+
+/*
+ * Called from the load-image callback for kernel images.  BlackCat's
+ * DriverEntry runs right after this notification, before the agent's
+ * once-per-second refresh would see the module, so record the image range
+ * here to make its first operations attributable.
+ */
+VOID MsMonAttributionNoteImage(PCUNICODE_STRING FullImageName, PVOID ImageBase, SIZE_T ImageSize)
+{
+    CHAR baseName[64];
+    WCHAR wideName[64];
+    WCHAR detail[160];
+    UNICODE_STRING text;
+    UNICODE_STRING detailString;
+    USHORT characters;
+    USHORT start = 0;
+    USHORT length;
+    USHORT index;
+    KIRQL oldIrql;
+
+    if (FullImageName == NULL || FullImageName->Buffer == NULL || ImageBase == NULL ||
+        ImageSize == 0 || ImageSize > MAXULONG) return;
+    characters = (USHORT)(FullImageName->Length / sizeof(WCHAR));
+    for (index = 0; index < characters; index++) {
+        if (FullImageName->Buffer[index] == L'\\' || FullImageName->Buffer[index] == L'/') start = (USHORT)(index + 1);
     }
-    cursor = base + ARRAYSIZE(prefix) - 1;
-    if (*cursor < '0' || *cursor > '9') return FALSE;
-    while (*cursor >= '0' && *cursor <= '9') cursor++;
-    for (index = 0; index < ARRAYSIZE(suffix); index++) {
-        if (cursor[index] == '\0' || MsMonLowerChar(cursor[index]) != suffix[index]) return FALSE;
+    length = (USHORT)(characters - start);
+    if (length == 0 || length >= RTL_NUMBER_OF(baseName)) return;
+    for (index = 0; index < length; index++) {
+        WCHAR value = FullImageName->Buffer[start + index];
+        if (value == L'\0' || value > 0x7f) return;
+        baseName[index] = (CHAR)value;
+        wideName[index] = value;
     }
-    return TRUE;
+    baseName[length] = '\0';
+    wideName[length] = L'\0';
+    if (!MsMonBlackCatBaseName(baseName)) return;
+
+    KeAcquireSpinLock(&gAttributionLock, &oldIrql);
+    gBlackCatBase = (ULONG_PTR)ImageBase;
+    gBlackCatSize = (ULONG)ImageSize;
+    gBlackCatLoaded = TRUE;
+    RtlCopyMemory(gBlackCatName, wideName, (length + 1) * sizeof(WCHAR));
+    KeReleaseSpinLock(&gAttributionLock, oldIrql);
+
+    RtlInitUnicodeString(&text, L"blackcat_loaded");
+    (VOID)RtlStringCchPrintfW(detail, RTL_NUMBER_OF(detail), L"name=%ws;base=0x%p;size=0x%lx;source=image_load",
+                              wideName, ImageBase, (ULONG)ImageSize);
+    RtlInitUnicodeString(&detailString, detail);
+    (VOID)MsMonLogEvent(MsMonCoverage, PsGetCurrentProcessId(), NULL, PsGetCurrentThreadId(),
+                        NULL, 0, MsMonFlagObserverRecord, STATUS_SUCCESS, 0,
+                        MsMonCategoryUnknown, (ULONG_PTR)ImageBase, ImageSize, &text, &detailString);
+}
+
+/* The loaded BlackCat image's file name, for the component field of events it caused. */
+UNICODE_STRING MsMonBlackCatComponent(BOOLEAN Active, PWCHAR Buffer, USHORT Characters)
+{
+    static const WCHAR fallback[] = L"BlackCat";
+    UNICODE_STRING result;
+    KIRQL oldIrql;
+    USHORT length = 0;
+
+    result.Buffer = Buffer;
+    result.Length = 0;
+    result.MaximumLength = (USHORT)(Characters * sizeof(WCHAR));
+    if (!Active || Buffer == NULL || Characters == 0) return result;
+    KeAcquireSpinLock(&gAttributionLock, &oldIrql);
+    while (length + 1 < Characters && length < RTL_NUMBER_OF(gBlackCatName) && gBlackCatName[length] != L'\0') {
+        Buffer[length] = gBlackCatName[length];
+        length++;
+    }
+    KeReleaseSpinLock(&gAttributionLock, oldIrql);
+    if (length == 0) {
+        while (length + 1 < Characters && fallback[length] != L'\0') {
+            Buffer[length] = fallback[length];
+            length++;
+        }
+    }
+    Buffer[length] = L'\0';
+    result.Length = (USHORT)(length * sizeof(WCHAR));
+    return result;
 }
 
 NTSTATUS MsMonAttributionRefresh(VOID)
@@ -105,6 +202,7 @@ NTSTATUS MsMonAttributionRefresh(VOID)
     gBlackCatLoaded = loaded;
     gBlackCatBase = base;
     gBlackCatSize = imageSize;
+    RtlCopyMemory(gBlackCatName, moduleName, sizeof(gBlackCatName));
     KeReleaseSpinLock(&gAttributionLock, oldIrql);
 
     if (changed) {

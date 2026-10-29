@@ -29,20 +29,35 @@ static NTSTATUS MsMonCreateClose(PDEVICE_OBJECT DeviceObject, PIRP Irp)
     return MsMonCompleteIrp(Irp, STATUS_SUCCESS, 0);
 }
 
-static NTSTATUS MsMonStartSession(PMSMON_SESSION_CONFIG Config)
+static NTSTATUS MsMonStartSession(PMSMON_SESSION_CONFIG Config, ULONG InputLength)
 {
-    UNICODE_STRING root;
+    UNICODE_STRING roots[1 + MSMON_EXTRA_ROOTS];
+    ULONG rootCount = 0;
+    ULONG index;
     NTSTATUS status;
     SIZE_T length = wcsnlen(Config->ClientRoot, MSMON_CLIENT_PATH_CHARS);
     if (length == 0 || length == MSMON_CLIENT_PATH_CHARS) return STATUS_INVALID_PARAMETER;
-    root.Buffer = Config->ClientRoot;
-    root.Length = (USHORT)(length * sizeof(WCHAR));
-    root.MaximumLength = root.Length;
+    roots[rootCount].Buffer = Config->ClientRoot;
+    roots[rootCount].Length = (USHORT)(length * sizeof(WCHAR));
+    roots[rootCount].MaximumLength = roots[rootCount].Length;
+    rootCount++;
+    /* Agents built before ExtraRoots existed send the structure without it. */
+    if (InputLength >= sizeof(MSMON_SESSION_CONFIG)) {
+        for (index = 0; index < MSMON_EXTRA_ROOTS; index++) {
+            length = wcsnlen(Config->ExtraRoots[index], MSMON_CLIENT_PATH_CHARS);
+            if (length == MSMON_CLIENT_PATH_CHARS) return STATUS_INVALID_PARAMETER;
+            if (length == 0) continue;
+            roots[rootCount].Buffer = Config->ExtraRoots[index];
+            roots[rootCount].Length = (USHORT)(length * sizeof(WCHAR));
+            roots[rootCount].MaximumLength = roots[rootCount].Length;
+            rootCount++;
+        }
+    }
     MsMonProcessStopSession();
     MsMonEventsStop();
     status = MsMonEventsStart(Config->SessionId, Config->QueueRecords, Config->QueueBytes, Config->PayloadMode);
     if (!NT_SUCCESS(status)) return status;
-    status = MsMonProcessStartSession(&root);
+    status = MsMonProcessStartSession(roots, rootCount);
     if (NT_SUCCESS(status)) status = MsMonAttributionRefresh();
     if (NT_SUCCESS(status) && !MsMonObjectAvailable()) {
         UNICODE_STRING text;
@@ -85,11 +100,11 @@ static NTSTATUS MsMonDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
     MsMonCoverageEnter(MSMON_SENSOR_IOCTL_DISPATCH);
     switch (code) {
     case MSMON_IOCTL_START_SESSION:
-        if (inputLength < sizeof(MSMON_SESSION_CONFIG)) {
+        if (inputLength < (ULONG)FIELD_OFFSET(MSMON_SESSION_CONFIG, ExtraRoots)) {
             status = STATUS_BUFFER_TOO_SMALL;
             break;
         }
-        status = MsMonStartSession((PMSMON_SESSION_CONFIG)Irp->AssociatedIrp.SystemBuffer);
+        status = MsMonStartSession((PMSMON_SESSION_CONFIG)Irp->AssociatedIrp.SystemBuffer, inputLength);
         break;
     case MSMON_IOCTL_STOP_SESSION:
         MsMonAttributionStop();

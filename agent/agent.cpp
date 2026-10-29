@@ -6,6 +6,8 @@
 #include <bcrypt.h>
 #include <winver.h>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -14,8 +16,11 @@
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <deque>
+#include <mutex>
 #include <set>
 #include <sstream>
+#include <thread>
 
 #pragma comment(lib, "version.lib")
 
@@ -301,13 +306,13 @@ static std::string BuildCoverageJson(
          << ",\"writer_bytes\":" << bytes
          << ",\"etw_queue_drops\":" << queueDrops;
     if (etw != nullptr) {
-        static const char* providers[3] = {"wmi", "dns", "rpc"};
+        static const char* providers[EtwCollector::PROVIDERS] = {"wmi", "dns", "rpc", "tcp"};
         json << ",\"etw_lost\":" << etw->LostEvents()
              << ",\"etw_parse_failures\":" << etw->ParseFailures()
              << ",\"etw_unattributed\":" << etw->UnattributedCount()
              << ",\"etw_pending_overflow\":" << etw->PendingOverflow()
              << ",\"etw_providers\":[";
-        for (int index = 0; index < 3; index++) {
+        for (int index = 0; index < EtwCollector::PROVIDERS; index++) {
             if (index != 0) json << ',';
             json << "{\"name\":\"" << providers[index] << "\""
                  << ",\"received\":" << etw->Received(index)
@@ -503,6 +508,172 @@ private:
     bool started_ = false;
 };
 
+/*
+ * Drains the driver on its own thread.  When reading shared one loop with
+ * decoding, classification, hashing and disk writes, the driver's bounded
+ * nonpaged queue overflowed during the client's start-up burst (about 250,000
+ * file reads in a few seconds) and most of those events were dropped.  Raw
+ * read batches now wait here in pageable user memory instead.
+ *
+ * The reader uses its own device handle.  Device handles are synchronous,
+ * so the I/O manager serialises IOCTLs per handle; on the shared handle the
+ * main thread's once-per-second module refresh, which waits for the kernel's
+ * loaded-module lock, held reads back while BlackCat was being loaded and
+ * verified, and about 27,000 client events overflowed the driver queue.  The
+ * reader handle never starts a session, so closing it does not stop one.
+ */
+static const size_t DRIVER_PUMP_LIMIT_BYTES = 256u * 1024u * 1024u;
+
+class DriverPump {
+public:
+    DriverPump(DWORD waitMs, size_t limitBytes)
+        : waitMs_(waitMs), limitBytes_(limitBytes) {}
+    ~DriverPump() { Stop(); }
+
+    bool Start()
+    {
+        if (!device_.Open()) return false;
+        worker_ = std::thread([this] { Run(); });
+        return true;
+    }
+
+    /* Call after StopTracking: read until the driver queue is empty, then finish. */
+    void RequestDrain() { drain_.store(true); }
+
+    void Stop()
+    {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stop_ = true;
+        }
+        space_.notify_all();
+        if (worker_.joinable()) worker_.join();
+    }
+
+    /* Move every queued batch into `out`, waiting up to timeoutMs for the first. */
+    void Take(std::deque<std::vector<BYTE>>& out, DWORD timeoutMs)
+    {
+        std::unique_lock<std::mutex> lock(mutex_);
+        data_.wait_for(lock, std::chrono::milliseconds(timeoutMs),
+                       [this] { return !batches_.empty() || finished_; });
+        out.swap(batches_);
+        batches_.clear();
+        bufferedBytes_ = 0;
+        lock.unlock();
+        space_.notify_all();
+    }
+
+    /* True once the reader has finished and every batch has been taken. */
+    bool Done() const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return finished_ && batches_.empty();
+    }
+
+    /* The reader stopped on an error: Win32 code, or invalidCount for a bad byte count. */
+    bool Failed(DWORD& error, bool& invalidCount) const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        error = error_;
+        invalidCount = invalidCount_;
+        return failed_;
+    }
+
+    size_t BufferedBytes() const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return bufferedBytes_;
+    }
+
+    size_t PeakBytes() const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return peakBytes_;
+    }
+
+    uint64_t BackpressureWaits() const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return backpressureWaits_;
+    }
+
+    size_t LimitBytes() const { return limitBytes_; }
+
+private:
+    void Finish(bool failed, DWORD error, bool invalidCount)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        failed_ = failed;
+        error_ = error;
+        invalidCount_ = invalidCount;
+        finished_ = true;
+        data_.notify_all();
+    }
+
+    void Run()
+    {
+        std::vector<BYTE> scratch(MSMON_READ_MAX_BYTES);
+        /* The client's start-up saturates every core; keep the drain ahead of it. */
+        (void)SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+        for (;;) {
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                if (!stop_ && bufferedBytes_ >= limitBytes_) {
+                    /* The driver queue absorbs the wait; overflow there is still counted. */
+                    backpressureWaits_++;
+                    space_.wait(lock, [this] { return stop_ || bufferedBytes_ < limitBytes_; });
+                }
+                if (stop_) {
+                    finished_ = true;
+                    data_.notify_all();
+                    return;
+                }
+            }
+            const bool drain = drain_.load();
+            DWORD bytes = 0;
+            if (!device_.Read(drain ? 0 : waitMs_, scratch, bytes)) {
+                DWORD error = GetLastError();
+                Finish(true, error != 0 ? error : ERROR_GEN_FAILURE, false);
+                return;
+            }
+            if (bytes > scratch.size()) {
+                Finish(true, ERROR_INVALID_DATA, true);
+                return;
+            }
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (bytes != 0) {
+                batches_.emplace_back(scratch.begin(), scratch.begin() + bytes);
+                bufferedBytes_ += bytes;
+                if (bufferedBytes_ > peakBytes_) peakBytes_ = bufferedBytes_;
+                data_.notify_one();
+            }
+            if (drain && bytes == 0) {
+                finished_ = true;
+                data_.notify_all();
+                return;
+            }
+        }
+    }
+
+    DeviceSession device_;
+    const DWORD waitMs_;
+    const size_t limitBytes_;
+    std::thread worker_;
+    std::atomic<bool> drain_{false};
+    mutable std::mutex mutex_;
+    std::condition_variable data_;
+    std::condition_variable space_;
+    std::deque<std::vector<BYTE>> batches_;
+    size_t bufferedBytes_ = 0;
+    size_t peakBytes_ = 0;
+    uint64_t backpressureWaits_ = 0;
+    bool stop_ = false;
+    bool finished_ = false;
+    bool failed_ = false;
+    bool invalidCount_ = false;
+    DWORD error_ = 0;
+};
+
 static bool IsUnderRoot(const std::wstring& root, const std::wstring& path)
 {
     if (path.size() <= root.size()) return false;
@@ -510,7 +681,162 @@ static bool IsUnderRoot(const std::wstring& root, const std::wstring& path)
     return path[root.size()] == L'\\';
 }
 
-static unsigned TrackExisting(DeviceSession& device, const std::wstring& scopeRoot,
+static bool IsUnderAnyRoot(const std::vector<std::wstring>& roots, const std::wstring& path)
+{
+    for (const auto& root : roots) {
+        if (IsUnderRoot(root, path)) return true;
+    }
+    return false;
+}
+
+static std::wstring JoinRoots(const std::vector<std::wstring>& roots)
+{
+    std::wstring joined;
+    for (const auto& root : roots) {
+        if (!joined.empty()) joined += L'|';
+        joined += root;
+    }
+    return joined;
+}
+
+/*
+ * Copies small text files that tracked processes write under the client and
+ * Nexon data folders into the session bundle.  The client writes short-lived
+ * diagnostics (for example _ms_report.ini when a server connection drops)
+ * and deletes them within a second, and the driver does not capture file
+ * contents.  A copy is taken once a file has had no write for 150 ms, at most
+ * once every 2 s per file, within per-session limits; each copy is logged
+ * with its SHA-256 so the hash chain covers it.
+ */
+class FileSnapshotter {
+public:
+    FileSnapshotter(const std::filesystem::path& sessionDir, std::vector<std::wstring> roots)
+        : directory_(sessionDir / L"snapshots"), roots_(std::move(roots))
+    {
+        for (wchar_t letter = L'A'; letter <= L'Z'; letter++) {
+            wchar_t drive[3] = {letter, L':', L'\0'};
+            wchar_t target[1024];
+            if (QueryDosDeviceW(drive, target, static_cast<DWORD>(std::size(target))) != 0) {
+                devices_.emplace_back(target, drive);
+            }
+        }
+    }
+
+    void Note(const std::wstring& devicePath)
+    {
+        std::wstring path = DosPath(devicePath);
+        if (path.empty() || !Eligible(path)) return;
+        pending_[path] = GetTickCount64() + SETTLE_MS;
+    }
+
+    /* Take the copies that are due; with flush, take every pending copy now. */
+    template <typename Log>
+    bool Process(bool flush, Log&& log)
+    {
+        const uint64_t now = GetTickCount64();
+        for (auto it = pending_.begin(); it != pending_.end();) {
+            uint64_t& last = taken_[it->first];
+            if (!flush && (it->second > now || (last != 0 && now - last < INTERVAL_MS))) {
+                ++it;
+                continue;
+            }
+            std::wstring path = it->first;
+            it = pending_.erase(it);
+            last = now;
+            if (!Take(path, log)) return false;
+        }
+        return true;
+    }
+
+private:
+    static constexpr uint64_t SETTLE_MS = 150;
+    static constexpr uint64_t INTERVAL_MS = 2000;
+    static constexpr uint64_t MAX_FILE_BYTES = 256u * 1024u;
+    static constexpr uint64_t MAX_TOTAL_BYTES = 64ull * 1024ull * 1024ull;
+    static constexpr unsigned MAX_FILES = 2000;
+
+    std::wstring DosPath(const std::wstring& devicePath) const
+    {
+        for (const auto& device : devices_) {
+            const std::wstring& prefix = device.first;
+            if (devicePath.size() > prefix.size() &&
+                _wcsnicmp(devicePath.c_str(), prefix.c_str(), prefix.size()) == 0 &&
+                devicePath[prefix.size()] == L'\\') {
+                return device.second + devicePath.substr(prefix.size());
+            }
+        }
+        return {};
+    }
+
+    bool Eligible(const std::wstring& path) const
+    {
+        static const wchar_t* extensions[] = {L".ini", L".log", L".txt", L".json", L".xml", L".cfg"};
+        std::wstring extension = std::filesystem::path(path).extension().wstring();
+        bool textual = false;
+        for (const wchar_t* candidate : extensions) {
+            if (_wcsicmp(extension.c_str(), candidate) == 0) textual = true;
+        }
+        return textual && IsUnderAnyRoot(roots_, path);
+    }
+
+    template <typename Log>
+    bool Take(const std::wstring& path, Log&& log)
+    {
+        if (files_ >= MAX_FILES || totalBytes_ >= MAX_TOTAL_BYTES) {
+            if (limitLogged_) return true;
+            limitLogged_ = true;
+            return log(L"file_snapshot_limit", L"files=" + std::to_wstring(files_) +
+                                                   L";bytes=" + std::to_wstring(totalBytes_));
+        }
+        HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                  nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file == INVALID_HANDLE_VALUE) {
+            return log(L"file_snapshot_missed", L"path=" + path + L";win32=" + std::to_wstring(GetLastError()));
+        }
+        LARGE_INTEGER size{};
+        std::vector<BYTE> data;
+        bool ok = GetFileSizeEx(file, &size) != 0;
+        if (ok) {
+            uint64_t wanted = static_cast<uint64_t>(size.QuadPart);
+            if (wanted > MAX_FILE_BYTES) wanted = MAX_FILE_BYTES;
+            data.resize(static_cast<size_t>(wanted));
+            DWORD read = 0;
+            if (!data.empty()) ok = ReadFile(file, data.data(), static_cast<DWORD>(data.size()), &read, nullptr) != 0;
+            data.resize(read);
+        }
+        CloseHandle(file);
+        if (!ok) {
+            return log(L"file_snapshot_missed", L"path=" + path + L";win32=" + std::to_wstring(GetLastError()));
+        }
+        std::error_code directoryError;
+        std::filesystem::create_directories(directory_, directoryError);
+        wchar_t prefix[16];
+        swprintf_s(prefix, L"%05u_", ++files_);
+        std::filesystem::path saved = directory_ / (std::wstring(prefix) + std::filesystem::path(path).filename().wstring());
+        std::ofstream out(saved, std::ios::binary);
+        if (!data.empty()) out.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
+        const bool written = static_cast<bool>(out);
+        out.close();
+        totalBytes_ += data.size();
+        const std::string hash = Sha256Bytes(data.data(), data.size());
+        return log(L"file_snapshot",
+                   L"path=" + path + L";bytes=" + std::to_wstring(data.size()) +
+                   L";file_bytes=" + std::to_wstring(size.QuadPart) +
+                   L";sha256=" + std::wstring(hash.begin(), hash.end()) +
+                   L";saved=snapshots\\" + saved.filename().wstring() + (written ? L"" : L";save_failed=1"));
+    }
+
+    std::filesystem::path directory_;
+    std::vector<std::wstring> roots_;
+    std::vector<std::pair<std::wstring, std::wstring>> devices_;
+    std::unordered_map<std::wstring, uint64_t> pending_;
+    std::unordered_map<std::wstring, uint64_t> taken_;
+    unsigned files_ = 0;
+    uint64_t totalBytes_ = 0;
+    bool limitLogged_ = false;
+};
+
+static unsigned TrackExisting(DeviceSession& device, const std::vector<std::wstring>& scopeRoots,
                               ProcessScope& scope)
 {
     HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -537,7 +863,7 @@ static unsigned TrackExisting(DeviceSession& device, const std::wstring& scopeRo
             std::wstring path;
             uint64_t startTime = 0;
             if (!ProcessIdentity(process.th32ProcessID, path, startTime)) continue;
-            if (!inherited && !IsUnderRoot(scopeRoot, path)) continue;
+            if (!inherited && !IsUnderAnyRoot(scopeRoots, path)) continue;
             ULONG flags = inherited ? MsMonFlagInheritedTrack : MsMonFlagExplicitTrack;
             if (device.Track(process.th32ProcessID, startTime, flags)) {
                 tracked.insert(process.th32ProcessID);
@@ -566,7 +892,8 @@ static void Usage()
                  "[--log-dir DIR] [--session-label LABEL] [--test-id ID] [--scenario NAME] [--phase NAME] "
                  "[--iteration N] [--machine-label NAME] [--outcome-override NAME] [--compact] "
                  "[--wait-ms N] [--max-file-mb N] [--queue-records N] [--queue-mb N] "
-                 "[--stop-file FILE] [--no-etw] [--no-payloads] [--once]\n";
+                 "[--stop-file FILE] [--extra-root DIRECTORY]... [--no-etw] [--no-payloads] [--once]\n"
+                 "Without --extra-root, %ProgramData%\\Nexon\\NGS is added when it exists.\n";
 }
 
 static bool ParseNumber(const wchar_t* text, uint64_t& value)
@@ -580,6 +907,7 @@ int wmain(int argc, wchar_t** argv)
 {
     std::wstring clientRoot = L"C:\\Nexon\\Library\\maplestorycw";
     std::wstring scopeRootArg;
+    std::vector<std::wstring> extraRootArgs;
     std::wstring output = DefaultOutputPath();
     std::wstring logDir;
     std::wstring sessionLabel;
@@ -593,7 +921,7 @@ int wmain(int argc, wchar_t** argv)
     bool outputSet = false;
     uint64_t waitMs = 100;
     uint64_t maxFileBytes = 64ull * 1024ull * 1024ull;
-    uint64_t queueRecords = MSMON_DEFAULT_QUEUE_RECORDS;
+    uint64_t queueRecords = MSMON_MAX_QUEUE_RECORDS;
     uint64_t queueBytes = MSMON_DEFAULT_QUEUE_BYTES;
     bool once = false;
     bool enableEtw = true;
@@ -618,6 +946,8 @@ int wmain(int argc, wchar_t** argv)
             clientRoot = argv[++index];
         } else if (index + 1 < argc && argument == L"--scope-root") {
             scopeRootArg = argv[++index];
+        } else if (index + 1 < argc && argument == L"--extra-root") {
+            extraRootArgs.push_back(argv[++index]);
         } else if (index + 1 < argc && argument == L"--output") {
             output = argv[++index];
             outputSet = true;
@@ -735,6 +1065,44 @@ int wmain(int argc, wchar_t** argv)
         std::cerr << "Client root: " << error << "\n";
         return 1;
     }
+
+    /*
+     * The NGS security service runs from %ProgramData%\Nexon\NGS and is
+     * started by the service control manager, not by the client, so it is
+     * neither under the client scope nor a descendant of a tracked process.
+     */
+    std::vector<std::wstring> extraRoots;
+    std::error_code extraRootError;
+    if (extraRootArgs.empty()) {
+        wchar_t programData[MAX_PATH];
+        DWORD programDataLength = GetEnvironmentVariableW(L"ProgramData", programData, MAX_PATH);
+        if (programDataLength != 0 && programDataLength < MAX_PATH) {
+            std::filesystem::path ngs = std::filesystem::path(programData) / L"Nexon" / L"NGS";
+            if (std::filesystem::is_directory(ngs, extraRootError)) extraRoots.push_back(ngs.wstring());
+        }
+    } else {
+        for (const auto& extraRootArg : extraRootArgs) extraRoots.push_back(FullPath(extraRootArg));
+    }
+    if (extraRoots.size() > MSMON_EXTRA_ROOTS) {
+        std::cerr << "At most " << MSMON_EXTRA_ROOTS << " --extra-root directories are supported.\n";
+        return 1;
+    }
+    std::vector<std::wstring> extraNt;
+    for (auto& extraRoot : extraRoots) {
+        while (extraRoot.size() > 3 && (extraRoot.back() == L'\\' || extraRoot.back() == L'/')) extraRoot.pop_back();
+        std::wstring rootNt;
+        if (extraRoot.empty() || !DevicePath(extraRoot, rootNt, error)) {
+            std::cerr << "Extra root " << WideToUtf8(extraRoot) << ": " << error << "\n";
+            return 1;
+        }
+        if (rootNt.size() >= MSMON_CLIENT_PATH_CHARS) {
+            std::cerr << "Extra root NT path is too long: " << WideToUtf8(extraRoot) << "\n";
+            return 1;
+        }
+        extraNt.push_back(rootNt);
+    }
+    std::vector<std::wstring> scopeRoots{scopeRoot};
+    scopeRoots.insert(scopeRoots.end(), extraRoots.begin(), extraRoots.end());
     wchar_t windowsBuffer[32768];
     if (GetWindowsDirectoryW(windowsBuffer, static_cast<UINT>(std::size(windowsBuffer))) == 0) {
         std::cerr << "Could not resolve the Windows directory.\n";
@@ -826,6 +1194,9 @@ int wmain(int argc, wchar_t** argv)
         return 1;
     }
     wcscpy_s(config.ClientRoot, MSMON_CLIENT_PATH_CHARS, scopeNt.c_str());
+    for (size_t rootIndex = 0; rootIndex < extraNt.size(); rootIndex++) {
+        wcscpy_s(config.ExtraRoots[rootIndex], MSMON_CLIENT_PATH_CHARS, extraNt[rootIndex].c_str());
+    }
 
     DeviceSession device;
     if (!device.Open()) {
@@ -845,7 +1216,7 @@ int wmain(int argc, wchar_t** argv)
     bool startCoverageSupported = device.Coverage(startCoverage);
 
     ProcessScope scope;
-    unsigned registered = TrackExisting(device, scopeRoot, scope);
+    unsigned registered = TrackExisting(device, scopeRoots, scope);
     for (DWORD pid : explicitPids) {
         std::wstring path;
         uint64_t startTime = 0;
@@ -857,6 +1228,7 @@ int wmain(int argc, wchar_t** argv)
         }
     }
     std::cout << "Registered " << registered << " client/helper/descendant processes.\n";
+    const unsigned initiallyTracked = registered;
     if (registered == 0) {
         std::cout << "No client process is running yet; waiting for a tracked image to start.\n";
     }
@@ -868,6 +1240,7 @@ int wmain(int argc, wchar_t** argv)
     }
     OutsideClassifier classifier(clientRoot, clientNt, windowsDos, windowsNt);
     SessionSummary summary;
+    summary.SetInitiallyTracked(initiallyTracked);
     EventQueue etwQueue;
     std::unique_ptr<EtwCollector> etw;
 
@@ -888,7 +1261,8 @@ int wmain(int argc, wchar_t** argv)
         return writer.Write(TelemetryJson(event));
     };
 
-    if (!writeCoverage(L"session_start", L"client_root=" + clientRoot + L";scope_root=" + scopeRoot)) return 1;
+    if (!writeCoverage(L"session_start", L"client_root=" + clientRoot + L";scope_root=" + scopeRoot +
+                                          L";extra_roots=" + JoinRoots(extraRoots))) return 1;
     {
         std::wstring context = L"schema_version=1;session_uuid=" + sessionUuid +
                                L";session_label=" + sessionLabel +
@@ -958,6 +1332,7 @@ int wmain(int argc, wchar_t** argv)
         const wchar_t* fileState = !startCoverageSupported ? L"unknown" : (fileRegistered ? L"true" : L"false");
         const wchar_t* registryState = !startCoverageSupported ? L"unknown" : (registryRegistered ? L"true" : L"false");
         std::wstring manifest = L"scope_root=" + scopeRoot +
+                                L";extra_roots=" + JoinRoots(extraRoots) +
                                 L";inside_root=" + clientRoot +
                                 L";driver_callbacks=" + callbacks +
                                 L";minifilter_npfs=" + fileState +
@@ -966,7 +1341,8 @@ int wmain(int argc, wchar_t** argv)
                                 L";memory=false;ui=false;hardware_direct=false";
         if (!startCoverageSupported) manifest += L";driver_registration=unknown";
         manifest += L";etw=";
-        manifest += (enableEtw ? L"wmi,dns,rpc" : L"disabled");
+        manifest += (enableEtw ? L"wmi,dns,rpc,tcp" : L"disabled");
+        manifest += sessionDir.empty() ? L";file_snapshots=disabled" : L";file_snapshots=client_text_files";
         manifest += L";etw_level=verbose;payload_mode=";
         manifest += capturePayloads ? L"full" : L"metadata";
         manifest += L";blind_spots=per_page_mmap_io,named_pipe_payload,memory_ops,ui_clipboard_input,hardware_direct,brokered_actions,tls_plaintext";
@@ -1007,7 +1383,7 @@ int wmain(int argc, wchar_t** argv)
                            L"matches=" + std::to_wstring(discovered))) return 1;
     }
     if (enableEtw) {
-        etw = std::make_unique<EtwCollector>(scope, etwQueue, sessionId, capturePayloads);
+        etw = std::make_unique<EtwCollector>(scope, etwQueue, sessionId, capturePayloads, scopeRoots);
         if (!etw->Start(error)) {
             if (!writeCoverage(L"etw_unavailable", std::wstring(error.begin(), error.end()))) return 1;
             etw.reset();
@@ -1077,9 +1453,32 @@ int wmain(int argc, wchar_t** argv)
         return true;
     };
 
-    DWORD bytes = 0;
+    std::unique_ptr<FileSnapshotter> snapshotter;
+    if (!sessionDir.empty()) {
+        std::vector<std::wstring> snapshotRoots{clientRoot, scopeRoot};
+        for (const wchar_t* variable : {L"LOCALAPPDATA", L"APPDATA"}) {
+            wchar_t value[MAX_PATH];
+            DWORD length = GetEnvironmentVariableW(variable, value, MAX_PATH);
+            if (length != 0 && length < MAX_PATH) snapshotRoots.push_back((std::filesystem::path(value) / L"Nexon").wstring());
+        }
+        snapshotter = std::make_unique<FileSnapshotter>(sessionDir, snapshotRoots);
+        if (!writeCoverage(L"file_snapshots", L"roots=" + JoinRoots(snapshotRoots) +
+                                                L";extensions=.ini|.log|.txt|.json|.xml|.cfg;max_bytes=262144")) return 1;
+    }
+    auto logSnapshot = [&](const std::wstring& text, const std::wstring& detail) { return writeCoverage(text, detail); };
     bool draining = false;
+    bool driverDone = false;
     std::wstring outcome = once ? L"completed" : L"unknown";
+    std::unique_ptr<DriverPump> pump;
+    if (!once) {
+        pump = std::make_unique<DriverPump>(static_cast<DWORD>(waitMs), DRIVER_PUMP_LIMIT_BYTES);
+        if (!pump->Start()) {
+            std::cerr << "Cannot open a reader handle to " MSMON_USER_DEVICE_PATH ": Win32 error "
+                      << GetLastError() << "\n";
+            return 1;
+        }
+    }
+    std::deque<std::vector<BYTE>> batches;
     do {
         std::error_code stopError;
         bool stopFileRequested = stopFileEnabled && std::filesystem::exists(stopFile, stopError);
@@ -1090,65 +1489,105 @@ int wmain(int argc, wchar_t** argv)
                 result = 1;
                 break;
             }
+            pump->RequestDrain();
             draining = true;
         }
-        if (!device.Read(draining ? 0 : static_cast<DWORD>(waitMs), buffer, bytes)) {
-            std::cerr << "Driver read failed: Win32 error " << GetLastError() << "\n";
-            outcome = L"driver_stopped";
-            result = 1;
-            break;
+        batches.clear();
+        if (pump) {
+            pump->Take(batches, static_cast<DWORD>(waitMs));
+        } else {
+            DWORD bytes = 0;
+            if (!device.Read(static_cast<DWORD>(waitMs), buffer, bytes)) {
+                std::cerr << "Driver read failed: Win32 error " << GetLastError() << "\n";
+                outcome = L"driver_stopped";
+                result = 1;
+                break;
+            }
+            if (bytes > buffer.size()) {
+                std::cerr << "Driver returned an invalid byte count.\n";
+                result = 1;
+                break;
+            }
+            batches.emplace_back(buffer.begin(), buffer.begin() + bytes);
         }
-        if (bytes > buffer.size()) {
-            std::cerr << "Driver returned an invalid byte count.\n";
-            result = 1;
-            break;
-        }
-        DWORD offset = 0;
-        while (offset < bytes) {
-            TelemetryEvent event;
-            DWORD consumed = 0;
-            if (!DecodeDriverEvent(buffer.data() + offset, bytes - offset, event, consumed, error) || consumed == 0) {
-                std::cerr << "Invalid driver event: " << error << "\n";
-                result = 1;
-                break;
-            }
-            offset += consumed;
-            if (event.header.SessionId != sessionId) {
-                std::cerr << "Driver returned an event from another session.\n";
-                result = 1;
-                break;
-            }
-            if (previousDriverSequence != 0 && event.header.Sequence <= previousDriverSequence) {
-                std::cerr << "Driver sequence is not increasing.\n";
-                result = 1;
-                break;
-            }
-            if (event.header.Sequence > previousDriverSequence + 1) {
-                uint64_t gap = event.header.Sequence - previousDriverSequence - 1;
-                driverGaps += gap;
-                if (!writeGap("driver", previousDriverSequence, event.header.Sequence)) {
+        for (const auto& batch : batches) {
+            const DWORD bytes = static_cast<DWORD>(batch.size());
+            DWORD offset = 0;
+            while (offset < bytes) {
+                TelemetryEvent event;
+                DWORD consumed = 0;
+                if (!DecodeDriverEvent(batch.data() + offset, bytes - offset, event, consumed, error) || consumed == 0) {
+                    std::cerr << "Invalid driver event: " << error << "\n";
+                    result = 1;
+                    break;
+                }
+                offset += consumed;
+                if (event.header.SessionId != sessionId) {
+                    std::cerr << "Driver returned an event from another session.\n";
+                    result = 1;
+                    break;
+                }
+                if (previousDriverSequence != 0 && event.header.Sequence <= previousDriverSequence) {
+                    std::cerr << "Driver sequence is not increasing.\n";
+                    result = 1;
+                    break;
+                }
+                if (event.header.Sequence > previousDriverSequence + 1) {
+                    uint64_t gap = event.header.Sequence - previousDriverSequence - 1;
+                    driverGaps += gap;
+                    if (!writeGap("driver", previousDriverSequence, event.header.Sequence)) {
+                        result = 1;
+                        break;
+                    }
+                }
+                previousDriverSequence = event.header.Sequence;
+                if (event.header.Type == MsMonProcessStart) {
+                    uint64_t start = event.header.ProcessStartTime != 0 ? event.header.ProcessStartTime : event.header.Value0;
+                    scope.AddProcess(event.header.ProcessId, start, event.text);
+                    if (etw) etw->ReplayProcess(event.header.ProcessId);
+                } else if (event.header.Type == MsMonProcessExit) {
+                    event.processPath = scope.Path(event.header.ProcessId);
+                    scope.RemoveProcess(event.header.ProcessId, event.header.ProcessStartTime);
+                } else if (event.header.Type == MsMonImageLoad) {
+                    scope.AddImage(event.header.ProcessId, event.header.Value0, event.header.Value1, event.text);
+                }
+                if (snapshotter && event.header.Type == MsMonFileWrite) snapshotter->Note(event.text);
+                if (!event.stackAddresses.empty()) {
+                    /* Name the modules inside the process that made the request. */
+                    event.modules = scope.ResolveStack(event.stackPid, event.stackAddresses.data(),
+                                                       event.stackAddresses.size(), &event.stackUnresolved);
+                    if (!event.modules.empty()) event.header.Attribution = MsMonAttributionStackResolved;
+                }
+                if (!writeEvent(event)) {
+                    std::cerr << "Could not write the event log.\n";
                     result = 1;
                     break;
                 }
             }
-            previousDriverSequence = event.header.Sequence;
-            if (event.header.Type == MsMonProcessStart) {
-                uint64_t start = event.header.ProcessStartTime != 0 ? event.header.ProcessStartTime : event.header.Value0;
-                scope.AddProcess(event.header.ProcessId, start, event.text);
-                if (etw) etw->ReplayProcess(event.header.ProcessId);
-            } else if (event.header.Type == MsMonProcessExit) {
-                event.processPath = scope.Path(event.header.ProcessId);
-                scope.RemoveProcess(event.header.ProcessId, event.header.ProcessStartTime);
-            } else if (event.header.Type == MsMonImageLoad) {
-                scope.AddImage(event.header.ProcessId, event.header.Value0, event.header.Value1, event.text);
-            }
-            if (!writeEvent(event)) {
-                std::cerr << "Could not write the event log.\n";
+            if (result != 0) break;
+        }
+        if (result != 0) break;
+        if (pump) {
+            /* Report a reader failure only after every batch it queued has been written. */
+            DWORD pumpError = 0;
+            bool invalidCount = false;
+            if (pump->Failed(pumpError, invalidCount) && pump->Done()) {
+                if (invalidCount) {
+                    std::cerr << "Driver returned an invalid byte count.\n";
+                } else {
+                    std::cerr << "Driver read failed: Win32 error " << pumpError << "\n";
+                    outcome = L"driver_stopped";
+                }
                 result = 1;
                 break;
             }
+            driverDone = pump->Done();
         }
         if (etw) etw->ExpirePending(GetTickCount64());
+        if (snapshotter && !snapshotter->Process(false, logSnapshot)) {
+            result = 1;
+            break;
+        }
         if (result != 0 || !drainEtw()) {
             result = 1;
             break;
@@ -1188,7 +1627,9 @@ int wmain(int argc, wchar_t** argv)
                                L";dropped=" + std::to_wstring(statistics.DroppedEvents) +
                                L";tracked=" + std::to_wstring(statistics.TrackedProcesses) +
                                L";queue_record_limit=" + std::to_wstring(statistics.QueueRecordLimit) +
-                               L";queue_byte_limit=" + std::to_wstring(statistics.QueueByteLimit);
+                               L";queue_byte_limit=" + std::to_wstring(statistics.QueueByteLimit) +
+                               L";agent_buffered_bytes=" + std::to_wstring(pump ? pump->BufferedBytes() : 0) +
+                               L";agent_peak_buffered_bytes=" + std::to_wstring(pump ? pump->PeakBytes() : 0);
                 event.outsideClient = false;
                 if (!writeEvent(event)) {
                     result = 1;
@@ -1197,7 +1638,17 @@ int wmain(int argc, wchar_t** argv)
             }
             nextStatistics = GetTickCount64() + 30000;
         }
-    } while (!once && (!draining || bytes != 0));
+    } while (!once && !(draining && driverDone));
+
+    if (pump) {
+        pump->Stop();
+        if (!writeCoverage(L"driver_pump",
+                           L"peak_buffered_bytes=" + std::to_wstring(pump->PeakBytes()) +
+                           L";limit_bytes=" + std::to_wstring(pump->LimitBytes()) +
+                           L";backpressure_waits=" + std::to_wstring(pump->BackpressureWaits()))) {
+            result = 1;
+        }
+    }
 
     if (etw != nullptr) {
         /*
@@ -1211,6 +1662,7 @@ int wmain(int argc, wchar_t** argv)
         etw->ExpirePending(~0ull);
     }
     if (!drainEtw()) result = 1;
+    if (snapshotter && !snapshotter->Process(true, logSnapshot)) result = 1;
     if (etw != nullptr) {
         if (!writeCoverage(L"etw_accounting",
                            L"unattributed=" + std::to_wstring(etw->UnattributedCount()) +

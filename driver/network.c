@@ -60,11 +60,42 @@ static NTSTATUS gNetworkLayerStatus[MSMON_CALLOUT_COUNT];
 
 static VOID NTAPI MsMonWfpFlowDelete(UINT16 LayerId, UINT32 CalloutId, UINT64 FlowContext);
 
+/*
+ * Classify and flow-delete run at DISPATCH_LEVEL, where RtlStringCchPrintfW
+ * must not be used: the kernel CRT formats numbers as narrow text and widens
+ * each character through RtlAnsiCharToUnicodeChar, which reads the current
+ * process's PEB.  With that page not resident the read bugchecks
+ * (IRQL_NOT_LESS_OR_EQUAL in nt!RtlpIsUtf8Process).  Build the text by hand.
+ */
+static VOID MsMonAppendText(PWSTR Output, SIZE_T Characters, SIZE_T* Offset, PCWSTR Text)
+{
+    while (*Text != L'\0' && *Offset + 1 < Characters) Output[(*Offset)++] = *Text++;
+    Output[*Offset] = L'\0';
+}
+
+static VOID MsMonAppendUnsigned(PWSTR Output, SIZE_T Characters, SIZE_T* Offset, ULONG Value)
+{
+    WCHAR digits[10];
+    ULONG count = 0;
+    do {
+        digits[count++] = (WCHAR)(L'0' + Value % 10);
+        Value /= 10;
+    } while (Value != 0);
+    while (count > 0 && *Offset + 1 < Characters) Output[(*Offset)++] = digits[--count];
+    Output[*Offset] = L'\0';
+}
+
+/* WFP supplies IPv4 addresses and ports in host byte order: most significant octet first. */
 static VOID MsMonFormatIpv4(UINT32 Address, PWSTR Output, SIZE_T Characters)
 {
-    (VOID)RtlStringCchPrintfW(Output, Characters, L"%u.%u.%u.%u",
-                              Address & 0xff, (Address >> 8) & 0xff,
-                              (Address >> 16) & 0xff, (Address >> 24) & 0xff);
+    SIZE_T offset = 0;
+    ULONG index;
+    if (Characters == 0) return;
+    Output[0] = L'\0';
+    for (index = 0; index < 4; index++) {
+        if (index != 0) MsMonAppendText(Output, Characters, &offset, L".");
+        MsMonAppendUnsigned(Output, Characters, &offset, (Address >> (24 - 8 * index)) & 0xff);
+    }
 }
 
 static VOID MsMonFormatIpv6(const FWP_BYTE_ARRAY16* Address, PWSTR Output, SIZE_T Characters)
@@ -242,6 +273,7 @@ static VOID NTAPI MsMonWfpClassify(
     WCHAR local[48];
     WCHAR remote[48];
     WCHAR endpoints[128];
+    SIZE_T endpointsLength;
     PCWSTR direction;
     ULONG type;
 
@@ -271,8 +303,8 @@ static VOID NTAPI MsMonWfpClassify(
             remoteAddressField >= InFixedValues->valueCount ||
             localPortField >= InFixedValues->valueCount ||
             remotePortField >= InFixedValues->valueCount) break;
-        localPort = RtlUshortByteSwap(InFixedValues->incomingValue[localPortField].value.uint16);
-        remotePort = RtlUshortByteSwap(InFixedValues->incomingValue[remotePortField].value.uint16);
+        localPort = InFixedValues->incomingValue[localPortField].value.uint16;
+        remotePort = InFixedValues->incomingValue[remotePortField].value.uint16;
         protocol = InFixedValues->incomingValue[protocolField].value.uint8;
         if ((InMetaValues->currentMetadataValues & FWPS_METADATA_FIELD_FLOW_HANDLE) != 0) {
             flowId = InMetaValues->flowHandle;
@@ -288,8 +320,15 @@ static VOID NTAPI MsMonWfpClassify(
             MsMonFormatIpv4(InFixedValues->incomingValue[remoteAddressField].value.uint32,
                             remote, RTL_NUMBER_OF(remote));
         }
-        (VOID)RtlStringCchPrintfW(endpoints, RTL_NUMBER_OF(endpoints), L"%ws:%u -> %ws:%u",
-                                  local, localPort, remote, remotePort);
+        endpointsLength = 0;
+        endpoints[0] = L'\0';
+        MsMonAppendText(endpoints, RTL_NUMBER_OF(endpoints), &endpointsLength, local);
+        MsMonAppendText(endpoints, RTL_NUMBER_OF(endpoints), &endpointsLength, L":");
+        MsMonAppendUnsigned(endpoints, RTL_NUMBER_OF(endpoints), &endpointsLength, localPort);
+        MsMonAppendText(endpoints, RTL_NUMBER_OF(endpoints), &endpointsLength, L" -> ");
+        MsMonAppendText(endpoints, RTL_NUMBER_OF(endpoints), &endpointsLength, remote);
+        MsMonAppendText(endpoints, RTL_NUMBER_OF(endpoints), &endpointsLength, L":");
+        MsMonAppendUnsigned(endpoints, RTL_NUMBER_OF(endpoints), &endpointsLength, remotePort);
         if (index >= 4) {
             type = MsMonNetworkFlowEstablished;
             direction = L"flow_established";

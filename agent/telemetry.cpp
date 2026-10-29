@@ -13,6 +13,18 @@ void SetDecodedFields(bool enabled)
     gDecodedFields = enabled;
 }
 
+static void InsertModule(std::vector<ModuleRange>& modules, uint64_t base, uint64_t size, const std::wstring& path)
+{
+    auto duplicate = std::find_if(modules.begin(), modules.end(), [&](const ModuleRange& module) {
+        return module.base == base;
+    });
+    if (duplicate != modules.end()) modules.erase(duplicate);
+    modules.push_back({base, size, path});
+    std::sort(modules.begin(), modules.end(), [](const ModuleRange& left, const ModuleRange& right) {
+        return left.base < right.base;
+    });
+}
+
 void ProcessScope::AddProcess(DWORD pid, uint64_t startTime, const std::wstring& path)
 {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -20,6 +32,11 @@ void ProcessScope::AddProcess(DWORD pid, uint64_t startTime, const std::wstring&
     if (process.startTime != startTime) process.modules.clear();
     process.startTime = startTime;
     if (!path.empty()) process.path = path;
+    auto early = earlyImages_.find(pid);
+    if (early != earlyImages_.end()) {
+        for (const auto& module : early->second) InsertModule(process.modules, module.base, module.size, module.path);
+        earlyImages_.erase(early);
+    }
 }
 
 void ProcessScope::RemoveProcess(DWORD pid, uint64_t startTime)
@@ -35,17 +52,22 @@ void ProcessScope::RemoveProcess(DWORD pid, uint64_t startTime)
 void ProcessScope::AddImage(DWORD pid, uint64_t base, uint64_t size, const std::wstring& path)
 {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (base == 0 || size == 0) return;
     auto found = processes_.find(pid);
-    if (found == processes_.end() || base == 0 || size == 0) return;
-    auto& modules = found->second.modules;
-    auto duplicate = std::find_if(modules.begin(), modules.end(), [&](const ModuleRange& module) {
-        return module.base == base;
-    });
-    if (duplicate != modules.end()) modules.erase(duplicate);
-    modules.push_back({base, size, path});
-    std::sort(modules.begin(), modules.end(), [](const ModuleRange& left, const ModuleRange& right) {
-        return left.base < right.base;
-    });
+    if (found == processes_.end()) {
+        /*
+         * An image load can reach the agent before the process-start record
+         * (the kernel callback order is not documented).  Hold it for
+         * AddProcess instead of dropping it, without marking the PID tracked
+         * before the driver says so.
+         */
+        if (earlyImages_.size() >= 256 && earlyImages_.find(pid) == earlyImages_.end()) {
+            earlyImages_.erase(earlyImages_.begin());
+        }
+        InsertModule(earlyImages_[pid], base, size, path);
+        return;
+    }
+    InsertModule(found->second.modules, base, size, path);
 }
 
 bool ProcessScope::IsTracked(DWORD pid) const
@@ -68,22 +90,27 @@ std::wstring ProcessScope::Path(DWORD pid) const
     return found == processes_.end() ? std::wstring() : found->second.path;
 }
 
-std::vector<std::wstring> ProcessScope::ResolveStack(DWORD pid, const uint64_t* addresses, size_t count) const
+std::vector<std::wstring> ProcessScope::ResolveStack(DWORD pid, const uint64_t* addresses, size_t count,
+                                                     size_t* unresolved) const
 {
+    static const uint64_t USER_ADDRESS_LIMIT = 0x0000800000000000ull;
     std::lock_guard<std::mutex> lock(mutex_);
     std::vector<std::wstring> result;
+    if (unresolved != nullptr) *unresolved = 0;
     auto found = processes_.find(pid);
     if (found == processes_.end() || addresses == nullptr) return result;
     std::set<std::wstring> seen;
     for (size_t index = 0; index < count; index++) {
         uint64_t address = addresses[index];
+        bool matched = false;
         for (const auto& module : found->second.modules) {
             if (address >= module.base && address - module.base < module.size) {
-                if (seen.insert(module.path).second) result.push_back(module.path);
+                matched = true;
+                if (result.size() < 8 && seen.insert(module.path).second) result.push_back(module.path);
                 break;
             }
         }
-        if (result.size() == 8) break;
+        if (!matched && unresolved != nullptr && address != 0 && address < USER_ADDRESS_LIMIT) (*unresolved)++;
     }
     return result;
 }
@@ -194,6 +221,7 @@ std::string EventTypeName(unsigned long type)
     case MsMonEtwDns: return "etw_dns";
     case MsMonEtwRpc: return "etw_rpc";
     case MsMonEtwUnattributed: return "etw_unattributed";
+    case MsMonEtwTcp: return "etw_tcp";
     case MsMonCoverage: return "coverage";
     case MsMonCoverageUsage: return "coverage_usage";
     default: return "unknown";
@@ -241,71 +269,36 @@ std::string Timestamp(uint64_t value)
     return buffer;
 }
 
-std::string Sha256(const std::string& input)
-{
-    BCRYPT_ALG_HANDLE algorithm = nullptr;
-    BCRYPT_HASH_HANDLE hash = nullptr;
-    DWORD objectSize = 0;
-    DWORD resultSize = 0;
-    std::vector<unsigned char> object;
-    unsigned char digest[32];
-    std::ostringstream hex;
-    if (BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0) != 0) return {};
-    if (BCryptGetProperty(algorithm, BCRYPT_OBJECT_LENGTH, reinterpret_cast<PUCHAR>(&objectSize),
-                          sizeof(objectSize), &resultSize, 0) != 0) {
-        BCryptCloseAlgorithmProvider(algorithm, 0);
-        return {};
-    }
-    object.resize(objectSize);
-    if (BCryptCreateHash(algorithm, &hash, object.data(), objectSize, nullptr, 0, 0) != 0 ||
-        BCryptHashData(hash, reinterpret_cast<PUCHAR>(const_cast<char*>(input.data())),
-                       static_cast<ULONG>(input.size()), 0) != 0 ||
-        BCryptFinishHash(hash, digest, sizeof(digest), 0) != 0) {
-        if (hash != nullptr) BCryptDestroyHash(hash);
-        BCryptCloseAlgorithmProvider(algorithm, 0);
-        return {};
-    }
-    BCryptDestroyHash(hash);
-    BCryptCloseAlgorithmProvider(algorithm, 0);
-    hex << std::hex << std::setfill('0');
-    for (unsigned char byte : digest) hex << std::setw(2) << static_cast<unsigned>(byte);
-    return hex.str();
-}
-
 static std::string HexDigest(const unsigned char* digest, size_t size)
 {
-    std::ostringstream hex;
-    hex << std::hex << std::setfill('0');
-    for (size_t index = 0; index < size; index++) hex << std::setw(2) << static_cast<unsigned>(digest[index]);
-    return hex.str();
+    static const char hex[] = "0123456789abcdef";
+    std::string result(size * 2, '0');
+    for (size_t index = 0; index < size; index++) {
+        result[index * 2] = hex[digest[index] >> 4];
+        result[index * 2 + 1] = hex[digest[index] & 0xf];
+    }
+    return result;
 }
 
+/*
+ * The log writer hashes every record into the chain.  Opening and closing an
+ * algorithm provider per record dominated the writer's cost during bursts, so
+ * use the shared SHA-256 pseudo-handle and the one-shot BCryptHash.
+ */
 std::string Sha256Bytes(const void* data, size_t size)
 {
-    BCRYPT_ALG_HANDLE algorithm = nullptr;
-    BCRYPT_HASH_HANDLE hash = nullptr;
-    DWORD objectSize = 0;
-    DWORD resultSize = 0;
-    std::vector<unsigned char> object;
     unsigned char digest[32];
-    if (BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0) != 0) return {};
-    if (BCryptGetProperty(algorithm, BCRYPT_OBJECT_LENGTH, reinterpret_cast<PUCHAR>(&objectSize),
-                          sizeof(objectSize), &resultSize, 0) != 0) {
-        BCryptCloseAlgorithmProvider(algorithm, 0);
+    if (BCryptHash(BCRYPT_SHA256_ALG_HANDLE, nullptr, 0,
+                   reinterpret_cast<PUCHAR>(const_cast<void*>(data)), static_cast<ULONG>(size),
+                   digest, sizeof(digest)) != 0) {
         return {};
     }
-    object.resize(objectSize);
-    if (BCryptCreateHash(algorithm, &hash, object.data(), objectSize, nullptr, 0, 0) != 0 ||
-        BCryptHashData(hash, reinterpret_cast<PUCHAR>(const_cast<void*>(data)),
-                       static_cast<ULONG>(size), 0) != 0 ||
-        BCryptFinishHash(hash, digest, sizeof(digest), 0) != 0) {
-        if (hash != nullptr) BCryptDestroyHash(hash);
-        BCryptCloseAlgorithmProvider(algorithm, 0);
-        return {};
-    }
-    BCryptDestroyHash(hash);
-    BCryptCloseAlgorithmProvider(algorithm, 0);
     return HexDigest(digest, sizeof(digest));
+}
+
+std::string Sha256(const std::string& input)
+{
+    return Sha256Bytes(input.data(), input.size());
 }
 
 std::string Sha256File(const std::wstring& path)
@@ -366,6 +359,12 @@ std::string StatusName(long status)
         {0xC0000034, "STATUS_OBJECT_NAME_NOT_FOUND"},
         {0xC0000035, "STATUS_OBJECT_NAME_COLLISION"},
         {0xC0000056, "STATUS_DELETE_PENDING"},
+        {0xC00000B5, "STATUS_IO_TIMEOUT"},
+        {0xC000020C, "STATUS_CONNECTION_DISCONNECTED"},
+        {0xC000020D, "STATUS_CONNECTION_RESET"},
+        {0xC0000236, "STATUS_CONNECTION_REFUSED"},
+        {0xC0000237, "STATUS_GRACEFUL_DISCONNECT"},
+        {0xC0000241, "STATUS_CONNECTION_ABORTED"},
         {0xC00000BA, "STATUS_FILE_IS_A_DIRECTORY"},
         {0xC0000101, "STATUS_DIRECTORY_NOT_EMPTY"},
         {0xC0000225, "STATUS_NOT_FOUND"},
@@ -616,7 +615,12 @@ std::string TelemetryJson(const TelemetryEvent& event)
         if (index != 0) json << ',';
         json << '\"' << JsonEscape(WideToUtf8(event.modules[index])) << '\"';
     }
-    json << "]}";
+    json << "]";
+    if (!event.stackAddresses.empty()) {
+        json << ",\"stack_frames\":" << event.stackAddresses.size()
+             << ",\"stack_unresolved\":" << event.stackUnresolved;
+    }
+    json << "}";
     return json.str();
 }
 
@@ -648,6 +652,17 @@ bool DecodeDriverEvent(const BYTE* data, DWORD available, TelemetryEvent& event,
         !validString(header.ComponentOffset, header.ComponentBytes)) {
         error = "invalid event string bounds";
         return false;
+    }
+    if (header.StackFrames != 0) {
+        const size_t stackBytes = static_cast<size_t>(header.StackFrames) * sizeof(uint64_t);
+        if (header.StackFrames > MSMON_MAX_STACK_FRAMES || header.StackOffset < sizeof(header) ||
+            header.StackOffset > header.Size || stackBytes > header.Size - header.StackOffset) {
+            error = "invalid event stack bounds";
+            return false;
+        }
+        event.stackAddresses.resize(header.StackFrames);
+        std::memcpy(event.stackAddresses.data(), data + header.StackOffset, stackBytes);
+        event.stackPid = header.ProcessId;
     }
     if ((header.Flags & MsMonFlagPayloadPresent) != 0) {
         if ((header.Flags & MsMonFlagPayloadUnavailable) != 0 || header.OperationId == 0 ||

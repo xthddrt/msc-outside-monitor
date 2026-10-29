@@ -24,6 +24,8 @@ struct TelemetryEvent {
      * can still be resolved.  Never written to JSON. */
     DWORD stackPid = 0;
     std::vector<uint64_t> stackAddresses;
+    /* User-mode frames that fell in no known module (unbacked code, or a module loaded before tracking). */
+    size_t stackUnresolved = 0;
     std::string source = "driver";
     bool outsideClient = true;
 };
@@ -48,11 +50,14 @@ public:
     bool IsTracked(DWORD pid) const;
     uint64_t StartTime(DWORD pid) const;
     std::wstring Path(DWORD pid) const;
-    std::vector<std::wstring> ResolveStack(DWORD pid, const uint64_t* addresses, size_t count) const;
+    std::vector<std::wstring> ResolveStack(DWORD pid, const uint64_t* addresses, size_t count,
+                                           size_t* unresolved = nullptr) const;
 
 private:
     mutable std::mutex mutex_;
     std::unordered_map<DWORD, ProcessInfo> processes_;
+    /* Image loads the driver reported before the process-start record. */
+    std::unordered_map<DWORD, std::vector<ModuleRange>> earlyImages_;
 };
 
 class EventQueue {

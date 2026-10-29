@@ -230,6 +230,11 @@ static VOID MsMonCaptureSingleValue(
     case KeyValueFullInformation:
     case KeyValueFullInformationAlign64: {
         PKEY_VALUE_FULL_INFORMATION value = (PKEY_VALUE_FULL_INFORMATION)Information;
+        /* An empty value has no data, and its DataOffset need not point inside the buffer. */
+        if (value->DataLength == 0) {
+            MsMonLogRegistryValue(Context, Status, value->Type, Information, 0);
+            return;
+        }
         if (value->DataOffset > ReturnedLength || value->DataLength > ReturnedLength - value->DataOffset) {
             MsMonRegistryUnavailable(Context, Status, L"invalid_value_offset", 0);
             return;

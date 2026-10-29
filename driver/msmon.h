@@ -16,6 +16,8 @@ NTSTATUS MsMonAttributionInitialize(VOID);
 NTSTATUS MsMonAttributionRefresh(VOID);
 VOID MsMonAttributionStop(VOID);
 BOOLEAN MsMonCurrentIsBlackCat(VOID);
+VOID MsMonAttributionNoteImage(PCUNICODE_STRING FullImageName, PVOID ImageBase, SIZE_T ImageSize);
+UNICODE_STRING MsMonBlackCatComponent(BOOLEAN Active, PWCHAR Buffer, USHORT Characters);
 
 NTSTATUS MsMonEventsInitialize(VOID);
 VOID MsMonEventsUninitialize(VOID);
@@ -66,7 +68,7 @@ VOID MsMonGetCoverage(PMSMON_COVERAGE Coverage);
 NTSTATUS MsMonProcessInitialize(VOID);
 NTSTATUS MsMonImageInitialize(VOID);
 VOID MsMonProcessUninitialize(VOID);
-NTSTATUS MsMonProcessStartSession(PCUNICODE_STRING ClientRoot);
+NTSTATUS MsMonProcessStartSession(PCUNICODE_STRING Roots, ULONG RootCount);
 VOID MsMonProcessStopSession(VOID);
 NTSTATUS MsMonTrackProcess(HANDLE ProcessId, ULONG Flags);
 BOOLEAN MsMonIsTracked(HANDLE ProcessId, LONGLONG StartTime);

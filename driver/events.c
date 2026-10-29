@@ -225,6 +225,57 @@ ULONGLONG MsMonNextOperationId(VOID)
     return (ULONGLONG)InterlockedIncrement64((volatile LONG64*)&gQueue.OperationId);
 }
 
+/* Exported by ntoskrnl; the WDK headers do not declare it. */
+NTSYSAPI ULONG NTAPI RtlWalkFrameChain(_Out_writes_(Count) PVOID* Callers, _In_ ULONG Count, _In_ ULONG Flags);
+#define MSMON_WALK_USER_MODE_STACK 1u
+
+static BOOLEAN MsMonStackWanted(ULONG Type)
+{
+    switch (Type) {
+    case MsMonProcessHandle:
+    case MsMonThreadHandle:
+    case MsMonFileCreate:
+    case MsMonFileWrite:
+    case MsMonFileSetInformation:
+    case MsMonFileDirectoryControl:
+    case MsMonFileDeviceControl:
+    case MsMonFileSystemControl:
+    case MsMonFileQueryVolumeInformation:
+    case MsMonFileSetSecurity:
+    case MsMonFileSetEa:
+    case MsMonRegistryOpen:
+    case MsMonRegistryCreate:
+    case MsMonRegistrySetValue:
+    case MsMonRegistryDelete:
+    case MsMonRegistryRename:
+    case MsMonRegistryQuery:
+    case MsMonRegistryEnumerate:
+        return TRUE;
+    default:
+        return FALSE;
+    }
+}
+
+/*
+ * Return addresses from the requesting thread's user-mode stack, so the agent
+ * can name the module inside the process that made the request (for example
+ * a DLL loaded into the client).  Walked only when it is both safe and
+ * meaningful: at PASSIVE_LEVEL, since the walk reads user memory that may
+ * page in; for a request that came from user mode; on a non-system thread
+ * that is the thread and process the event is attributed to.  Per-I/O events
+ * (reads, cleanup, close, section and information queries) are skipped to
+ * keep the cost out of the client's start-up burst.
+ */
+static ULONG MsMonCaptureUserStack(ULONG Type, HANDLE ProcessId, HANDLE ThreadId, PVOID* Frames)
+{
+    if (!MsMonStackWanted(Type) || KeGetCurrentIrql() != PASSIVE_LEVEL || ExGetPreviousMode() != UserMode ||
+        PsIsSystemThread(PsGetCurrentThread()) || ProcessId != PsGetCurrentProcessId() ||
+        (ThreadId != NULL && ThreadId != PsGetCurrentThreadId())) {
+        return 0;
+    }
+    return RtlWalkFrameChain(Frames, MSMON_MAX_STACK_FRAMES, MSMON_WALK_USER_MODE_STACK);
+}
+
 static NTSTATUS MsMonLogEventInternal(
     ULONG Type, HANDLE ProcessId, HANDLE ParentProcessId, HANDLE ThreadId,
     HANDLE TargetProcessId, LONGLONG TargetProcessStartTime, ULONG Flags,
@@ -238,18 +289,31 @@ static NTSTATUS MsMonLogEventInternal(
     KIRQL oldIrql;
     BOOLEAN truncated = FALSE;
     BOOLEAN blackCat = MsMonCurrentIsBlackCat();
-    UNICODE_STRING component = { sizeof(L"BlackCat64.sys") - sizeof(WCHAR), sizeof(L"BlackCat64.sys"), (PWSTR)L"BlackCat64.sys" };
+    WCHAR componentName[64];
+    UNICODE_STRING component = MsMonBlackCatComponent(blackCat, componentName, RTL_NUMBER_OF(componentName));
+    PVOID frames[MSMON_MAX_STACK_FRAMES];
+    ULONG frameCount = MsMonCaptureUserStack(Type, ProcessId, ThreadId, frames);
     USHORT textBytes = MsMonStringBytes(Text, &truncated);
     USHORT detailBytes = MsMonStringBytes(Detail, &truncated);
     USHORT componentBytes = blackCat ? MsMonStringBytes(&component, &truncated) : 0;
     ULONG textOffset = (sizeof(MSMON_EVENT_HEADER) + 7u) & ~7u;
     ULONG detailOffset = (textOffset + textBytes + (textBytes != 0 ? 2u : 0u) + 7u) & ~7u;
     ULONG componentOffset = (detailOffset + detailBytes + (detailBytes != 0 ? 2u : 0u) + 7u) & ~7u;
-    ULONG payloadOffset = (componentOffset + componentBytes + (componentBytes != 0 ? 2u : 0u) + 7u) & ~7u;
+    ULONG stackOffset = (componentOffset + componentBytes + (componentBytes != 0 ? 2u : 0u) + 7u) & ~7u;
+    ULONG payloadOffset = (stackOffset + frameCount * (ULONG)sizeof(ULONGLONG) + 7u) & ~7u;
     ULONG payloadBytes = Payload != NULL ? Payload->ByteCount : 0;
     ULONG recordBytes = payloadOffset + payloadBytes;
-    ULONG allocationBytes = sizeof(LIST_ENTRY) + recordBytes;
+    ULONG allocationBytes;
     PWSTR destination;
+    ULONG index;
+
+    /* The stack never costs the event itself: drop the frames if they would not fit. */
+    if (recordBytes > MSMON_MAX_EVENT_RECORD_BYTES && frameCount != 0) {
+        frameCount = 0;
+        payloadOffset = stackOffset;
+        recordBytes = payloadOffset + payloadBytes;
+    }
+    allocationBytes = sizeof(LIST_ENTRY) + recordBytes;
 
     MsMonCoverageEventAttempt(Type);
     if (recordBytes > MSMON_MAX_EVENT_RECORD_BYTES ||
@@ -312,6 +376,12 @@ static NTSTATUS MsMonLogEventInternal(
         destination = (PWSTR)((PUCHAR)&block->Event + componentOffset);
         RtlCopyMemory(destination, component.Buffer, componentBytes);
         destination[componentBytes / sizeof(WCHAR)] = L'\0';
+    }
+    if (frameCount != 0) {
+        PULONGLONG stack = (PULONGLONG)((PUCHAR)&block->Event + stackOffset);
+        block->Event.StackOffset = (USHORT)stackOffset;
+        block->Event.StackFrames = (USHORT)frameCount;
+        for (index = 0; index < frameCount; index++) stack[index] = (ULONGLONG)(ULONG_PTR)frames[index];
     }
     if (Payload != NULL) {
         block->Event.Flags |= MsMonFlagPayloadPresent;

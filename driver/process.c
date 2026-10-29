@@ -11,7 +11,9 @@ typedef struct _MSMON_PROCESS_ENTRY {
 static LIST_ENTRY gProcesses;
 static KSPIN_LOCK gProcessLock;
 static volatile LONG gProcessCount;
-static UNICODE_STRING gClientRoot;
+#define MSMON_MAX_SCOPE_ROOTS (1u + MSMON_EXTRA_ROOTS)
+static UNICODE_STRING gRoots[MSMON_MAX_SCOPE_ROOTS];
+static ULONG gRootCount;
 static KMUTEX gRootMutex;
 static BOOLEAN gSessionActive;
 static BOOLEAN gProcessNotifyEx;
@@ -37,29 +39,48 @@ VOID MsMonRecordStatus(PCWSTR Name, NTSTATUS Status)
 }
 
 /*
- * Track any executable image beneath the configured client root, not a
- * hard-coded list.  The installation contains PE payloads with non-.exe
- * extensions (for example the GRAP .aes images) and private-server builds
- * may rename helpers.  The root is the appdata scope chosen by the agent;
- * descendants are still inherited separately.
+ * Track any executable image beneath a configured root, not a hard-coded list.
+ * The installation contains PE payloads with non-.exe extensions (for example
+ * the GRAP .aes images) and private-server builds may rename helpers.  The
+ * first root is the appdata scope chosen by the agent; further roots cover
+ * client components started by something else, such as the NGS service the
+ * service control manager launches.  Descendants are inherited separately.
  */
 static BOOLEAN MsMonImageUnderRoot(PCUNICODE_STRING ImageFileName)
 {
     BOOLEAN result = FALSE;
-    USHORT offset;
-    WCHAR boundary;
-    if (!gSessionActive || gClientRoot.Buffer == NULL || ImageFileName == NULL || ImageFileName->Buffer == NULL) {
+    ULONG index;
+    if (!gSessionActive || gRootCount == 0 || ImageFileName == NULL || ImageFileName->Buffer == NULL) {
         return FALSE;
     }
     (VOID)KeWaitForSingleObject(&gRootMutex, Executive, KernelMode, FALSE, NULL);
-    if (gSessionActive && gClientRoot.Buffer != NULL &&
-        ImageFileName->Length > gClientRoot.Length &&
-        RtlPrefixUnicodeString(&gClientRoot, ImageFileName, TRUE)) {
-        offset = gClientRoot.Length;
-        boundary = ImageFileName->Buffer[offset / sizeof(WCHAR)];
-        result = (boundary == L'\\');
+    for (index = 0; gSessionActive && index < gRootCount && !result; index++) {
+        PCUNICODE_STRING root = &gRoots[index];
+        if (ImageFileName->Length > root->Length && RtlPrefixUnicodeString(root, ImageFileName, TRUE)) {
+            result = ImageFileName->Buffer[root->Length / sizeof(WCHAR)] == L'\\';
+        }
     }
     KeReleaseMutex(&gRootMutex, FALSE);
+    return result;
+}
+
+/*
+ * The agent configures the root as a device path (\Device\HarddiskVolumeN\...),
+ * but CreateInfo->ImageFileName is the name the creator passed, normally
+ * \??\C:\..., so a prefix match on it never succeeds for a newly started
+ * client.  SeLocateProcessImageName returns the device form; the caller's
+ * name is kept as a fallback.
+ */
+static BOOLEAN MsMonProcessImageUnderRoot(PEPROCESS Process, PCUNICODE_STRING FallbackName)
+{
+    PUNICODE_STRING imageName = NULL;
+    BOOLEAN result = FALSE;
+    if (!gSessionActive) return FALSE;
+    if (NT_SUCCESS(SeLocateProcessImageName(Process, &imageName))) {
+        result = MsMonImageUnderRoot(imageName);
+        ExFreePool(imageName);
+    }
+    if (!result && FallbackName != NULL) result = MsMonImageUnderRoot(FallbackName);
     return result;
 }
 
@@ -76,48 +97,77 @@ static VOID MsMonClearProcesses(VOID)
     KeReleaseSpinLock(&gProcessLock, oldIrql);
 }
 
-NTSTATUS MsMonProcessStartSession(PCUNICODE_STRING ClientRoot)
+static VOID MsMonFreeRoots(PUNICODE_STRING Roots, ULONG Count)
+{
+    ULONG index;
+    for (index = 0; index < Count; index++) {
+        if (Roots[index].Buffer != NULL) ExFreePoolWithTag(Roots[index].Buffer, MSMON_POOL_TAG);
+    }
+}
+
+static NTSTATUS MsMonCopyRoot(PCUNICODE_STRING Root, PUNICODE_STRING Normalized)
 {
     PWSTR buffer;
-    PWSTR oldBuffer;
-    UNICODE_STRING normalized;
     USHORT length;
 
-    if (ClientRoot == NULL || ClientRoot->Buffer == NULL || ClientRoot->Length == 0 ||
-        ClientRoot->Length >= MSMON_CLIENT_PATH_CHARS * sizeof(WCHAR)) return STATUS_INVALID_PARAMETER;
-    length = ClientRoot->Length;
-    while (length > 3 * sizeof(WCHAR) && ClientRoot->Buffer[length / sizeof(WCHAR) - 1] == L'\\') {
+    if (Root == NULL || Root->Buffer == NULL || Root->Length == 0 ||
+        Root->Length >= MSMON_CLIENT_PATH_CHARS * sizeof(WCHAR)) return STATUS_INVALID_PARAMETER;
+    length = Root->Length;
+    while (length > 3 * sizeof(WCHAR) && Root->Buffer[length / sizeof(WCHAR) - 1] == L'\\') {
         length -= sizeof(WCHAR);
     }
     buffer = ExAllocatePool2(POOL_FLAG_NON_PAGED, (SIZE_T)length + sizeof(WCHAR), MSMON_POOL_TAG);
     if (buffer == NULL) return STATUS_INSUFFICIENT_RESOURCES;
-    RtlCopyMemory(buffer, ClientRoot->Buffer, length);
+    RtlCopyMemory(buffer, Root->Buffer, length);
     buffer[length / sizeof(WCHAR)] = L'\0';
-    RtlInitUnicodeString(&normalized, buffer);
-    normalized.Length = length;
-    normalized.MaximumLength = length + sizeof(WCHAR);
+    Normalized->Buffer = buffer;
+    Normalized->Length = length;
+    Normalized->MaximumLength = length + sizeof(WCHAR);
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS MsMonProcessStartSession(PCUNICODE_STRING Roots, ULONG RootCount)
+{
+    UNICODE_STRING normalized[MSMON_MAX_SCOPE_ROOTS];
+    UNICODE_STRING old[MSMON_MAX_SCOPE_ROOTS];
+    ULONG oldCount;
+    ULONG index;
+    NTSTATUS status;
+
+    if (Roots == NULL || RootCount == 0 || RootCount > MSMON_MAX_SCOPE_ROOTS) return STATUS_INVALID_PARAMETER;
+    RtlZeroMemory(normalized, sizeof(normalized));
+    for (index = 0; index < RootCount; index++) {
+        status = MsMonCopyRoot(&Roots[index], &normalized[index]);
+        if (!NT_SUCCESS(status)) {
+            MsMonFreeRoots(normalized, index);
+            return status;
+        }
+    }
 
     MsMonClearProcesses();
     (VOID)KeWaitForSingleObject(&gRootMutex, Executive, KernelMode, FALSE, NULL);
-    oldBuffer = gClientRoot.Buffer;
-    gClientRoot = normalized;
+    RtlCopyMemory(old, gRoots, sizeof(old));
+    oldCount = gRootCount;
+    RtlCopyMemory(gRoots, normalized, sizeof(gRoots));
+    gRootCount = RootCount;
     gSessionActive = TRUE;
     KeReleaseMutex(&gRootMutex, FALSE);
-    if (oldBuffer != NULL) ExFreePoolWithTag(oldBuffer, MSMON_POOL_TAG);
+    MsMonFreeRoots(old, oldCount);
     return STATUS_SUCCESS;
 }
 
 VOID MsMonProcessStopSession(VOID)
 {
-    PWSTR buffer;
+    UNICODE_STRING old[MSMON_MAX_SCOPE_ROOTS];
+    ULONG oldCount;
     (VOID)KeWaitForSingleObject(&gRootMutex, Executive, KernelMode, FALSE, NULL);
     gSessionActive = FALSE;
-    buffer = gClientRoot.Buffer;
-    gClientRoot.Buffer = NULL;
-    gClientRoot.Length = 0;
-    gClientRoot.MaximumLength = 0;
+    RtlCopyMemory(old, gRoots, sizeof(old));
+    oldCount = gRootCount;
+    RtlZeroMemory(gRoots, sizeof(gRoots));
+    gRootCount = 0;
     KeReleaseMutex(&gRootMutex, FALSE);
-    if (buffer != NULL) ExFreePoolWithTag(buffer, MSMON_POOL_TAG);
+    MsMonFreeRoots(old, oldCount);
     MsMonClearProcesses();
 }
 
@@ -259,7 +309,9 @@ static VOID MsMonProcessNotifyInner(PEPROCESS Process, HANDLE ProcessId, PPS_CRE
     }
     if (MsMonIsTracked(CreateInfo->ParentProcessId, 0)) {
         flags = MsMonFlagInheritedTrack;
-    } else if (MsMonImageUnderRoot(CreateInfo->ImageFileName)) {
+    } else if (MsMonIsTracked(ProcessId, startTime) ||
+               MsMonProcessImageUnderRoot(Process, CreateInfo->ImageFileName)) {
+        /* Already tracked when MsMonImageNotify saw the executable map. */
         flags = MsMonFlagExplicitTrack;
     } else if (MsMonCurrentIsBlackCat()) {
         /*
@@ -314,10 +366,38 @@ static VOID MsMonThreadNotify(HANDLE ProcessId, HANDLE ThreadId, BOOLEAN Create)
     ExReleaseRundownProtection(&gCallbackRundown);
 }
 
+/*
+ * Windows build 26200 delivers the process-create callback before the new
+ * process's executable and ntdll.dll image loads, but that order is not
+ * documented.  If an image load arrives first, start tracking the client
+ * there so those records are not skipped; the create callback then finds it
+ * tracked and logs the process start.  Only a
+ * process whose own image is under the root qualifies, so an unrelated process
+ * that maps a DLL from the client directory is not pulled in.
+ */
+static VOID MsMonTrackClientAtFirstImage(PCUNICODE_STRING FullImageName, HANDLE ProcessId, PIMAGE_INFO ImageInfo)
+{
+    PEPROCESS process = NULL;
+    if (!gSessionActive || ProcessId == NULL || ImageInfo->SystemModeImage) return;
+    if (!MsMonImageUnderRoot(FullImageName)) return;
+    if (!NT_SUCCESS(PsLookupProcessByProcessId(ProcessId, &process))) return;
+    if (MsMonProcessImageUnderRoot(process, NULL) &&
+        !NT_SUCCESS(MsMonTrackProcess(ProcessId, MsMonFlagExplicitTrack))) {
+        MsMonCoverageSkip(MSMON_SKIP_TRACK);
+        MsMonEventsNoteDropped();
+    }
+    ObDereferenceObject(process);
+}
+
 static VOID MsMonImageNotify(PUNICODE_STRING FullImageName, HANDLE ProcessId, PIMAGE_INFO ImageInfo)
 {
     if (!ExAcquireRundownProtection(&gCallbackRundown)) return;
     MsMonCoverageEnter(MSMON_SENSOR_IMAGE_NOTIFY);
+    if (ImageInfo->SystemModeImage) {
+        MsMonAttributionNoteImage(FullImageName, ImageInfo->ImageBase, ImageInfo->ImageSize);
+    } else if (!MsMonIsTracked(ProcessId, 0)) {
+        MsMonTrackClientAtFirstImage(FullImageName, ProcessId, ImageInfo);
+    }
     if (MsMonIsTracked(ProcessId, 0) || MsMonCurrentIsBlackCat()) {
         (VOID)MsMonLogEvent(MsMonImageLoad, ProcessId, NULL, NULL, NULL, 0, 0,
                             STATUS_SUCCESS, 0, MsMonCategoryUnknown,
@@ -370,7 +450,8 @@ NTSTATUS MsMonProcessInitialize(VOID)
     KeInitializeSpinLock(&gProcessLock);
     KeInitializeMutex(&gRootMutex, 0);
     gProcessCount = 0;
-    gClientRoot.Buffer = NULL;
+    RtlZeroMemory(gRoots, sizeof(gRoots));
+    gRootCount = 0;
     gSessionActive = FALSE;
     gProcessNotifyEx = FALSE;
     gProcessNotifyRegistered = FALSE;

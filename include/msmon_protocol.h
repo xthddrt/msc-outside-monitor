@@ -14,10 +14,13 @@ extern "C" {
 #define MSMON_MAX_PAYLOAD_TOTAL_BYTES (8u * 1024u * 1024u)
 #define MSMON_READ_MAX_BYTES (1024u * 1024u)
 #define MSMON_DEFAULT_QUEUE_RECORDS 16384u
-#define MSMON_MAX_QUEUE_RECORDS 32768u
+/* The byte limit bounds nonpaged memory; the record limit only has to exceed what it admits. */
+#define MSMON_MAX_QUEUE_RECORDS 131072u
 #define MSMON_DEFAULT_QUEUE_BYTES (64u * 1024u * 1024u)
 #define MSMON_MAX_QUEUE_BYTES (128u * 1024u * 1024u)
 #define MSMON_CLIENT_PATH_CHARS 260u
+#define MSMON_EXTRA_ROOTS 3u
+#define MSMON_MAX_STACK_FRAMES 24u
 
 typedef enum _MSMON_EVENT_TYPE {
     MsMonProcessStart = 1,
@@ -59,6 +62,7 @@ typedef enum _MSMON_EVENT_TYPE {
     MsMonEtwDns = 101,
     MsMonEtwRpc = 102,
     MsMonEtwUnattributed = 103,
+    MsMonEtwTcp = 104,
     MsMonCoverage = 110,
     MsMonCoverageUsage = 111
 } MSMON_EVENT_TYPE;
@@ -139,7 +143,13 @@ typedef struct _MSMON_EVENT_HEADER {
     unsigned long PayloadKind;
     unsigned long PayloadOffset;
     unsigned long PayloadBytes;
-    unsigned long Reserved;
+    /*
+     * User-mode return addresses of the requesting thread, one unsigned
+     * __int64 each, at StackOffset; both zero when no stack was captured.
+     * These two fields were a zeroed Reserved ULONG, so the layout is unchanged.
+     */
+    unsigned short StackOffset;
+    unsigned short StackFrames;
 } MSMON_EVENT_HEADER;
 
 typedef struct _MSMON_PAYLOAD {
@@ -160,6 +170,11 @@ typedef struct _MSMON_SESSION_CONFIG {
     unsigned long PayloadMode;
     unsigned long Reserved;
     wchar_t ClientRoot[MSMON_CLIENT_PATH_CHARS];
+    /*
+     * Further device-path roots tracked like ClientRoot; empty entries are
+     * unused.  Drivers accept the shorter structure that ends at ClientRoot.
+     */
+    wchar_t ExtraRoots[MSMON_EXTRA_ROOTS][MSMON_CLIENT_PATH_CHARS];
 } MSMON_SESSION_CONFIG;
 
 typedef struct _MSMON_TRACK_REQUEST {

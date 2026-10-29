@@ -72,6 +72,7 @@ Options:
 - `--test-id ID` overrides the generated bundle directory/test ID;
 - `--outcome-override NAME` overrides the computed outcome (use only for killed sessions);
 - `--compact` omits decoded status/flag/access fields;
+- `--extra-root DIRECTORY` adds another tracked root (up to three). Without it, `%ProgramData%\Nexon\NGS` is added when it exists, so the NGS security service is tracked;
 - `--scope-root DIRECTORY` explicitly sets the process scope (the folder containing the client executable);
 - `--pid PID` explicitly tracks another existing process;
 - `--wait-ms N` sets the empty-queue wait, capped by the driver at one second;

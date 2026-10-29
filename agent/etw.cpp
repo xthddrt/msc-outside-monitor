@@ -1,5 +1,6 @@
 #include "etw.h"
 #include <tdh.h>
+#include <winternl.h>
 #include <algorithm>
 #include <cstddef>
 #include <cstring>
@@ -12,35 +13,119 @@
 static const GUID WMI_ACTIVITY = { 0x1418ef04, 0xb0b4, 0x4623, { 0xbf, 0x7e, 0xd7, 0x4a, 0xb4, 0x7b, 0xbd, 0xaa } };
 static const GUID DNS_CLIENT = { 0x1c95126e, 0x7eea, 0x49a9, { 0xa3, 0xfe, 0xa3, 0x78, 0xb0, 0x3d, 0xdb, 0x4d } };
 static const GUID RPC_EVENTS = { 0x6ad52b32, 0xd609, 0x4be9, { 0xae, 0x07, 0xce, 0x8d, 0xae, 0x93, 0x7e, 0x39 } };
+static const GUID TCPIP_EVENTS = { 0x2f07e2ee, 0x15db, 0x40f1, { 0x90, 0xef, 0x9d, 0x7b, 0xa2, 0x82, 0x18, 0x8a } };
+
+/*
+ * Microsoft-Windows-TCPIP keywords ConnectPath | ClosePath | ReceivePath |
+ * Global | TcpipDiagnosis | TcpipTcb.  ReceivePath and Global are chatty on
+ * their own; the event-ID filter keeps only the lifecycle events below.
+ */
+static const ULONGLONG TCPIP_KEYWORDS = 0x0000000400000000ull | 0x0000001000000000ull | 0x0000000200000000ull |
+                                        0x0000008000000000ull | 0x80ull | 0x4ull;
+
+/* Counter slot per provider; -1 for types that are not provider events. */
+static int ProviderIndex(unsigned long type)
+{
+    switch (type) {
+    case MsMonEtwWmi: return 0;
+    case MsMonEtwDns: return 1;
+    case MsMonEtwRpc: return 2;
+    case MsMonEtwTcp: return 3;
+    default: return -1;
+    }
+}
+
+/*
+ * TCP connection lifecycle events kept from Microsoft-Windows-TCPIP.  Each
+ * names who ended a connection and how: a local close or abort, a
+ * disconnect with its status, a shutdown with its reason, or a
+ * retransmission, keep-alive or disconnect timeout.
+ */
+static const wchar_t* TcpEventName(USHORT id)
+{
+    switch (id) {
+    case 1017: return L"accept_completed";
+    case 1033: return L"connect_completed";
+    case 1034: return L"connect_failed";
+    case 1045: return L"connect_timeout";
+    case 1183: return L"connect_reset";
+    case 1186: return L"connect_retransmit";
+    case 1038: return L"close_issued";
+    case 1039: return L"abort_issued";
+    case 1040: return L"abort_completed";
+    case 1043: return L"disconnect_completed";
+    case 1044: return L"shutdown_initiated";
+    case 1046: return L"retransmit_timeout";
+    case 1047: return L"keepalive_timeout";
+    case 1048: return L"disconnect_timeout";
+    case 1201: return L"finwait2_timeout";
+    case 1176: return L"fin_received";
+    case 1184: return L"reset_received";
+    case 1479: return L"reset_sent";
+    default: return nullptr;
+    }
+}
+
+static const std::vector<USHORT> TCPIP_EVENT_IDS = {
+    1017, 1033, 1034, 1038, 1039, 1040, 1043, 1044, 1045, 1046, 1047, 1048, 1183, 1186,
+    1176, 1184, 1201, 1479
+};
 
 static const ULONG ETW_PENDING_LIMIT = 4096;
 static const ULONG ETW_PENDING_MILLISECONDS = 5000;
 
+static const ULONG ETW_CANDIDATE_RECHECK_MILLISECONDS = 1000;
+static const int ETW_CANDIDATE_ANCESTOR_DEPTH = 4;
+
 /*
  * Deferring every untracked PID would turn the log into a system-wide WMI/DNS/
- * RPC feed: on a normal machine thousands of unrelated events would expire into
- * `etw_unattributed` records.  The race this queue actually fixes is narrow --
- * an ETW event from a client process that started moments before the driver's
- * process-start record reaches the agent.  Only defer events from processes
- * whose creation time is inside that same window.
+ * RPC feed.  The race this queue fixes is narrow -- an ETW event from a client
+ * process that started moments before the driver's process-start record
+ * reaches the agent.  Deferring every recently started process let RPC traffic
+ * from unrelated short-lived processes fill the bounded queue and evict the
+ * client's own early events, so only processes that can belong to the client
+ * tree are deferred: one whose image, or a recent ancestor's image, is under
+ * the scope root, or whose parent is already tracked.
  */
-static bool ProcessStartedWithin(DWORD pid, uint64_t nowFileTime, uint64_t window)
-{
-    HANDLE process;
-    FILETIME creation{}, exitTime{}, kernelTime{}, userTime{};
-    ULARGE_INTEGER created;
-    bool ok;
+struct ProcessFacts {
+    bool ok = false;
+    uint64_t created = 0;
+    DWORD parent = 0;
+    std::wstring image;
+};
 
-    if (pid == 0 || pid == 4) return false;
-    process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-    if (process == NULL) return false;
-    ok = GetProcessTimes(process, &creation, &exitTime, &kernelTime, &userTime) != 0;
+static ProcessFacts QueryProcessFacts(DWORD pid)
+{
+    using QueryInformationProcess = NTSTATUS (NTAPI*)(HANDLE, PROCESSINFOCLASS, PVOID, ULONG, PULONG);
+    static const auto query = reinterpret_cast<QueryInformationProcess>(
+        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationProcess"));
+    ProcessFacts facts;
+    FILETIME creation{}, exitTime{}, kernelTime{}, userTime{};
+
+    if (pid == 0 || pid == 4) return facts;
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (process == NULL) return facts;
+    if (GetProcessTimes(process, &creation, &exitTime, &kernelTime, &userTime)) {
+        facts.created = (static_cast<uint64_t>(creation.dwHighDateTime) << 32) | creation.dwLowDateTime;
+        facts.ok = facts.created != 0;
+    }
+    std::vector<wchar_t> path(32768);
+    DWORD size = static_cast<DWORD>(path.size());
+    if (QueryFullProcessImageNameW(process, 0, path.data(), &size)) facts.image.assign(path.data(), size);
+    PROCESS_BASIC_INFORMATION basic{};
+    if (query != nullptr && NT_SUCCESS(query(process, ProcessBasicInformation, &basic, sizeof(basic), nullptr))) {
+        /* Reserved3 is InheritedFromUniqueProcessId. */
+        facts.parent = static_cast<DWORD>(reinterpret_cast<ULONG_PTR>(basic.Reserved3));
+    }
     CloseHandle(process);
-    if (!ok) return false;
-    created.LowPart = creation.dwLowDateTime;
-    created.HighPart = creation.dwHighDateTime;
-    return created.QuadPart != 0 && nowFileTime >= created.QuadPart &&
-           nowFileTime - created.QuadPart <= window;
+    return facts;
+}
+
+static bool UnderRoot(const std::wstring& root, const std::wstring& path)
+{
+    if (root.empty() || path.size() <= root.size()) return false;
+    if (_wcsnicmp(path.c_str(), root.c_str(), root.size()) != 0) return false;
+    return path[root.size()] == L'\\';
 }
 
 static const EVENT_PROPERTY_INFO* FindProperty(const TRACE_EVENT_INFO* info, const std::wstring& name)
@@ -166,8 +251,45 @@ static void AppendField(std::wstring& target, const std::wstring& name, const st
     target += name + L"=" + value;
 }
 
-EtwCollector::EtwCollector(ProcessScope& scope, EventQueue& queue, uint64_t sessionId, bool capturePayloads)
-    : scope_(scope), queue_(queue), sessionId_(sessionId), capturePayloads_(capturePayloads) {}
+EtwCollector::EtwCollector(ProcessScope& scope, EventQueue& queue, uint64_t sessionId, bool capturePayloads,
+                           const std::vector<std::wstring>& scopeRoots)
+    : scope_(scope), queue_(queue), scopeRoots_(scopeRoots), sessionId_(sessionId), capturePayloads_(capturePayloads) {}
+
+bool EtwCollector::MayBelongToClient(DWORD pid, uint64_t nowFileTime)
+{
+    const uint64_t window = static_cast<uint64_t>(ETW_PENDING_MILLISECONDS) * 10000ULL;
+    const uint64_t nowTick = GetTickCount64();
+    auto cached = candidates_.find(pid);
+    if (cached != candidates_.end() && nowTick - cached->second.checkedTick < ETW_CANDIDATE_RECHECK_MILLISECONDS) {
+        return cached->second.candidate && nowFileTime - cached->second.created <= window;
+    }
+
+    ProcessFacts node = QueryProcessFacts(pid);
+    CandidateDecision decision;
+    decision.created = node.created;
+    decision.checkedTick = nowTick;
+    if (node.ok && nowFileTime >= node.created && nowFileTime - node.created <= window) {
+        for (int depth = 0; depth <= ETW_CANDIDATE_ANCESTOR_DEPTH; depth++) {
+            if (std::any_of(scopeRoots_.begin(), scopeRoots_.end(),
+                            [&](const std::wstring& root) { return UnderRoot(root, node.image); })) {
+                decision.candidate = true;
+                break;
+            }
+            if (node.parent == 0 || node.parent == 4) break;
+            if (scope_.IsTracked(node.parent)) {
+                decision.candidate = true;
+                break;
+            }
+            ProcessFacts parent = QueryProcessFacts(node.parent);
+            /* A parent created after its child is a reused PID, not the real parent. */
+            if (!parent.ok || parent.created > node.created) break;
+            node = std::move(parent);
+        }
+    }
+    if (candidates_.size() >= 4096) candidates_.clear();
+    candidates_[pid] = decision;
+    return decision.candidate;
+}
 
 EtwCollector::~EtwCollector()
 {
@@ -187,11 +309,28 @@ ULONG WINAPI EtwCollector::BufferCallback(PEVENT_TRACE_LOGFILEW logfile)
     return TRUE;
 }
 
-void EtwCollector::EnableProvider(const GUID& provider, const std::wstring& name)
+void EtwCollector::EnableProvider(const GUID& provider, const std::wstring& name, ULONGLONG anyKeyword,
+                                  const std::vector<USHORT>& eventIds, bool stacks)
 {
     ENABLE_TRACE_PARAMETERS parameters{};
     parameters.Version = ENABLE_TRACE_PARAMETERS_VERSION_2;
-    parameters.EnableProperty = EVENT_ENABLE_PROPERTY_STACK_TRACE;
+    parameters.EnableProperty = stacks ? EVENT_ENABLE_PROPERTY_STACK_TRACE : 0;
+
+    /* An event-ID filter keeps a chatty provider's other events out of the session entirely. */
+    std::vector<BYTE> filterBuffer;
+    EVENT_FILTER_DESCRIPTOR filter{};
+    if (!eventIds.empty()) {
+        filterBuffer.resize(FIELD_OFFSET(EVENT_FILTER_EVENT_ID, Events) + eventIds.size() * sizeof(USHORT));
+        auto* ids = reinterpret_cast<EVENT_FILTER_EVENT_ID*>(filterBuffer.data());
+        ids->FilterIn = TRUE;
+        ids->Count = static_cast<USHORT>(eventIds.size());
+        std::memcpy(ids->Events, eventIds.data(), eventIds.size() * sizeof(USHORT));
+        filter.Ptr = reinterpret_cast<ULONGLONG>(filterBuffer.data());
+        filter.Size = static_cast<ULONG>(filterBuffer.size());
+        filter.Type = EVENT_FILTER_TYPE_EVENT_ID;
+        parameters.EnableFilterDesc = &filter;
+        parameters.FilterDescCount = 1;
+    }
 
     /*
      * Verbose with no keyword mask asks the provider for all events it can
@@ -200,11 +339,18 @@ void EtwCollector::EnableProvider(const GUID& provider, const std::wstring& name
      * excluded those.  The agent-side PID filter still limits what is written.
      */
     ULONG status = EnableTraceEx2(session_, &provider, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
-                                  TRACE_LEVEL_VERBOSE, 0, 0, 0, &parameters);
-    if (status != ERROR_SUCCESS) {
+                                  TRACE_LEVEL_VERBOSE, anyKeyword, 0, 0, &parameters);
+    if (status != ERROR_SUCCESS && parameters.EnableProperty != 0) {
         parameters.EnableProperty = 0;
         status = EnableTraceEx2(session_, &provider, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
-                                TRACE_LEVEL_VERBOSE, 0, 0, 0, &parameters);
+                                TRACE_LEVEL_VERBOSE, anyKeyword, 0, 0, &parameters);
+    }
+    if (status != ERROR_SUCCESS && parameters.FilterDescCount != 0) {
+        /* Without the filter the agent still keeps only the listed events; it just receives more. */
+        parameters.EnableFilterDesc = nullptr;
+        parameters.FilterDescCount = 0;
+        status = EnableTraceEx2(session_, &provider, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+                                TRACE_LEVEL_VERBOSE, anyKeyword, 0, 0, &parameters);
     }
     if (status != ERROR_SUCCESS) {
         warnings_.push_back(L"ETW provider unavailable: " + name + L" (Win32 " + std::to_wstring(status) + L")");
@@ -236,6 +382,7 @@ bool EtwCollector::Start(std::string& error)
     EnableProvider(WMI_ACTIVITY, L"Microsoft-Windows-WMI-Activity");
     EnableProvider(DNS_CLIENT, L"Microsoft-Windows-DNS-Client");
     EnableProvider(RPC_EVENTS, L"Microsoft-Windows-RPC");
+    EnableProvider(TCPIP_EVENTS, L"Microsoft-Windows-TCPIP", TCPIP_KEYWORDS, TCPIP_EVENT_IDS, false);
 
     EVENT_TRACE_LOGFILEW log{};
     log.LoggerName = loggerName_.data();
@@ -276,7 +423,7 @@ void EtwCollector::Emit(TelemetryEvent&& event)
 {
     if (!event.stackAddresses.empty() && event.stackPid != 0) {
         event.modules = scope_.ResolveStack(event.stackPid, event.stackAddresses.data(),
-                                            event.stackAddresses.size());
+                                            event.stackAddresses.size(), &event.stackUnresolved);
         if (!event.modules.empty()) event.header.Attribution = MsMonAttributionStackResolved;
     }
     /*
@@ -287,9 +434,8 @@ void EtwCollector::Emit(TelemetryEvent&& event)
      */
     std::lock_guard<std::mutex> lock(emitMutex_);
     event.header.Sequence = sequence_.fetch_add(1) + 1;
-    if (event.header.Type >= MsMonEtwWmi && event.header.Type <= MsMonEtwRpc) {
-        emitted_[event.header.Type - MsMonEtwWmi].fetch_add(1);
-    }
+    const int slot = ProviderIndex(event.header.Type);
+    if (slot >= 0) emitted_[slot].fetch_add(1);
     queue_.Push(std::move(event));
 }
 
@@ -302,10 +448,12 @@ void EtwCollector::OnRecord(PEVENT_RECORD record)
         type = MsMonEtwDns;
     } else if (IsEqualGUID(record->EventHeader.ProviderId, RPC_EVENTS)) {
         type = MsMonEtwRpc;
+    } else if (IsEqualGUID(record->EventHeader.ProviderId, TCPIP_EVENTS)) {
+        type = MsMonEtwTcp;
     } else {
         return;
     }
-    received_[type - MsMonEtwWmi].fetch_add(1);
+    received_[ProviderIndex(type)].fetch_add(1);
 
     ULONG infoSize = 0;
     (void)TdhGetEventInformation(record, 0, nullptr, nullptr, &infoSize);
@@ -319,7 +467,11 @@ void EtwCollector::OnRecord(PEVENT_RECORD record)
         parseFailures_.fetch_add(1);
         return;
     }
-    parsed_[type - MsMonEtwWmi].fetch_add(1);
+    parsed_[ProviderIndex(type)].fetch_add(1);
+    if (type == MsMonEtwTcp) {
+        OnTcpRecord(record, info);
+        return;
+    }
 
     DWORD nativePid = record->EventHeader.ProcessId;
     DWORD attributedPid = nativePid;
@@ -406,9 +558,8 @@ void EtwCollector::OnRecord(PEVENT_RECORD record)
         GetSystemTimeAsFileTime(&nowFileTime);
         now.LowPart = nowFileTime.dwLowDateTime;
         now.HighPart = nowFileTime.dwHighDateTime;
-        if (!ProcessStartedWithin(attributedPid, now.QuadPart,
-                                  static_cast<uint64_t>(ETW_PENDING_MILLISECONDS) * 10000ULL)) {
-            /* Long-running, unrelated process: out of scope, as before. */
+        if (!MayBelongToClient(attributedPid, now.QuadPart)) {
+            /* Long-running or unrelated process: out of scope, as before. */
             return;
         }
         const uint64_t deadline = GetTickCount64() + ETW_PENDING_MILLISECONDS;
@@ -418,11 +569,97 @@ void EtwCollector::OnRecord(PEVENT_RECORD record)
             pendingOverflow_.fetch_add(1);
         }
         pending_.push_back({ std::move(event), deadline });
-        deferred_[type - MsMonEtwWmi].fetch_add(1);
+        deferred_[ProviderIndex(type)].fetch_add(1);
         return;
     }
 
     event.header.ProcessStartTime = scope_.StartTime(attributedPid);
+    Emit(std::move(event));
+}
+
+/* SOCKADDR_IN or SOCKADDR_IN6: little-endian family, then the port in network byte order. */
+static std::wstring FormatSocketAddress(const std::vector<BYTE>& data)
+{
+    if (data.size() >= 8 && data[0] == 2 && data[1] == 0) {
+        wchar_t text[32];
+        swprintf_s(text, L"%u.%u.%u.%u:%u", static_cast<unsigned>(data[4]), static_cast<unsigned>(data[5]),
+                   static_cast<unsigned>(data[6]), static_cast<unsigned>(data[7]),
+                   static_cast<unsigned>((data[2] << 8) | data[3]));
+        return text;
+    }
+    if (data.size() >= 24 && data[0] == 23 && data[1] == 0) {
+        std::wstring text = L"[";
+        for (size_t index = 0; index < 16; index += 2) {
+            wchar_t group[8];
+            swprintf_s(group, L"%x", static_cast<unsigned>((data[8 + index] << 8) | data[9 + index]));
+            if (index != 0) text += L':';
+            text += group;
+        }
+        return text + L"]:" + std::to_wstring((data[2] << 8) | data[3]);
+    }
+    return L"?";
+}
+
+void EtwCollector::OnTcpRecord(PEVENT_RECORD record, const TRACE_EVENT_INFO* info)
+{
+    const USHORT id = record->EventHeader.EventDescriptor.Id;
+    const wchar_t* name = TcpEventName(id);
+    if (name == nullptr) return;
+    uint64_t number = 0;
+    uint64_t tcb = 0;
+    DWORD pid = 0;
+    (void)PropertyNumber(record, info, L"Tcb", tcb);
+    if (PropertyNumber(record, info, L"ProcessId", number) && number <= MAXDWORD) pid = static_cast<DWORD>(number);
+
+    std::vector<BYTE> address;
+    std::wstring endpoints;
+    if (PropertyData(record, info, L"LocalAddress", address) || PropertyData(record, info, L"LocalSockAddr", address)) {
+        endpoints = FormatSocketAddress(address) + L" -> ";
+        if (PropertyData(record, info, L"RemoteAddress", address) || PropertyData(record, info, L"RemoteSockAddr", address)) {
+            endpoints += FormatSocketAddress(address);
+        } else {
+            endpoints += L"?";
+        }
+    }
+
+    /*
+     * Connect and accept events name the owning process; later events for the
+     * same connection often carry PID 0 (they run in system context) and the
+     * FIN-delivery event carries no addresses, so the connection's TCB pointer
+     * carries the owner and addresses forward.
+     */
+    if (pid != 0 && tcb != 0 && scope_.IsTracked(pid)) {
+        if (tcbConnections_.size() >= 16384) tcbConnections_.clear();
+        auto& connection = tcbConnections_[tcb];
+        connection.pid = pid;
+        if (!endpoints.empty()) connection.endpoints = endpoints;
+    }
+    if (pid == 0 || !scope_.IsTracked(pid)) {
+        auto found = tcb != 0 ? tcbConnections_.find(tcb) : tcbConnections_.end();
+        if (found == tcbConnections_.end()) return;
+        pid = found->second.pid;
+        if (endpoints.empty()) endpoints = found->second.endpoints;
+    }
+
+    TelemetryEvent event;
+    event.source = "etw";
+    event.header.Size = sizeof(event.header);
+    event.header.Version = MSMON_PROTOCOL_VERSION;
+    event.header.Type = MsMonEtwTcp;
+    event.header.Flags = MsMonFlagObserverRecord;
+    event.header.Timestamp = static_cast<uint64_t>(record->EventHeader.TimeStamp.QuadPart);
+    event.header.SessionId = sessionId_;
+    event.header.ProcessId = pid;
+    event.header.ProcessStartTime = scope_.StartTime(pid);
+    event.header.ThreadId = record->EventHeader.ThreadId;
+    event.header.Attribution = MsMonAttributionProcessOnly;
+    event.header.Value0 = id;
+    event.header.Value1 = tcb;
+    if (PropertyNumber(record, info, L"Status", number)) event.header.Status = static_cast<LONG>(number);
+    event.text = endpoints.empty() ? L"?" : endpoints;
+    event.detail = L"event=" + std::wstring(name);
+    if (PropertyNumber(record, info, L"RexmitCount", number)) AppendField(event.detail, L"rexmit", std::to_wstring(number));
+    if (PropertyNumber(record, info, L"Reason", number)) AppendField(event.detail, L"reason", std::to_wstring(number));
     Emit(std::move(event));
 }
 
@@ -463,9 +700,8 @@ void EtwCollector::ExpirePending(uint64_t nowTick)
         }
     }
     for (auto& original : expired) {
-        if (original.header.Type >= MsMonEtwWmi && original.header.Type <= MsMonEtwRpc) {
-            expired_[original.header.Type - MsMonEtwWmi].fetch_add(1);
-        }
+        const int slot = ProviderIndex(original.header.Type);
+        if (slot >= 0) expired_[slot].fetch_add(1);
         TelemetryEvent event;
         event.source = "etw";
         event.header.Size = sizeof(event.header);
@@ -500,6 +736,7 @@ std::wstring EtwCollector::ProviderName(unsigned long type) const
     case MsMonEtwWmi: return L"Microsoft-Windows-WMI-Activity";
     case MsMonEtwDns: return L"Microsoft-Windows-DNS-Client";
     case MsMonEtwRpc: return L"Microsoft-Windows-RPC";
+    case MsMonEtwTcp: return L"Microsoft-Windows-TCPIP";
     default: return L"unknown";
     }
 }
