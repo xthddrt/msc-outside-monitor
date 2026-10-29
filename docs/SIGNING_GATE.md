@@ -29,12 +29,28 @@ certificate, which matches the EKU change having no effect. These results are no
 evidence that a Microsoft-issued signature is required.
 
 `driver/msmon.vcxproj` now links with `/INTEGRITYCHECK`, and `build.cmd` records the
-flag as `driver_force_integrity` in `build/build-info.json`. With the flag set, the
-kernel validates the signature at load; under `TESTSIGNING` a test-signed build is
-expected to load and register object callbacks. **Not yet verified on the test host:**
-rerun `probe-signing-gate.ps1` and replace this paragraph with the measured slot 23/24
-status. If those slots still report `0xC0000022` on a build with
-`driver_force_integrity: true`, Microsoft attestation signing is the next route to test.
+flag as `driver_force_integrity` in `build/build-info.json`.
+
+## Result with `/INTEGRITYCHECK` (measured)
+
+Measured 2026-10-29 on a second host (Acer Aspire C24-1650, Windows build 26200),
+Secure Boot off, `TESTSIGNING` on. Build `6465015` (`driver_force_integrity: true`)
+was test-signed with a self-signed Code Signing certificate (no Kernel Mode Code
+Signing EKU) and installed with `install-driver.ps1`. A 10-second agent session
+(`reg-check-20261029-105410`) read the registration slots from `coverage.json`:
+
+| Registration | Sensor slot | NTSTATUS |
+|---|---|---|
+| process/thread/image notify, minifilter, registry | 20-27 | `0x00000000` |
+| `ObRegisterCallbacks` (process, thread) | 23-24 | `0x00000000` |
+| WFP callouts (connect, accept, flow; v4 and v6) | 28-33 | `0x00000000` |
+| `FwpmEngineOpen` | 34 | `0x00000000` |
+
+`registration_failed` was 0 and the `coverage_manifest` listed every callback,
+including all six WFP layers. A Microsoft-issued signature is not needed to register
+object callbacks under `TESTSIGNING`; the missing `/INTEGRITYCHECK` flag was the cause.
+This verifies registration only: handle and network events still need to be checked
+against controlled activity (`TEST_VM.md` checklist).
 
 ## WFP result: layer-registration defect, not signing evidence
 
@@ -45,8 +61,8 @@ not a signing error.
 The cause was in `MsMonAddCallout`: `FWPM_CALLOUT.applicableLayer` was zeroed but
 never assigned before `FwpmCalloutAdd`. The driver now assigns the layer GUID passed
 to that function. The initial `0xC0220004` results must not be used as evidence for
-a WFP signing gate. The corrected WFP registration path still needs an isolated
-runtime retest; success must not be inferred from compilation.
+a WFP signing gate. With the fix, all six layers register (see the measured result
+above).
 
 ## Repro
 
@@ -57,15 +73,14 @@ slots. On a `/INTEGRITYCHECK` build all object and WFP slots are expected to rep
 `0x00000000`; any failure should be decoded and investigated on its own rather than
 attributed to signing.
 
-## Interim options
+## Options
 
-1. **Rebuild with `/INTEGRITYCHECK` and rerun the probe.** This is the expected fix for
-   the object-callback denial and keeps everything inside this driver.
-2. **Microsoft attestation signing** (Partner Center; requires an EV certificate), only
-   if option 1 still reports `0xC0000022`. It cannot correct an invalid WFP callout
-   definition.
-3. **Sysmon** (`tools/windows-test/sysmon/`) can supplement process-handle access and
-   connect/DNS telemetry while the driver result is unverified. Its `ProcessAccess`
+1. **Build with `/INTEGRITYCHECK`** (the default now). Verified to clear the
+   object-callback denial under `TESTSIGNING`.
+2. **Microsoft attestation signing** (Partner Center; requires an EV certificate) is
+   needed only to load on machines without `TESTSIGNING`, not to register callbacks.
+3. **Sysmon** (`tools/windows-test/sysmon/`) can cross-check process-handle access and
+   connect/DNS telemetry. Its `ProcessAccess`
    event was observed with source image, target image, and granted access mask. It is
    not a replacement for the driver's thread-handle, duplication, accept, flow-lifetime,
    or BlackCat attribution events.

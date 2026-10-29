@@ -20,5 +20,6 @@ if (Test-Path $summary) { "--- summary ---"; Get-Content $summary }
 "--- driver state (left loaded; reboot to unload) ---"
 (& sc.exe query msmon) -join "`n"
 "--- chain verify ---"
-$parts = Get-ChildItem $bundle.FullName -Filter 'events.jsonl*' | Sort-Object Name | ForEach-Object { $_.FullName }
+# @() keeps a single part an array; splatting a lone string passes it one character at a time.
+$parts = @(Get-ChildItem $bundle.FullName -Filter 'events.jsonl*' | Sort-Object Name | ForEach-Object { $_.FullName })
 if ($parts) { & python "$repo\tools\verify_log.py" @parts }

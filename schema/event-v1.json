@@ -75,6 +75,8 @@
     "detail": {"type": "string"},
     "component": {"type": "string"},
     "modules": {"type": "array", "items": {"type": "string"}},
+    "stack_frames": {"type": "integer", "minimum": 1},
+    "stack_unresolved": {"type": "integer", "minimum": 0},
     "payload_unavailable": {"type": "boolean"},
     "payload": {
       "type": "object",

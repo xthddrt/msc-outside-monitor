@@ -470,6 +470,18 @@
       "status": "active"
     },
     {
+      "sensor_id": "event.etw_tcp",
+      "kind": "event",
+      "event_type": "etw_tcp",
+      "type_id": 104,
+      "implementation": "driver event MsMonEtwTcp",
+      "expected_in": [
+        "network",
+        "gameplay"
+      ],
+      "status": "active"
+    },
+    {
       "sensor_id": "event.coverage",
       "kind": "event",
       "event_type": "coverage",

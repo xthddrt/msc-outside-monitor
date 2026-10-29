@@ -52,7 +52,7 @@ void OutsideClassifier::Classify(TelemetryEvent& event) const
             L"win32_diskdrive", L"win32_physicalmedia", L"win32_networkadapter",
             L"win32_systemenclosure", L"uuid", L"serialnumber", L"macaddress", L"smbios"
         }) ? MsMonCategoryHardwareIdentity : MsMonCategoryWindowsRuntime;
-    } else if (type == MsMonEtwDns) {
+    } else if (type == MsMonEtwDns || type == MsMonEtwTcp) {
         event.header.Category = MsMonCategoryNetwork;
     } else if (type == MsMonEtwRpc) {
         event.header.Category = MsMonCategoryIpc;
@@ -90,7 +90,9 @@ void OutsideClassifier::Classify(TelemetryEvent& event) const
 void SessionSummary::Add(const TelemetryEvent& event)
 {
     events_++;
-    if (event.component == L"BlackCat64.sys") blackCatEvents_++;
+    if (event.source == "driver" && event.header.Type == MsMonProcessStart) trackedStarts_++;
+    /* The driver reports the loaded image's real name: BlackCat1.sys, BlackCat64.sys, ... */
+    if (event.component.size() >= 8 && _wcsnicmp(event.component.c_str(), L"blackcat", 8) == 0) blackCatEvents_++;
     if (event.outsideClient) outsideEvents_++;
     if (event.header.Category == MsMonCategoryHardwareIdentity) hardwareEvents_++;
     if ((event.header.Flags & MsMonFlagPayloadUnavailable) != 0) payloadUnavailable_++;
@@ -138,7 +140,9 @@ std::string SessionSummary::Json(const MSMON_STATISTICS& statistics, uint64_t et
          << ",\"etw_dropped_events\":" << etwDropped
          << ",\"driver_sequence_gaps\":" << driverGaps
          << ",\"etw_sequence_gaps\":" << etwGaps
-         << ",\"tracked_processes\":" << statistics.TrackedProcesses << ",\"by_category\":{";
+         << ",\"tracked_at_start\":" << initiallyTracked_
+         << ",\"tracked_process_starts\":" << trackedStarts_
+         << ",\"tracked_processes_at_end\":" << statistics.TrackedProcesses << ",\"by_category\":{";
     bool first = true;
     for (const auto& item : categories_) {
         if (!first) json << ',';

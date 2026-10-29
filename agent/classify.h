@@ -19,11 +19,14 @@ private:
 class SessionSummary {
 public:
     void Add(const TelemetryEvent& event);
+    void SetInitiallyTracked(uint64_t count) { initiallyTracked_ = count; }
     std::string Json(const MSMON_STATISTICS& statistics, uint64_t etwDropped,
                      uint64_t driverGaps, uint64_t etwGaps) const;
 
 private:
     uint64_t events_ = 0;
+    uint64_t initiallyTracked_ = 0;
+    uint64_t trackedStarts_ = 0;
     uint64_t outsideEvents_ = 0;
     uint64_t hardwareEvents_ = 0;
     uint64_t blackCatEvents_ = 0;

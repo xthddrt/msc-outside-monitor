@@ -63,6 +63,8 @@ def expected_for(name):
         return ["dns", "gameplay"]
     if name == "etw_rpc":
         return ["rpc", "gameplay"]
+    if name == "etw_tcp":
+        return ["network", "gameplay"]
     return ["startup", "shutdown"]
 
 

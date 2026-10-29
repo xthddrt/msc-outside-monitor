@@ -3,13 +3,15 @@
 #include "telemetry.h"
 #include <evntrace.h>
 #include <evntcons.h>
+#include <tdh.h>
 #include <deque>
 #include <mutex>
 #include <thread>
 
 class EtwCollector {
 public:
-    EtwCollector(ProcessScope& scope, EventQueue& queue, uint64_t sessionId, bool capturePayloads);
+    EtwCollector(ProcessScope& scope, EventQueue& queue, uint64_t sessionId, bool capturePayloads,
+                 const std::vector<std::wstring>& scopeRoots);
     ~EtwCollector();
     bool Start(std::string& error);
     void Stop();
@@ -24,18 +26,28 @@ public:
     uint64_t PendingOverflow() const { return pendingOverflow_.load(); }
     uint64_t LostEvents() const { return lostEvents_.load(); }
     uint64_t ParseFailures() const { return parseFailures_.load(); }
-    uint64_t Received(int index) const { return index >= 0 && index < 3 ? received_[index].load() : 0; }
-    uint64_t Parsed(int index) const { return index >= 0 && index < 3 ? parsed_[index].load() : 0; }
-    uint64_t Emitted(int index) const { return index >= 0 && index < 3 ? emitted_[index].load() : 0; }
-    uint64_t Deferred(int index) const { return index >= 0 && index < 3 ? deferred_[index].load() : 0; }
-    uint64_t Expired(int index) const { return index >= 0 && index < 3 ? expired_[index].load() : 0; }
+    static constexpr int PROVIDERS = 4;
+    uint64_t Received(int index) const { return index >= 0 && index < PROVIDERS ? received_[index].load() : 0; }
+    uint64_t Parsed(int index) const { return index >= 0 && index < PROVIDERS ? parsed_[index].load() : 0; }
+    uint64_t Emitted(int index) const { return index >= 0 && index < PROVIDERS ? emitted_[index].load() : 0; }
+    uint64_t Deferred(int index) const { return index >= 0 && index < PROVIDERS ? deferred_[index].load() : 0; }
+    uint64_t Expired(int index) const { return index >= 0 && index < PROVIDERS ? expired_[index].load() : 0; }
 
 private:
     static ULONG WINAPI BufferCallback(PEVENT_TRACE_LOGFILEW logfile);
     void OnRecord(PEVENT_RECORD record);
-    void EnableProvider(const GUID& provider, const std::wstring& name);
+    void OnTcpRecord(PEVENT_RECORD record, const TRACE_EVENT_INFO* info);
+    void EnableProvider(const GUID& provider, const std::wstring& name, ULONGLONG anyKeyword = 0,
+                        const std::vector<USHORT>& eventIds = {}, bool stacks = true);
     void Emit(TelemetryEvent&& event);
     std::wstring ProviderName(unsigned long type) const;
+    bool MayBelongToClient(DWORD pid, uint64_t nowFileTime);
+
+    struct CandidateDecision {
+        uint64_t created = 0;
+        uint64_t checkedTick = 0;
+        bool candidate = false;
+    };
 
     struct PendingEvent {
         TelemetryEvent event;
@@ -44,6 +56,9 @@ private:
 
     ProcessScope& scope_;
     EventQueue& queue_;
+    std::vector<std::wstring> scopeRoots_;
+    /* Touched only by OnRecord on the ETW worker thread. */
+    std::unordered_map<DWORD, CandidateDecision> candidates_;
     uint64_t sessionId_;
     bool capturePayloads_ = true;
     TRACEHANDLE session_ = 0;
@@ -56,11 +71,17 @@ private:
     std::atomic<uint64_t> pendingOverflow_{0};
     std::atomic<uint64_t> lostEvents_{0};
     std::atomic<uint64_t> parseFailures_{0};
-    std::atomic<uint64_t> received_[3]{};
-    std::atomic<uint64_t> parsed_[3]{};
-    std::atomic<uint64_t> emitted_[3]{};
-    std::atomic<uint64_t> deferred_[3]{};
-    std::atomic<uint64_t> expired_[3]{};
+    std::atomic<uint64_t> received_[PROVIDERS]{};
+    std::atomic<uint64_t> parsed_[PROVIDERS]{};
+    std::atomic<uint64_t> emitted_[PROVIDERS]{};
+    std::atomic<uint64_t> deferred_[PROVIDERS]{};
+    std::atomic<uint64_t> expired_[PROVIDERS]{};
+    struct TcpConnection {
+        DWORD pid = 0;
+        std::wstring endpoints;
+    };
+    /* TCP connection (TCB) -> tracked owner and addresses; touched only on the ETW worker thread. */
+    std::unordered_map<uint64_t, TcpConnection> tcbConnections_;
     mutable std::mutex pendingMutex_;
     std::mutex emitMutex_;
     std::deque<PendingEvent> pending_;

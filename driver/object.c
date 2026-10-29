@@ -86,7 +86,8 @@ static VOID MsMonObjectPost(PVOID RegistrationContext, POB_POST_OPERATION_INFORM
     } else if (Information->Operation == OB_OPERATION_HANDLE_DUPLICATE) {
         grantedAccess = Information->Parameters->DuplicateHandleInformation.GrantedAccess;
     }
-    if (!context->ThreadObject && Information->Object != NULL) {
+    /* SeLocateProcessImageName is PASSIVE_LEVEL only; post-operation callbacks can run at APC_LEVEL. */
+    if (!context->ThreadObject && Information->Object != NULL && KeGetCurrentIrql() == PASSIVE_LEVEL) {
         (VOID)SeLocateProcessImageName((PEPROCESS)Information->Object, &imageName);
     }
     (VOID)MsMonLogEvent(context->ThreadObject ? MsMonThreadHandle : MsMonProcessHandle,

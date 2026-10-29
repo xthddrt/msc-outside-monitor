@@ -131,6 +131,81 @@ for the process tracker and the event queue, which used an uninitialised
 `OB_POST_OPERATION_INFORMATION.Parameters` and `Object` are now checked before
 use, and the allocated call context is freed on every path.
 
+### 12. `RtlStringCchPrintfW` in the WFP classify path
+
+Observed 2026-10-29: bugcheck `0xA` (`IRQL_NOT_LESS_OR_EQUAL`) seconds after a
+tracked client opened its first connection. Stack: `msmon!MsMonWfpClassify` ->
+`MsMonFormatIpv4` -> `RtlStringCchPrintfW` -> `nt!vsnwprintf` ->
+`nt!RtlAnsiCharToUnicodeChar` -> `nt!RtlpIsUtf8Process`, faulting on a
+user-mode address in an unrelated process (`mscorsvw.exe`).
+
+Classify runs at `DISPATCH_LEVEL` in arbitrary thread context. The ntstrsafe
+printf family is `PASSIVE_LEVEL` only: the kernel CRT widens formatted digits
+through `RtlAnsiCharToUnicodeChar`, which reads the current process's PEB. The
+path was latent until new-process tracking worked, because classify returns
+before formatting for untracked processes.
+
+Fix: classify builds address and endpoint text by hand (`MsMonAppendText`,
+`MsMonAppendUnsigned`). No printf remains on a `DISPATCH_LEVEL` path. The object
+post-operation callback also now calls `SeLocateProcessImageName` only at
+`PASSIVE_LEVEL`, since post-operation callbacks can run at `APC_LEVEL`.
+
+### 13. Network endpoints logged with reversed addresses and swapped ports
+
+WFP supplies IPv4 addresses and ports in host byte order. The classify path
+printed the least significant octet first and byte-swapped both ports, so
+`172.16.1.118:61399 -> 35.164.63.25:443` was logged as
+`118.1.16.172:55279 -> 25.63.164.35:47873`. Both are now printed as supplied.
+
+### 14. Empty registry values reported as `invalid_value_offset`
+
+For `KeyValueFullInformation`, an empty value's `DataOffset` need not lie inside
+the returned buffer, so a successful query was logged as unavailable. A
+zero-length value is now logged as an empty capture.
+
+### 15. BlackCat was never detected
+
+`MsMonBlackCatName` compared the `.sys` suffix with a loop that also visited the
+string terminator, where its `'\0'` check returned `FALSE`, so no module name
+ever matched: `blackcat_loaded` was never logged and `blackcat_matches` stayed
+0. The suffix is now compared and the terminator required separately. The
+load-image callback also records BlackCat's range when the driver loads, so
+operations from its `DriverEntry` are attributable, and attributed events carry
+the loaded image's real name (`BlackCat1.sys`) instead of a fixed
+`BlackCat64.sys`.
+
+### 16. NGS service outside the tracked scope
+
+The NGS security service runs `%ProgramData%\Nexon\NGS\NGService.exe` and is
+started by the service control manager, so it was neither under the client
+scope nor a tracked descendant. The session configuration now carries up to
+three extra roots (older agents send the shorter structure and still work), and
+the agent adds the NGS folder by default.
+
+## Collector throughput
+
+Observed 2026-10-29: 288,348 driver events dropped in one game session, 95% of
+the client's `file_read` events during its start-up burst. The agent read the
+driver queue on the same thread that decoded, hashed and wrote every record,
+so the 16,384-record queue overflowed. The agent now drains the driver on a
+dedicated thread into a pageable buffer (256 MB limit, peak and back-pressure
+reported in the `driver_pump` coverage record), the default queue is the
+32,768-record maximum, and the log chain hashes with the one-shot `BCryptHash`
+instead of opening a provider per record. A 250,000-read burst in 2 seconds
+was then logged with no drops (peak buffer 46.6 MB).
+
+The next game session still lost 26,825 events (26,697 `file_read`) in a single
+gap during the 62,000-77,000 events/s load peak, which ended as BlackCat
+finished loading. Synthetic bursts of 230,000 reads/s did not reproduce it.
+Device handles are synchronous, so the reader's reads queued behind the main
+thread's once-per-second module refresh, which waits for the kernel's
+loaded-module lock while a 5 MB driver is being loaded and verified. The
+reader now opens its own handle and runs at `THREAD_PRIORITY_HIGHEST`, and the
+queue record limit is 131,072 so the 64 MB byte limit, not the count, bounds
+the driver queue (about 1.7 s at the observed peak instead of 0.4 s). The
+writer sustains roughly 70,000 events/s; larger bursts are absorbed by the
+256 MB reader buffer before back-pressure reaches the driver.
+
 ## Not changed
 
 * Full-payload registry and volume capture is still the default; logs still
