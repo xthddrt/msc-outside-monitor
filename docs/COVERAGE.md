@@ -21,11 +21,11 @@ Three independent axes:
 
 **Activity** — `observed`, `enabled_not_observed`, `skipped`, `disabled`, `registration_failed`, `unsupported`, `not_applicable`, `not_instrumented`.
 
-**Health** — `ok`, `degraded` (a nonzero drop ratio at or below 0.1% by default), `lossy` (a drop ratio above the threshold), `unknown`. The threshold is configurable in `tools/sensor_report.py --drop-ratio`.
+**Health** — `ok`, `lossy` (any drop/loss), `degraded` (drop ratio > 0.1% by default), `unknown`. The threshold is configurable in `tools/sensor_report.py --drop-ratio`.
 
 **Verification** — `verified`, `failing`, `unverified`, from `tests/scenarios/*.json`.
 
-`mapped` and `expected_for_scenario` are flags, not states. A sensor may be `observed + degraded + unverified`.
+`mapped` and `expected_for_scenario` are flags, not states. A sensor may be `observed + lossy + unverified`.
 
 Do not read a zero as dead code. A sensor needs several covering sessions and code review before removal.
 

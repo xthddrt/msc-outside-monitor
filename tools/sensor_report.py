@@ -63,7 +63,7 @@ def main():
             return "unknown"
         if dropped <= 0:
             return "ok"
-        return "lossy" if dropped / attempted > args.drop_ratio else "degraded"
+        return "degraded" if dropped / attempted > args.drop_ratio else "lossy"
 
     results = []
     for item in sensor_map:
