@@ -1,6 +1,6 @@
 # Elevated: export Sysmon events for the client path as NDJSON for later analysis.
 param(
-  [string]$Out = 'C:\msmon-sessions\sysmon-events.json',
+  [string]$Out = 'C:\msmon-sessions\sysmon-events.jsonl',
   [int]$Minutes = 120
 )
 $start = (Get-Date).AddMinutes(-$Minutes)
@@ -16,6 +16,6 @@ $rows = foreach ($e in $events) {
         fields = $d
     }
 }
-$rows | ConvertTo-Json -Depth 4 -Compress | Set-Content $Out -Encoding UTF8
+$rows | ForEach-Object { $_ | ConvertTo-Json -Depth 4 -Compress } | Set-Content $Out -Encoding UTF8
 "wrote $($rows.Count) events to $Out"
 $rows | Group-Object type | Sort-Object Count -Descending | Select-Object Count,Name | Format-Table -AutoSize

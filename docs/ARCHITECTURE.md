@@ -72,4 +72,4 @@ Protected components and direct user-mode hardware APIs can lack a supported att
 
 ## Reliability requirements
 
-The deliverable is a compiled development prototype. It has not been installed or runtime-tested. Before production use it needs isolated VM load/unload testing, Driver Verifier, payload and queue stress tests, buffer-failure tests, PID-reuse testing, WFP/minifilter coexistence checks, formal IRQL and lifetime review, independent security review, and a proper production signing/deployment process.
+The deliverable is a development prototype with limited installation and callback-registration measurements recorded in `docs/SIGNING_GATE.md`. Before production use it needs the full isolated VM load/unload checklist, Driver Verifier, payload and queue stress tests, buffer-failure tests, PID-reuse testing, WFP/minifilter coexistence checks, formal IRQL and lifetime review, independent security review, and a proper production signing/deployment process.

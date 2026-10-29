@@ -1,6 +1,6 @@
 # Isolated test-VM procedure
 
-The driver compiles cleanly with WDK 10.0.26100 (`/W4 /WX`) but has **not been installed or runtime-tested** on this host. Do not first load it on a production host or alongside an active game session.
+The driver compiles cleanly with WDK 10.0.26100 (`/W4 /WX`). Limited installation and callback-registration measurements are recorded in `docs/SIGNING_GATE.md`, but the full runtime checklist remains incomplete. Do not first load a new build on a production host or alongside an active game session.
 
 ## Prepare
 

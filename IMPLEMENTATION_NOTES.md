@@ -3,7 +3,7 @@
 > **Logging/sensor-usage update:** the schema, portable bundle, coverage IOCTL, sensor map, fixture, catalog, and redaction tools from the reconciled final plan are implemented. See `docs/LOG_SCHEMA.md`, `docs/STORAGE.md`, `docs/COVERAGE.md`, `coverage/sensor-map.json`, and `tools/`. Runtime driver verification still requires the isolated VM.
 
 **Base commit:** `41a058da9aaa565a10472b7657f072c739e8e82c`
-**Status:** source changes applied. The user-mode agent and kernel driver both compile cleanly with MSVC `/W4 /WX` against WDK 10.0.26100; the driver output is `build\Release\driver\msmon.sys`. `InfVerif` syntax validation passes; `InfVerif /w` flags the legacy `DIRID 12` destination (not a load blocker for the test-VM procedure). No runtime driver test has been performed.
+**Status:** source changes applied. The user-mode agent and kernel driver both compile cleanly with MSVC `/W4 /WX` against WDK 10.0.26100; the driver output is `build\Release\driver\msmon.sys`. `InfVerif` syntax validation passes; `InfVerif /w` flags the legacy `DIRID 12` destination (not a load blocker for the test-VM procedure). The original slice had no runtime testing; later limited installation and callback-registration measurements are recorded in `docs/SIGNING_GATE.md`, with the full VM checklist still outstanding.
 **Purpose:** first implementation slice from the merged plan, reconciled with the independent branch. Use this file to compare behavior and file-level changes.
 
 ---

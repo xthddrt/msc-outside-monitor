@@ -27,15 +27,17 @@ try { Remove-Item $target -Force -ErrorAction Stop; Say "deleted" } catch { Say 
 try { Copy-Item $src $target -Force -ErrorAction Stop; Say "copied to System32\drivers" } catch { Say "copy failed: $($_.Exception.Message)" }
 
 $imagePath = '\SystemRoot\System32\drivers\msmon.sys'
+$staged = $target
 if (-not (Test-Path $target)) {
   Say "== falling back to a non-System32 driver path =="
   $alt = 'C:\Nexon\ms-test\driver'
   New-Item -ItemType Directory -Force -Path $alt | Out-Null
-  Copy-Item $src (Join-Path $alt 'msmon.sys') -Force
+  $staged = Join-Path $alt 'msmon.sys'
+  Copy-Item $src $staged -Force
   $imagePath = '\??\C:\Nexon\ms-test\driver\msmon.sys'
   Say "imagePath=$imagePath"
 }
-Say ("staged: {0} ({1} bytes, {2})" -f $imagePath, (Get-Item ($target)).Length, (Get-AuthenticodeSignature $target).Status)
+Say ("staged: {0} ({1} bytes, {2})" -f $imagePath, (Get-Item $staged).Length, (Get-AuthenticodeSignature $staged).Status)
 
 Say "== register service =="
 & sc.exe stop msmon | Out-Null
