@@ -17,6 +17,9 @@ before expecting handle or network events.
 | `sysmon/export-events.ps1` | dump Sysmon events to NDJSON next to a session bundle |
 | `sysmon/client-only.xml` | Sysmon config filtered to the client path: ProcessAccess, NetworkConnect, DnsQuery, FileCreate, RegistryEvent, process create/terminate |
 
+Regression tests for the collector (burst drops, module attribution, TCP close reasons, file
+snapshots) are in `regression/`; see `tools/analysis/README.md`.
+
 All of these require an elevated shell. `install-driver.ps1`, `swap-driver.ps1` and
 `probe-signing-gate.ps1` create and trust a self-signed test certificate; remove it and
 uninstall the driver when finished.
