@@ -1,4 +1,4 @@
-# Elevated: probe object-callback signing and WFP registration with a verified build.
+# Elevated: probe object-callback and WFP registration with a verified /INTEGRITYCHECK build.
 $ErrorActionPreference = 'Stop'
 function Say($m) { Write-Host $m }
 $repo = 'C:\Users\richa\Documents\Default Project\msc-outside-monitor'
@@ -11,6 +11,7 @@ if (-not $signtool) { throw 'x64 signtool.exe not found.' }
 if (Get-Process msmon-agent -ErrorAction SilentlyContinue) { throw 'Stop the collector before running this probe.' }
 $buildHash = (Get-FileHash $build -Algorithm SHA256).Hash.ToLower()
 if ($buildHash -ne ([string]$info.driver_sha256).ToLower()) { throw 'Build hash does not match build-info.json.' }
+if ($info.driver_force_integrity -ne $true) { throw 'Build was not linked with /INTEGRITYCHECK (build-info.json driver_force_integrity is not true); rebuild with build.cmd.' }
 
 Say "== cert with code-signing + kernel-mode EKU =="
 $cert = Get-ChildItem Cert:\LocalMachine\My | Where-Object Subject -eq 'CN=msmon kernel test' | Sort-Object NotAfter -Descending | Select-Object -First 1
@@ -38,7 +39,8 @@ if ($LASTEXITCODE -ne 0) { throw "signtool failed with exit code $LASTEXITCODE."
 $signature = Get-AuthenticodeSignature $signed
 if ($signature.Status -ne 'Valid') { throw "Signed build signature status is $($signature.Status)." }
 & sc.exe stop msmon | Out-Host
-if ($LASTEXITCODE -ne 0) { throw "sc stop failed with exit code $LASTEXITCODE." }
+# 1062 = ERROR_SERVICE_NOT_ACTIVE: already stopped is fine.
+if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 1062) { throw "sc stop failed with exit code $LASTEXITCODE." }
 Start-Sleep 1
 Copy-Item $signed $target -Force
 $signedHash = (Get-FileHash $signed -Algorithm SHA256).Hash.ToLower()
@@ -60,6 +62,7 @@ $p = Start-Process -FilePath $agent -WindowStyle Hidden -PassThru -ArgumentList 
   '--client','C:\Nexon\Library\maplestorycw','--log-dir',$logDir,
   '--session-label','probe-eku','--test-id',$testId,
   '--scenario','mixed','--stop-file',$stop)
+$null = $p.Handle  # cache the handle so ExitCode is readable after Wait-Process
 try {
     Start-Sleep 8
     New-Item -ItemType File -Path $stop -Force | Out-Null

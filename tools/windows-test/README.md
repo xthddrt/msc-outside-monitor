@@ -12,7 +12,7 @@ before expecting handle or network events.
 | `swap-driver.ps1` | replace a running build with the current one: verify hash against `build/build-info.json`, sign, stop, deploy, start |
 | `start-agent.ps1` | start `msmon-agent.exe` detached with a stop file |
 | `stop-collector.ps1` | create the stop file, wait for a clean drain, print the summary, verify the chain |
-| `probe-signing-gate.ps1` | regression probe for the `ObRegisterCallbacks` / WFP gate; prints the registration slots from `coverage.json` |
+| `probe-signing-gate.ps1` | regression probe for `ObRegisterCallbacks` / WFP registration; refuses builds without `/INTEGRITYCHECK`, prints the registration slots from `coverage.json` |
 | `sysmon/verify-processaccess.ps1` | prove Sysmon's `ProcessAccess` path works, then restore the tight config |
 | `sysmon/export-events.ps1` | dump Sysmon events to NDJSON next to a session bundle |
 | `sysmon/client-only.xml` | Sysmon config filtered to the client path: ProcessAccess, NetworkConnect, DnsQuery, FileCreate, RegistryEvent, process create/terminate |

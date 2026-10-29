@@ -43,7 +43,8 @@ try {
     Remove-Item $stop -Force -ErrorAction SilentlyContinue
 }
 & sc.exe stop msmon | Out-Host
-if ($LASTEXITCODE -ne 0) { throw "sc stop failed with exit code $LASTEXITCODE." }
+# 1062 = ERROR_SERVICE_NOT_ACTIVE: already stopped is fine.
+if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 1062) { throw "sc stop failed with exit code $LASTEXITCODE." }
 for ($i = 0; $i -lt 30; $i++) {
     if ((& sc.exe query msmon) -notmatch 'RUNNING') { break }
     Start-Sleep -Milliseconds 500

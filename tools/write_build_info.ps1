@@ -21,11 +21,20 @@ function Hash-File([string]$Path) {
     if (Test-Path $Path) { return (Get-FileHash -Algorithm SHA256 -Path $Path).Hash.ToLower() }
     return ''
 }
+# IMAGE_DLLCHARACTERISTICS_FORCE_INTEGRITY (set by /INTEGRITYCHECK); ObRegisterCallbacks denies images without it.
+function Test-ForceIntegrity([string]$Path) {
+    if (-not (Test-Path $Path)) { return $false }
+    $bytes = [System.IO.File]::ReadAllBytes($Path)
+    $pe = [BitConverter]::ToInt32($bytes, 0x3C)
+    $dllCharacteristics = [BitConverter]::ToUInt16($bytes, $pe + 24 + 70)
+    return ($dllCharacteristics -band 0x0080) -ne 0
+}
 $record = [ordered]@{
     schema_version = 1
     commit = "$commit".Trim()
     built_utc = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
     driver_sha256 = Hash-File $driver
+    driver_force_integrity = Test-ForceIntegrity $driver
     agent_sha256 = Hash-File $agent
 }
 $json = $record | ConvertTo-Json

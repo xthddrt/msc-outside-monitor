@@ -16,6 +16,8 @@ $rows = foreach ($e in $events) {
         fields = $d
     }
 }
-$rows | ForEach-Object { $_ | ConvertTo-Json -Depth 4 -Compress } | Set-Content $Out -Encoding UTF8
-"wrote $($rows.Count) events to $Out"
+# One object per line, UTF-8 without BOM so line-oriented JSON readers accept the first line.
+$lines = [string[]]@(foreach ($row in $rows) { $row | ConvertTo-Json -Depth 4 -Compress })
+[System.IO.File]::WriteAllLines($Out, $lines, (New-Object System.Text.UTF8Encoding($false)))
+"wrote $($lines.Length) events to $Out"
 $rows | Group-Object type | Sort-Object Count -Descending | Select-Object Count,Name | Format-Table -AutoSize
