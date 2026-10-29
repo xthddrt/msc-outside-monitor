@@ -2,7 +2,7 @@
 $ErrorActionPreference = 'Continue'
 $stop = 'C:\msmon-sessions\STOP'
 $logDir = 'C:\msmon-sessions'
-$repo = 'C:\Users\richa\Documents\Default Project\msc-outside-monitor'
+$repo = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 
 "stopping via $stop"
 New-Item -ItemType File -Path $stop -Force | Out-Null

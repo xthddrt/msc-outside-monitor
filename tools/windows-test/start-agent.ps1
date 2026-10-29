@@ -6,7 +6,8 @@ param(
   [string]$LogDir = 'C:\msmon-sessions',
   [string]$StopFile = 'C:\msmon-sessions\STOP'
 )
-$agent = 'C:\Users\richa\Documents\Default Project\msc-outside-monitor\build\Release\agent\msmon-agent.exe'
+$repo = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
+$agent = Join-Path $repo 'build\Release\agent\msmon-agent.exe'
 Remove-Item $StopFile -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 $console = Join-Path $LogDir 'agent-console.txt'
@@ -14,7 +15,7 @@ $p = Start-Process -FilePath $agent -WindowStyle Hidden -PassThru `
      -RedirectStandardOutput $console -RedirectStandardError ($console + '.err') `
      -ArgumentList @('--client', $Client, '--log-dir', $LogDir, '--session-label', $Label,
                      '--scenario', $Scenario, '--phase', 'steady', '--iteration', '1',
-                     '--machine-label', 'acer-tc1785', '--stop-file', $StopFile)
+                     '--machine-label', $env:COMPUTERNAME.ToLower(), '--stop-file', $StopFile)
 Start-Sleep -Seconds 4
 $alive = [bool](Get-Process -Id $p.Id -ErrorAction SilentlyContinue)
 "agent pid=$($p.Id) alive=$alive label=$Label"
