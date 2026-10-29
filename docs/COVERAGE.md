@@ -11,9 +11,9 @@ The driver and agent report which monitoring paths executed. This proves executi
 - `SensorLogged[64]`: invocations that emitted at least one record.
 - Skip counters: untracked, unsafe IRQL, missing name, allocation, process tracking, queue.
 - `RegistrationOk` / `RegistrationFailed` bitmasks and `RegistrationStatus[64]`.
-- `BlackCatMatches` and `PayloadCaptured[4]`.
+- `BlackCatMatches` and `PayloadCaptured[4]` (payload chunks captured, by payload kind).
 
-Counters reset at session start. The agent writes `coverage.json` and emits a chained `coverage_usage` record (type 111).
+Session counters reset at session start. `RegistrationOk`, `RegistrationFailed`, and `RegistrationStatus` are recorded at driver load and kept across sessions, so a coverage report read after a session still shows registration results. The agent writes `coverage.json` and emits a chained `coverage_usage` record (type 111).
 
 ## Status model
 
@@ -38,7 +38,7 @@ python tools\generate_sensor_map.py
 python tools\check_sensor_map.py
 ```
 
-The checker fails when an event type, callback slot, or registration slot has no map entry, or a map ID is invalid.
+The checker fails when an event type, callback slot, or registration slot has no map entry, when an event sensor's `type_id` and `event_type` disagree (or a `type_id` is reused), or when a map ID is invalid.
 
 ## Report
 

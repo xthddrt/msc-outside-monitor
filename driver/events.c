@@ -146,7 +146,23 @@ static VOID MsMonCoverageEventDrop(ULONG Type)
 
 VOID MsMonCoverageReset(ULONGLONG SessionId)
 {
-    RtlZeroMemory(&gCoverage, sizeof(gCoverage));
+    /*
+     * Registration happens once at load, so RegistrationOk/Failed/Status are
+     * deliberately kept: the coverage report is read after a session, and
+     * clearing them here would report every registration as never attempted.
+     */
+    RtlZeroMemory(gCoverage.EventAttempted, sizeof(gCoverage.EventAttempted));
+    RtlZeroMemory(gCoverage.EventDropped, sizeof(gCoverage.EventDropped));
+    RtlZeroMemory(gCoverage.SensorEntered, sizeof(gCoverage.SensorEntered));
+    RtlZeroMemory(gCoverage.SensorLogged, sizeof(gCoverage.SensorLogged));
+    RtlZeroMemory(gCoverage.PayloadCaptured, sizeof(gCoverage.PayloadCaptured));
+    gCoverage.SkipUntracked = 0;
+    gCoverage.SkipIrql = 0;
+    gCoverage.SkipNoName = 0;
+    gCoverage.AllocFailures = 0;
+    gCoverage.TrackFailures = 0;
+    gCoverage.QueueDrops = 0;
+    gCoverage.BlackCatMatches = 0;
     gCoverage.Version = MSMON_COVERAGE_VERSION;
     gCoverage.Size = sizeof(gCoverage);
     gCoverage.SessionId = SessionId;
@@ -336,6 +352,9 @@ static NTSTATUS MsMonLogEventInternal(
     InterlockedAdd64(&gQueue.QueuedBytes, recordBytes);
     KeSetEvent(&gQueue.DataAvailable, IO_NO_INCREMENT, FALSE);
     KeReleaseSpinLock(&gQueue.Lock, oldIrql);
+    if (Payload != NULL && Payload->Kind < RTL_NUMBER_OF(gCoverage.PayloadCaptured)) {
+        InterlockedIncrement64((volatile LONG64*)&gCoverage.PayloadCaptured[Payload->Kind]);
+    }
     return STATUS_SUCCESS;
 }
 

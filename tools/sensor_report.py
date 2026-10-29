@@ -111,14 +111,17 @@ def main():
             statuses = driver.get("registration_status", [])
             status = statuses[slot] if slot < len(statuses) else 0
             failed = int(driver.get("registration_failed", 0)) & (1 << slot)
+            succeeded = int(driver.get("registration_ok", 0)) & (1 << slot)
             if not supported:
                 activity = "unsupported" if not coverage else "not_instrumented"
             elif failed:
                 activity = "registration_failed"
                 registration = f"0x{status & 0xFFFFFFFF:08X}"
+            elif succeeded:
+                activity = "observed"
+                registration = "ok"
             else:
                 activity = "enabled_not_observed"
-                registration = "ok"
         elif kind == "agent":
             providers = {entry.get("name"): entry for entry in agent.get("etw_providers", [])}
             provider = providers.get(item.get("provider"), {})

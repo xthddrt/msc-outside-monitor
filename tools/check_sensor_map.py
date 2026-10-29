@@ -27,6 +27,9 @@ def main():
         print("event enum not found", file=sys.stderr)
         return 1
     event_ids = {name: int(value) for name, value in re.findall(r"^\s*(MsMon\w+) = (\d+)", block.group(1), re.M)}
+    # Telemetry spells enum members as snake_case without the MsMon prefix.
+    event_names = {value: re.sub(r"(?<!^)(?=[A-Z])", "_", name.removeprefix("MsMon")).lower()
+                   for name, value in event_ids.items()}
 
     for item in sensors:
         sensor_id = item.get("sensor_id")
@@ -42,10 +45,10 @@ def main():
             event_type = item.get("event_type")
             if not isinstance(type_id, int) or not (0 <= type_id < 128):
                 errors.append(f"{sensor_id}: invalid type_id")
-            if event_type not in {name.removeprefix("MsMon").lower() for name in event_ids} and \
-               event_type not in {"coverage_usage"}:
-                # Names are CamelCase in the enum; accept the telemetry name via type_id check below.
-                pass
+            elif type_id in by_event:
+                errors.append(f"{sensor_id}: duplicate type_id {type_id} (also used by {by_event[type_id]})")
+            elif event_names.get(type_id) != event_type:
+                errors.append(f"{sensor_id}: event_type {event_type!r} does not match type_id {type_id}")
             by_event[type_id] = sensor_id
         elif kind == "callback":
             slot = item.get("slot")

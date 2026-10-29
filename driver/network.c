@@ -12,6 +12,7 @@
 
 VOID MsMonCoverageEnter(ULONG SensorId);
 VOID MsMonCoverageLogged(ULONG SensorId);
+VOID MsMonCoverageSkip(MSMON_SKIP_REASON Reason);
 VOID MsMonCoverageRegister(ULONG SensorId, NTSTATUS Status);
 
 #define MSMON_POOL_TAG 'noSM'
@@ -254,7 +255,10 @@ static VOID NTAPI MsMonWfpClassify(
         if (index >= MSMON_CALLOUT_COUNT || InFixedValues == NULL || InMetaValues == NULL) break;
         if ((InMetaValues->currentMetadataValues & FWPS_METADATA_FIELD_PROCESS_ID) == 0) break;
         if (!MsMonIsTracked(UlongToHandle((ULONG)InMetaValues->processId), 0) &&
-            !MsMonCurrentIsBlackCat()) break;
+            !MsMonCurrentIsBlackCat()) {
+            MsMonCoverageSkip(MSMON_SKIP_UNTRACKED);
+            break;
+        }
         MsMonSelectFields(index, &localAddressField, &remoteAddressField,
                           &localPortField, &remotePortField, &protocolField);
         /*

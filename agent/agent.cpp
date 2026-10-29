@@ -291,7 +291,13 @@ static std::string BuildCoverageJson(
          << ",\"track_failures\":" << delta(coverage.TrackFailures, start ? start->TrackFailures : 0)
          << ",\"queue_drops\":" << delta(coverage.QueueDrops, start ? start->QueueDrops : 0)
          << ",\"blackcat_matches\":" << delta(coverage.BlackCatMatches, start ? start->BlackCatMatches : 0)
-         << "},\"agent\":{\"writer_parts\":" << parts
+         << ",\"payload_captured\":[";
+    for (size_t index = 0; index < std::size(coverage.PayloadCaptured); index++) {
+        if (index != 0) json << ',';
+        json << delta(coverage.PayloadCaptured[index], start ? start->PayloadCaptured[index] : 0);
+    }
+    json << "]}"
+         << ",\"agent\":{\"writer_parts\":" << parts
          << ",\"writer_bytes\":" << bytes
          << ",\"etw_queue_drops\":" << queueDrops;
     if (etw != nullptr) {

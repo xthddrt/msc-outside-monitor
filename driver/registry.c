@@ -486,6 +486,7 @@ static NTSTATUS MsMonRegistryCallback(PVOID CallbackContext, PVOID Argument1, PV
 
     context = MsMonCreateContext(type, path, detail, value0, value1, desiredAccess);
     if (context == NULL) {
+        MsMonCoverageSkip(MSMON_SKIP_ALLOC);
         MsMonEventsNoteDropped();
         return STATUS_SUCCESS;
     }
