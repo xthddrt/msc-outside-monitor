@@ -137,7 +137,12 @@ def main():
                 activity = "skipped"
             else:
                 activity = "enabled_not_observed"
-            health_state = "lossy" if (agent.get("etw_lost", 0) or dropped) else "ok"
+            if agent.get("etw_lost", 0):
+                health_state = "lossy"
+            elif attempted > 0:
+                health_state = health(attempted, dropped)
+            else:
+                health_state = "ok"
 
         expected_for = scenario in item.get("expected_in", []) or sensor_id in expected
         if sensor_id in expected:
