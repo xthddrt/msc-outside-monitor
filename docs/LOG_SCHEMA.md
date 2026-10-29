@@ -6,7 +6,7 @@ The raw JSONL chain is authoritative. Manifest, catalog, reports, and redacted b
 
 ## 1. Record envelope
 
-Every line is one JSON object. Common fields:
+Every line is one JSON object. Telemetry records carry the common fields below; chained `observer_sequence_gap` and `observer_summary` records carry only `type`, `record_index`, `chain`, and their control/summary fields.
 
 | Field | Meaning |
 |---|---|
@@ -161,7 +161,7 @@ Reconstruct by grouping `operation_id`, sorting `byte_offset`, and concatenating
 
 ## 6. Compatibility and legacy
 
-- `schema_version` is 1. Records without it are legacy v4 logs; `validate_schema.py --allow-legacy` skips them.
+- Telemetry `schema_version` is 1. Records without it are legacy v4 logs; `validate_schema.py --allow-legacy` skips them. Observer control/summary records are part of schema v1 without carrying the full telemetry envelope.
 - Existing fields are preserved. New fields are additive.
 - The binary event header is unchanged: `session_id` stays 64-bit.
 - The event identity is `(session_uuid, source, sequence)`.

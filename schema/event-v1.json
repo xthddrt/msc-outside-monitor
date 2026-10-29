@@ -2,28 +2,35 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "msc-outside-monitor event v1",
   "type": "object",
-  "required": [
-    "protocol",
-    "schema_version",
-    "source",
-    "sequence",
-    "timestamp",
-    "session_id",
-    "type",
-    "type_id",
-    "flags",
-    "status",
-    "category",
-    "outside_client",
-    "attribution",
-    "value0",
-    "value1",
-    "operation_id",
-    "text",
-    "detail",
-    "component",
-    "record_index",
-    "chain"
+  "required": ["type", "record_index", "chain"],
+  "oneOf": [
+    {
+      "required": [
+        "protocol",
+        "schema_version",
+        "source",
+        "sequence",
+        "timestamp",
+        "session_id",
+        "type_id",
+        "flags",
+        "status",
+        "category",
+        "outside_client",
+        "attribution",
+        "value0",
+        "value1",
+        "operation_id",
+        "text",
+        "detail",
+        "component"
+      ]
+    },
+    {
+      "properties": {
+        "type": {"enum": ["observer_sequence_gap", "observer_summary"]}
+      }
+    }
   ],
   "properties": {
     "protocol": {"type": "integer", "minimum": 1},

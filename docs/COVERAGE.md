@@ -9,7 +9,7 @@ The driver and agent report which monitoring paths executed. This proves executi
 - `EventAttempted[128]` / `EventDropped[128]`: records/chunks per event type.
 - `SensorEntered[64]`: callback/operation invocations.
 - `SensorLogged[64]`: invocations that emitted at least one record.
-- Skip counters: untracked, unsafe IRQL, missing name, allocation, process tracking, queue.
+- Skip counters: untracked, unsafe IRQL, missing name, allocation, process tracking, queue. Each counts the callout/operation invocations it filtered, in the same unit as `SensorEntered`.
 - `RegistrationOk` / `RegistrationFailed` bitmasks and `RegistrationStatus[64]`.
 - `BlackCatMatches` and `PayloadCaptured[4]` (payload chunks captured, by payload kind).
 
@@ -21,11 +21,11 @@ Three independent axes:
 
 **Activity** — `observed`, `enabled_not_observed`, `skipped`, `disabled`, `registration_failed`, `unsupported`, `not_applicable`, `not_instrumented`.
 
-**Health** — `ok`, `lossy` (any drop/loss), `degraded` (drop ratio > 0.1% by default), `unknown`. The threshold is configurable in `tools/sensor_report.py --drop-ratio`.
+**Health** — `ok`, `degraded` (a nonzero drop ratio at or below 0.1% by default), `lossy` (a drop ratio above the threshold), `unknown`. The threshold is configurable in `tools/sensor_report.py --drop-ratio`.
 
 **Verification** — `verified`, `failing`, `unverified`, from `tests/scenarios/*.json`.
 
-`mapped` and `expected_for_scenario` are flags, not states. A sensor may be `observed + lossy + unverified`.
+`mapped` and `expected_for_scenario` are flags, not states. A sensor may be `observed + degraded + unverified`.
 
 Do not read a zero as dead code. A sensor needs several covering sessions and code review before removal.
 

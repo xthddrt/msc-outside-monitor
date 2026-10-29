@@ -15,7 +15,8 @@
         "event_dropped": {"type": "array", "items": {"type": "integer", "minimum": 0}},
         "sensor_entered": {"type": "array", "items": {"type": "integer", "minimum": 0}},
         "sensor_logged": {"type": "array", "items": {"type": "integer", "minimum": 0}},
-        "registration_status": {"type": "array", "items": {"type": "integer"}}
+        "registration_status": {"type": "array", "items": {"type": "integer"}},
+        "payload_captured": {"type": "array", "items": {"type": "integer", "minimum": 0}}
       },
       "additionalProperties": true
     },

@@ -3,8 +3,8 @@
 
 The standard library has no full JSON Schema engine.  This validator implements
 exactly the keywords used by `schema/*.json`: type, const, enum, pattern,
-minLength, minimum, maximum, required, properties, additionalProperties, items.
-Anything else is ignored, and the docs say so.
+minLength, maxLength, minimum, maximum, required, properties,
+additionalProperties, items, allOf, oneOf. Anything else is ignored, and the docs say so.
 """
 
 import argparse
@@ -97,9 +97,12 @@ def validate(value, schema, path="$", errors=None):
         for child in schema.get(key, []):
             validate(value, child, path, errors)
     if "oneOf" in schema:
-        matches = sum(1 for child in schema["oneOf"] if not validate(value, child, path, []))
+        branch_errors = [validate(value, child, path, []) for child in schema["oneOf"]]
+        matches = sum(1 for item in branch_errors if not item)
         if matches != 1:
             errors.append(f"{path}: expected exactly one oneOf match, got {matches}")
+            if matches == 0 and branch_errors:
+                errors.extend(min(branch_errors, key=len))
     return errors
 
 
