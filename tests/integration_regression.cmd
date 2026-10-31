@@ -19,7 +19,7 @@ if not defined VCVARS (
 call "%VCVARS%" >nul
 if errorlevel 1 exit /b 1
 if not exist "%OUT%" mkdir "%OUT%"
-cl /nologo /W4 /WX /O2 /EHsc /std:c++17 /Fo"%OUT%\\" /Fe:"%OUT%\integration_regression.exe" "%~dp0integration_regression.cpp" "%ROOT%\agent\integrations.cpp" "%ROOT%\agent\telemetry.cpp" bcrypt.lib
+cl /nologo /W4 /WX /O2 /EHsc /std:c++17 /Fo"%OUT%\\" /Fe:"%OUT%\integration_regression.exe" "%~dp0integration_regression.cpp" "%ROOT%\agent\integrations.cpp" "%ROOT%\agent\telemetry.cpp" "%ROOT%\agent\classify.cpp" bcrypt.lib
 if errorlevel 1 exit /b 1
 pushd "%ROOT%"
 "%OUT%\integration_regression.exe"
@@ -54,12 +54,18 @@ popd
 exit /b %RESULT%
 
 :gate
+rem %~1 = JSONL log; requires events == 3 and missing_events == 0.
 where "%PYTHON%" >nul 2>nul
 if errorlevel 1 (
-  echo [fail] %PYTHON% not found; verify_log gate cannot run
+  echo [fail] "%PYTHON%" not found; the verify_log gate cannot run
   exit /b 1
 )
-"%PYTHON%" "%ROOT%\tools\verify_log.py" %~1
-if errorlevel 1 exit /b 1
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$r = & '%PYTHON%' '%ROOT%\tools\verify_log.py' '%OUT%\%~nx1' | ConvertFrom-Json; if ($r.events -ne 3 -or $r.missing_events -ne 0) { Write-Host ('verify_log events=' + $r.events + ' missing=' + $r.missing_events + '; expected 3/0'); exit 1 }"
+"%PYTHON%" "%ROOT%\tools\verify_log.py" "%~1" > "%OUT%\verify_log.json" 2>&1
+if errorlevel 1 (
+  echo [fail] verify_log rejected %~1
+  type "%OUT%\verify_log.json"
+  exit /b 1
+)
+type "%OUT%\verify_log.json"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$r = Get-Content '%OUT%\verify_log.json' -Raw | ConvertFrom-Json; if ($r.events -ne 3 -or $r.missing_events -ne 0) { Write-Host ('verify_log events=' + $r.events + ' missing=' + $r.missing_events + '; expected 3/0 for ' + '%~1'); exit 1 }"
 exit /b %errorlevel%

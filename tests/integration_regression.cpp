@@ -1,4 +1,5 @@
 #include "../agent/integrations.h"
+#include "../agent/classify.h"
 #include <fstream>
 #include <iostream>
 #include <string>
@@ -58,6 +59,29 @@ int main()
     ok &= Check(event.detail.find(L"decision=audit") != std::wstring::npos,
                 "explicit audit rule stays audit");
 
+    /* The decision ring survives across runs: only events from this session may be written. */
+    ok &= Check(!KFilterDecisionInSession(source, source.Timestamp + 1),
+                "a decision from before the session start is excluded");
+    ok &= Check(KFilterDecisionInSession(source, source.Timestamp),
+                "a decision at the session boundary is included");
+    ok &= Check(KFilterDecisionInSession(source, source.Timestamp - 1),
+                "a decision after the session start is included");
+    ok &= Check(KFilterDecisionEvent(source, 77, 1).header.Sequence == 1,
+                "the first accepted decision keeps sequence 1");
+
+    KFILTER_EVENT_4 staleEvent = source;
+    staleEvent.Timestamp = source.Timestamp - 1;
+    KFilterReader sessionReader(77, source.Timestamp);
+    std::vector<TelemetryEvent> converted;
+    sessionReader.ConvertBatch(&staleEvent, 1, converted);
+    ok &= Check(converted.empty(), "a pre-session decision is not converted");
+    sessionReader.ConvertBatch(&source, 1, converted);
+    ok &= Check(converted.size() == 1 && converted.front().header.Sequence == 1,
+                "accepted decisions are numbered from 1");
+    sessionReader.ConvertBatch(&source, 1, converted);
+    ok &= Check(converted.size() == 2 && converted.back().header.Sequence == 2,
+                "numbering continues across batches");
+
     KFILTER_STATUS_4 start{};
     start.DroppedEvents = 3;
     KFILTER_STATUS_4 end = start;
@@ -88,10 +112,35 @@ int main()
     TelemetryEvent firstDecision = KFilterDecisionEvent(source, 77, 1);
     TelemetryEvent secondDecision = KFilterDecisionEvent(source, 77, 2);
 
+    /* Observer coverage carries sequence 0 and must not inflate the event totals. */
+    TelemetryEvent coverage;
+    coverage.source = "agent";
+    coverage.header.Size = sizeof(coverage.header);
+    coverage.header.Version = MSMON_PROTOCOL_VERSION;
+    coverage.header.Type = MsMonCoverage;
+    coverage.header.Flags = MsMonFlagObserverRecord;
+    coverage.header.Timestamp = source.Timestamp;
+    coverage.header.SessionId = 77;
+    coverage.text = L"coverage_usage";
+    ok &= Check(!CountsAsSessionEvent(coverage), "a sequence-0 coverage record is not an event");
+    ok &= Check(CountsAsSessionEvent(firstDecision), "a numbered decision is an event");
+
+    MSMON_STATISTICS statistics{};
+    SessionSummary summary;
+    summary.Add(coverage);
+    ok &= Check(summary.Json(statistics, 0, 0, 0).find("\"events\":0") != std::string::npos,
+                "coverage alone is not counted as an event");
+    summary.Add(firstDecision);
+    summary.Add(secondDecision);
+    summary.Add(integrity);
+    ok &= Check(summary.Json(statistics, 0, 0, 0).find("\"events\":3") != std::string::npos,
+                "observer_summary counts only identified events");
+
     JsonlWriter writer(L"build\\tests\\integration-events.jsonl", 0);
     ok &= Check(writer.Open(), "open JSONL output");
     ok &= Check(writer.Write(TelemetryJson(firstDecision)), "write first KFilter JSON");
     ok &= Check(writer.Write(TelemetryJson(secondDecision)), "write second KFilter JSON");
+    ok &= Check(writer.Write(TelemetryJson(coverage)), "write coverage JSON");
     ok &= Check(writer.Write(TelemetryJson(integrity)), "write CodeIntegrity JSON");
     ok &= Check(writer.Close(), "close JSONL output");
 

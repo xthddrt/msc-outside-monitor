@@ -103,7 +103,13 @@ std::wstring IntegrationCoverageState(bool etwEnabled, const std::wstring& kfilt
            L";wdac=" + (etwEnabled ? L"etw" : L"disabled");
 }
 
-KFilterReader::KFilterReader(uint64_t sessionId) : sessionId_(sessionId) {}
+bool KFilterDecisionInSession(const KFILTER_EVENT_4& event, uint64_t sessionStart)
+{
+    return event.Timestamp >= sessionStart;
+}
+
+KFilterReader::KFilterReader(uint64_t sessionId, uint64_t sessionStart)
+    : sessionId_(sessionId), sessionStart_(sessionStart) {}
 
 KFilterReader::~KFilterReader()
 {
@@ -162,6 +168,16 @@ bool KFilterReader::Open(KFILTER_STATUS_4& status, std::wstring& state, std::wst
     return true;
 }
 
+void KFilterReader::ConvertBatch(const KFILTER_EVENT_4* batch, unsigned count,
+                                 std::vector<TelemetryEvent>& events)
+{
+    for (unsigned index = 0; index < count; index++) {
+        /* Stale decisions from an earlier run are neither written nor numbered. */
+        if (!KFilterDecisionInSession(batch[index], sessionStart_)) continue;
+        events.push_back(KFilterDecisionEvent(batch[index], sessionId_, ++sequence_));
+    }
+}
+
 bool KFilterReader::Drain(std::vector<TelemetryEvent>& events, std::wstring& error)
 {
     KFILTER_EVENT_4 buffer[128];
@@ -180,9 +196,7 @@ bool KFilterReader::Drain(std::vector<TelemetryEvent>& events, std::wstring& err
             return false;
         }
         const unsigned count = bytes / sizeof(KFILTER_EVENT_4);
-        for (unsigned index = 0; index < count; index++) {
-            events.push_back(KFilterDecisionEvent(buffer[index], sessionId_, ++sequence_));
-        }
+        ConvertBatch(buffer, count, events);
         total += count;
         if (count < std::size(buffer) || total >= 2048) return true;
     }

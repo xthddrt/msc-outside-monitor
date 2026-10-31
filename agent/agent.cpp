@@ -1247,7 +1247,9 @@ int wmain(int argc, wchar_t** argv)
     summary.SetInitiallyTracked(initiallyTracked);
     EventQueue etwQueue;
     std::unique_ptr<EtwCollector> etw;
-    KFilterReader kfilter(sessionId);
+    /* The ring keeps decisions from earlier runs; only events from this instant belong here. */
+    const uint64_t kfilterSessionStart = Now();
+    KFilterReader kfilter(sessionId, kfilterSessionStart);
     KFILTER_STATUS_4 kfilterStart{};
     KFILTER_STATUS_4 kfilterLatest{};
     std::wstring kfilterState;
@@ -1448,8 +1450,10 @@ int wmain(int argc, wchar_t** argv)
         }
         classifier.Classify(event);
         summary.Add(event);
-        totalEvents++;
-        eventCounts[event.header.Type]++;
+        if (CountsAsSessionEvent(event)) {
+            totalEvents++;
+            eventCounts[event.header.Type]++;
+        }
         return writer.Write(TelemetryJson(event));
     };
 

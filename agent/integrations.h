@@ -53,18 +53,25 @@ TelemetryEvent KFilterDecisionEvent(const KFILTER_EVENT_4& event, uint64_t sessi
 std::wstring KFilterStatusDetail(const KFILTER_STATUS_4& status, const KFILTER_STATUS_4* start);
 std::wstring IntegrationCoverageState(bool etwEnabled, const std::wstring& kfilterState);
 
+/* The ring survives across agent runs: only decisions stamped at or after the session start
+ * belong to this session. Events at the boundary are included. */
+bool KFilterDecisionInSession(const KFILTER_EVENT_4& event, uint64_t sessionStart);
+
 class KFilterReader {
 public:
-    explicit KFilterReader(uint64_t sessionId);
+    KFilterReader(uint64_t sessionId, uint64_t sessionStart);
     ~KFilterReader();
 
     bool Open(KFILTER_STATUS_4& status, std::wstring& state, std::wstring& detail);
     bool Drain(std::vector<TelemetryEvent>& events, std::wstring& error);
+    /* Visible so the offline regression can exercise the session filter and numbering. */
+    void ConvertBatch(const KFILTER_EVENT_4* batch, unsigned count, std::vector<TelemetryEvent>& events);
     bool Status(KFILTER_STATUS_4& status, std::wstring& error);
     void Close();
 
 private:
     uint64_t sessionId_;
+    uint64_t sessionStart_;
     uint64_t sequence_ = 0;
     HANDLE handle_ = INVALID_HANDLE_VALUE;
 };

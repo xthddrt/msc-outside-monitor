@@ -87,8 +87,14 @@ void OutsideClassifier::Classify(TelemetryEvent& event) const
     event.outsideClient = event.header.Category != MsMonCategoryClientData;
 }
 
+bool CountsAsSessionEvent(const TelemetryEvent& event)
+{
+    return !(event.source == "agent" && event.header.Sequence == 0);
+}
+
 void SessionSummary::Add(const TelemetryEvent& event)
 {
+    if (!CountsAsSessionEvent(event)) return;
     events_++;
     if (event.source == "driver" && event.header.Type == MsMonProcessStart) trackedStarts_++;
     /* The driver reports the loaded image's real name: BlackCat1.sys, BlackCat64.sys, ... */

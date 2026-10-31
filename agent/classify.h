@@ -3,6 +3,10 @@
 #include "telemetry.h"
 #include <map>
 
+/* An agent record with sequence 0 is observer coverage, not a session event; every other
+ * record carries the per-source identity tools/verify_log.py counts. */
+bool CountsAsSessionEvent(const TelemetryEvent& event);
+
 class OutsideClassifier {
 public:
     OutsideClassifier(std::wstring clientDos, std::wstring clientNt,

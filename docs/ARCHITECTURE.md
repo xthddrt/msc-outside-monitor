@@ -62,7 +62,7 @@ TCP connection lifecycle comes from `Microsoft-Windows-TCPIP`, enabled with an e
 
 ### KFilter decisions
 
-When `\\.\KFilter` is available with ABI 4, the agent drains its decision ring during normal collection and shutdown. Each `kfilter_decision` preserves the decision timestamp, PID, path, status, target, action, flags, rights, rule ID, and generation. `WOULD_DENY` is emitted as `would_deny`, not as an enforced block. Start/final status and drop deltas are included in coverage. An absent, incompatible, stopped, or unreadable KFilter disables only this integration.
+When `\\.\KFilter` is available with ABI 4, the agent drains its decision ring during normal collection and shutdown. Each `kfilter_decision` preserves the decision timestamp, PID, path, status, target, action, flags, rights, rule ID, and generation. Decisions stamped before the session start are discarded (the ring is shared across runs), so a restart does not carry an earlier run's decisions into the new session. `WOULD_DENY` is emitted as `would_deny`, not as an enforced block. Start/final status and drop deltas are included in coverage. An absent, incompatible, stopped, or unreadable KFilter disables only this integration.
 
 The ring is a single-consumer destructive read: do not run `kfilterctl watch` or `clear` while the agent collects. KFilter can deny a pre-operation before the lower-altitude monitor sees it, so the decision record may be the only record of that attempt. Allowed activity continues through the existing monitor sensors.
 
