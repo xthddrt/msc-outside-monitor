@@ -1,0 +1,71 @@
+@echo off
+setlocal
+set "ROOT=%~dp0.."
+set "OUT=%ROOT%\build\tests"
+set "PYTHON=python"
+set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
+set "VCVARS="
+if exist "%ProgramFiles%\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat" set "VCVARS=%ProgramFiles%\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
+if not defined VCVARS if exist "%ProgramFiles(x86)%\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat" set "VCVARS=%ProgramFiles(x86)%\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+if not defined VCVARS if exist "%VSWHERE%" (
+  for /f "usebackq delims=" %%i in (`"%VSWHERE%" -latest -products * -property installationPath`) do (
+    if not defined VCVARS if exist "%%i\VC\Auxiliary\Build\vcvars64.bat" set "VCVARS=%%i\VC\Auxiliary\Build\vcvars64.bat"
+  )
+)
+if not defined VCVARS (
+  echo Visual Studio C++ tools were not found.
+  exit /b 1
+)
+call "%VCVARS%" >nul
+if errorlevel 1 exit /b 1
+if not exist "%OUT%" mkdir "%OUT%"
+cl /nologo /W4 /WX /O2 /EHsc /std:c++17 /Fo"%OUT%\\" /Fe:"%OUT%\integration_regression.exe" "%~dp0integration_regression.cpp" "%ROOT%\agent\integrations.cpp" "%ROOT%\agent\telemetry.cpp" "%ROOT%\agent\classify.cpp" bcrypt.lib
+if errorlevel 1 exit /b 1
+pushd "%ROOT%"
+"%OUT%\integration_regression.exe"
+set "RESULT=%errorlevel%"
+if not "%RESULT%"=="0" goto finished
+
+call :gate "build\tests\integration-events.jsonl"
+set "RESULT=%errorlevel%"
+if not "%RESULT%"=="0" goto finished
+
+"%PYTHON%" -c "p='build/tests/integration-events.jsonl';l=open(p).read().splitlines();open('build/tests/integration-events-bad.jsonl','w').write('\n'.join(l[:-1])+'\n')"
+set "RESULT=%errorlevel%"
+if not "%RESULT%"=="0" goto finished
+call :gate "build\tests\integration-events-bad.jsonl"
+if "%errorlevel%"=="0" (
+  echo [fail] verify_log accepted a truncated two-event log
+  set "RESULT=1"
+  goto finished
+)
+
+set "PYTHON=__no_such_python__"
+call :gate "build\tests\integration-events.jsonl"
+if "%errorlevel%"=="0" (
+  echo [fail] missing Python was accepted
+  set "RESULT=1"
+  goto finished
+)
+set "RESULT=0"
+
+:finished
+popd
+exit /b %RESULT%
+
+:gate
+rem %~1 = JSONL log; requires events == 3 and missing_events == 0.
+where "%PYTHON%" >nul 2>nul
+if errorlevel 1 (
+  echo [fail] "%PYTHON%" not found; the verify_log gate cannot run
+  exit /b 1
+)
+"%PYTHON%" "%ROOT%\tools\verify_log.py" "%~1" > "%OUT%\verify_log.json" 2>&1
+if errorlevel 1 (
+  echo [fail] verify_log rejected %~1
+  type "%OUT%\verify_log.json"
+  exit /b 1
+)
+type "%OUT%\verify_log.json"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$r = Get-Content '%OUT%\verify_log.json' -Raw | ConvertFrom-Json; if ($r.events -ne 3 -or $r.missing_events -ne 0) { Write-Host ('verify_log events=' + $r.events + ' missing=' + $r.missing_events + '; expected 3/0 for ' + '%~1'); exit 1 }"
+exit /b %errorlevel%

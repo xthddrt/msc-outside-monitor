@@ -87,8 +87,24 @@ void OutsideClassifier::Classify(TelemetryEvent& event) const
     event.outsideClient = event.header.Category != MsMonCategoryClientData;
 }
 
+bool CountsAsSessionEvent(const TelemetryEvent& event)
+{
+    return !(event.source == "agent" && event.header.Sequence == 0);
+}
+
+void AccountSessionEvent(SessionSummary& summary, const TelemetryEvent& event,
+                         uint64_t& totalEvents,
+                         std::unordered_map<unsigned long, uint64_t>& eventCounts)
+{
+    if (!CountsAsSessionEvent(event)) return;
+    summary.Add(event);
+    totalEvents++;
+    eventCounts[event.header.Type]++;
+}
+
 void SessionSummary::Add(const TelemetryEvent& event)
 {
+    if (!CountsAsSessionEvent(event)) return;
     events_++;
     if (event.source == "driver" && event.header.Type == MsMonProcessStart) trackedStarts_++;
     /* The driver reports the loaded image's real name: BlackCat1.sys, BlackCat64.sys, ... */

@@ -16,6 +16,8 @@ The monitor observes an exact client installation, its descendants, and configur
 | WMI Activity ETW | correlated client PID, namespace/provider/operation, and original query text in full-payload mode |
 | DNS Client ETW | correlated query name and query metadata |
 | RPC ETW | correlated endpoint/operation metadata where client attribution is available |
+| CodeIntegrity ETW | WDAC audit (`3076`) and enforced (`3077`) image decisions, including BlackCat blocks |
+| Optional KFilter device | deny/audit decisions with rule, rights, generation, path, PID, and drop accounting |
 
 For `BlackCat64.sys`, the driver maps the kernel image and checks the active kernel stack. Direct matches are emitted with component `BlackCat64.sys` and `stack_resolved` attribution. This proves BlackCat participated in the operation, not that MapleStory requested it. BlackCat-created children are tracked, and WFP accepts direct BlackCat stack matches. Queued work, shared worker threads, protected code, and BlackCat device IRPs outside existing callbacks remain unattributed.
 
@@ -79,9 +81,11 @@ Options:
 - `--max-file-mb N` rotates output after the threshold with a continuing hash chain;
 - `--queue-records N` and `--queue-mb N` adjust bounded driver buffering;
 - `--stop-file FILE` stops tracking, drains queued events, and writes the final summary when the file appears;
-- `--no-etw` disables the private ETW session and records a coverage warning;
+- `--no-etw` disables the private ETW session, including CodeIntegrity decisions, and records a coverage warning;
 - `--no-payloads` disables exact registry/volume payloads and restores sanitized WMI queries;
 - `--once` reads one driver batch and exits.
+
+KFilter collection is automatic and optional. Its absence, an ABI mismatch, or a read failure records coverage without stopping other sensors. Do not use `kfilterctl watch` or `clear` during collection because they compete for the same destructive ring. A KFilter pre-operation denial need not have a paired native monitor record. CodeIntegrity records are system-wide and do not prove client causality; enforced BlackCat policy should prevent `blackcat_loaded` and BlackCat stack attribution.
 
 Local drive-letter paths are translated to the NT device paths seen by kernel process callbacks. The process scope contains `MapleStory.exe` and its helpers; any executable image beneath the scope root is tracked, and descendants inherit tracking. Existing unrelated browsers and services are logged as interaction targets, not monitored wholesale. The session log contains a `coverage_manifest` record listing the scope/inside roots and the sensors that are actually enabled, so a missing event class is not mistaken for proof of no activity.
 

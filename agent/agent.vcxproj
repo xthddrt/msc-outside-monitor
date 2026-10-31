@@ -13,7 +13,7 @@
   <ImportGroup Label="PropertySheets"><Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" /></ImportGroup>
   <PropertyGroup><OutDir>$(SolutionDir)build\$(Configuration)\agent\</OutDir><IntDir>$(SolutionDir)build\obj\agent\$(Configuration)\</IntDir><TargetName>msmon-agent</TargetName></PropertyGroup>
   <ItemDefinitionGroup><ClCompile><WarningLevel>Level4</WarningLevel><TreatWarningAsError>true</TreatWarningAsError><LanguageStandard>stdcpp17</LanguageStandard><ConformanceMode>true</ConformanceMode></ClCompile><Link><SubSystem>Console</SubSystem><AdditionalDependencies>bcrypt.lib;tdh.lib;%(AdditionalDependencies)</AdditionalDependencies></Link></ItemDefinitionGroup>
-  <ItemGroup><ClCompile Include="agent.cpp" /><ClCompile Include="telemetry.cpp" /><ClCompile Include="etw.cpp" /><ClCompile Include="classify.cpp" /></ItemGroup>
-  <ItemGroup><ClInclude Include="telemetry.h" /><ClInclude Include="etw.h" /><ClInclude Include="classify.h" /><ClInclude Include="..\include\msmon_protocol.h" /></ItemGroup>
+  <ItemGroup><ClCompile Include="agent.cpp" /><ClCompile Include="telemetry.cpp" /><ClCompile Include="etw.cpp" /><ClCompile Include="classify.cpp" /><ClCompile Include="integrations.cpp" /></ItemGroup>
+  <ItemGroup><ClInclude Include="telemetry.h" /><ClInclude Include="etw.h" /><ClInclude Include="classify.h" /><ClInclude Include="integrations.h" /><ClInclude Include="..\include\msmon_protocol.h" /></ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

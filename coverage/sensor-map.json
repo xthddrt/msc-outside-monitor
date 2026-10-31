@@ -482,6 +482,24 @@
       "status": "active"
     },
     {
+      "sensor_id": "event.etw_code_integrity",
+      "kind": "event",
+      "event_type": "etw_code_integrity",
+      "type_id": 105,
+      "implementation": "agent/etw.cpp::OnCodeIntegrityRecord",
+      "expected_in": [],
+      "status": "active"
+    },
+    {
+      "sensor_id": "event.kfilter_decision",
+      "kind": "event",
+      "event_type": "kfilter_decision",
+      "type_id": 120,
+      "implementation": "agent/integrations.cpp::KFilterDecisionEvent",
+      "expected_in": [],
+      "status": "active"
+    },
+    {
       "sensor_id": "event.coverage",
       "kind": "event",
       "event_type": "coverage",
@@ -889,6 +907,14 @@
         "rpc",
         "gameplay"
       ],
+      "status": "active"
+    },
+    {
+      "sensor_id": "etw.codeintegrity",
+      "kind": "agent",
+      "provider": "codeintegrity",
+      "implementation": "agent/etw.cpp",
+      "expected_in": [],
       "status": "active"
     },
     {

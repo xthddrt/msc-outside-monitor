@@ -63,8 +63,10 @@ typedef enum _MSMON_EVENT_TYPE {
     MsMonEtwRpc = 102,
     MsMonEtwUnattributed = 103,
     MsMonEtwTcp = 104,
+    MsMonEtwCodeIntegrity = 105,
     MsMonCoverage = 110,
-    MsMonCoverageUsage = 111
+    MsMonCoverageUsage = 111,
+    MsMonKfilterDecision = 120
 } MSMON_EVENT_TYPE;
 
 typedef enum _MSMON_EVENT_FLAGS {

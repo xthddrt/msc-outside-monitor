@@ -1,6 +1,7 @@
 #include "telemetry.h"
 #include "classify.h"
 #include "etw.h"
+#include "integrations.h"
 #include "../include/msmon_coverage.h"
 #include <tlhelp32.h>
 #include <bcrypt.h>
@@ -255,6 +256,7 @@ struct SessionBinaryInfo {
 static std::string BuildCoverageJson(
     const MSMON_COVERAGE& coverage, const MSMON_COVERAGE* start, bool supported, const EtwCollector* etw,
     uint64_t queueDrops, unsigned parts, uint64_t bytes, const std::wstring& sessionUuid,
+    const std::wstring& kfilterState, uint64_t kfilterDropped,
     const std::unordered_map<unsigned long, uint64_t>& eventCounts)
 {
     auto delta = [&](unsigned __int64 end, unsigned __int64 begin) { return end - begin; };
@@ -304,9 +306,11 @@ static std::string BuildCoverageJson(
     json << "]}"
          << ",\"agent\":{\"writer_parts\":" << parts
          << ",\"writer_bytes\":" << bytes
-         << ",\"etw_queue_drops\":" << queueDrops;
+         << ",\"etw_queue_drops\":" << queueDrops
+         << ",\"kfilter_state\":\"" << JsonEscape(WideToUtf8(kfilterState)) << "\""
+         << ",\"kfilter_dropped_events\":" << kfilterDropped;
     if (etw != nullptr) {
-        static const char* providers[EtwCollector::PROVIDERS] = {"wmi", "dns", "rpc", "tcp"};
+        static const char* providers[EtwCollector::PROVIDERS] = {"wmi", "dns", "rpc", "tcp", "codeintegrity"};
         json << ",\"etw_lost\":" << etw->LostEvents()
              << ",\"etw_parse_failures\":" << etw->ParseFailures()
              << ",\"etw_unattributed\":" << etw->UnattributedCount()
@@ -1243,6 +1247,15 @@ int wmain(int argc, wchar_t** argv)
     summary.SetInitiallyTracked(initiallyTracked);
     EventQueue etwQueue;
     std::unique_ptr<EtwCollector> etw;
+    /* The ring keeps decisions from earlier runs; only events from this instant belong here. */
+    const uint64_t kfilterSessionStart = Now();
+    KFilterReader kfilter(sessionId, kfilterSessionStart);
+    KFILTER_STATUS_4 kfilterStart{};
+    KFILTER_STATUS_4 kfilterLatest{};
+    std::wstring kfilterState;
+    std::wstring kfilterDetail;
+    uint64_t kfilterDropped = 0;
+    bool kfilterActive = false;
 
     auto writeCoverage = [&](const std::wstring& text, const std::wstring& detail,
                              ULONG attribution = MsMonAttributionUnknown) {
@@ -1281,6 +1294,9 @@ int wmain(int argc, wchar_t** argv)
                                L";build_info_present=" + (binaries.buildInfoPresent ? L"true" : L"false");
         if (!writeCoverage(L"session_context", context)) return 1;
     }
+    kfilterActive = kfilter.Open(kfilterStart, kfilterState, kfilterDetail);
+    kfilterLatest = kfilterStart;
+    if (!writeCoverage(kfilterActive ? L"kfilter_status" : kfilterState, kfilterDetail)) return 1;
     {
         std::wstring callbacks;
         bool firstCallback = true;
@@ -1340,8 +1356,7 @@ int wmain(int argc, wchar_t** argv)
                                 L";registry_enum_names=" + registryState +
                                 L";memory=false;ui=false;hardware_direct=false";
         if (!startCoverageSupported) manifest += L";driver_registration=unknown";
-        manifest += L";etw=";
-        manifest += (enableEtw ? L"wmi,dns,rpc,tcp" : L"disabled");
+        manifest += L";" + IntegrationCoverageState(enableEtw, kfilterState);
         manifest += sessionDir.empty() ? L";file_snapshots=disabled" : L";file_snapshots=client_text_files";
         manifest += L";etw_level=verbose;payload_mode=";
         manifest += capturePayloads ? L"full" : L"metadata";
@@ -1434,10 +1449,25 @@ int wmain(int argc, wchar_t** argv)
             }
         }
         classifier.Classify(event);
-        summary.Add(event);
-        totalEvents++;
-        eventCounts[event.header.Type]++;
+        AccountSessionEvent(summary, event, totalEvents, eventCounts);
         return writer.Write(TelemetryJson(event));
+    };
+
+    auto drainKfilter = [&]() {
+        if (!kfilterActive) return true;
+        std::vector<TelemetryEvent> events;
+        std::wstring readError;
+        const bool readOk = kfilter.Drain(events, readError);
+        for (auto& event : events) {
+            if (!writeEvent(event)) return false;
+        }
+        if (!readOk) {
+            kfilterActive = false;
+            kfilterState = L"kfilter_unavailable";
+            kfilter.Close();
+            return writeCoverage(kfilterState, L"decision read failed; integration disabled;error=" + readError);
+        }
+        return true;
     };
 
     auto drainEtw = [&]() {
@@ -1588,7 +1618,7 @@ int wmain(int argc, wchar_t** argv)
             result = 1;
             break;
         }
-        if (result != 0 || !drainEtw()) {
+        if (result != 0 || !drainKfilter() || !drainEtw()) {
             result = 1;
             break;
         }
@@ -1650,6 +1680,20 @@ int wmain(int argc, wchar_t** argv)
         }
     }
 
+    if (!drainKfilter()) result = 1;
+    if (kfilterActive) {
+        std::wstring statusError;
+        if (kfilter.Status(kfilterLatest, statusError)) {
+            kfilterDropped = kfilterLatest.DroppedEvents >= kfilterStart.DroppedEvents ?
+                kfilterLatest.DroppedEvents - kfilterStart.DroppedEvents : 0;
+            if (!writeCoverage(L"kfilter_status", KFilterStatusDetail(kfilterLatest, &kfilterStart))) result = 1;
+        } else {
+            kfilterState = L"kfilter_unavailable";
+            if (!writeCoverage(kfilterState, L"final status failed;error=" + statusError)) result = 1;
+        }
+    }
+    kfilter.Close();
+
     if (etw != nullptr) {
         /*
          * The session is ending: any event still waiting for a process-start
@@ -1702,7 +1746,7 @@ int wmain(int argc, wchar_t** argv)
         WriteTextFile(sessionDir / L"coverage.json",
                       BuildCoverageJson(coverage, startCoveragePtr, coverageSupported, etw.get(),
                                         etwQueue.Dropped(), writer.PartCount(), writer.TotalBytes(),
-                                        sessionUuid, eventCounts));
+                                        sessionUuid, kfilterState, kfilterDropped, eventCounts));
     }
     {
         std::wstring detail = L"schema_version=1;driver_supported=" +

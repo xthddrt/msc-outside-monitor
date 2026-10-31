@@ -222,8 +222,10 @@ std::string EventTypeName(unsigned long type)
     case MsMonEtwRpc: return "etw_rpc";
     case MsMonEtwUnattributed: return "etw_unattributed";
     case MsMonEtwTcp: return "etw_tcp";
+    case MsMonEtwCodeIntegrity: return "etw_code_integrity";
     case MsMonCoverage: return "coverage";
     case MsMonCoverageUsage: return "coverage_usage";
+    case MsMonKfilterDecision: return "kfilter_decision";
     default: return "unknown";
     }
 }

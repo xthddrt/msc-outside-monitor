@@ -14,6 +14,7 @@ static const GUID WMI_ACTIVITY = { 0x1418ef04, 0xb0b4, 0x4623, { 0xbf, 0x7e, 0xd
 static const GUID DNS_CLIENT = { 0x1c95126e, 0x7eea, 0x49a9, { 0xa3, 0xfe, 0xa3, 0x78, 0xb0, 0x3d, 0xdb, 0x4d } };
 static const GUID RPC_EVENTS = { 0x6ad52b32, 0xd609, 0x4be9, { 0xae, 0x07, 0xce, 0x8d, 0xae, 0x93, 0x7e, 0x39 } };
 static const GUID TCPIP_EVENTS = { 0x2f07e2ee, 0x15db, 0x40f1, { 0x90, 0xef, 0x9d, 0x7b, 0xa2, 0x82, 0x18, 0x8a } };
+static const GUID CODE_INTEGRITY_EVENTS = { 0x4ee76bd8, 0x3cf4, 0x44a0, { 0xa0, 0xac, 0x39, 0x37, 0x64, 0x3e, 0x37, 0xa3 } };
 
 /*
  * Microsoft-Windows-TCPIP keywords ConnectPath | ClosePath | ReceivePath |
@@ -31,6 +32,7 @@ static int ProviderIndex(unsigned long type)
     case MsMonEtwDns: return 1;
     case MsMonEtwRpc: return 2;
     case MsMonEtwTcp: return 3;
+    case MsMonEtwCodeIntegrity: return 4;
     default: return -1;
     }
 }
@@ -70,6 +72,7 @@ static const std::vector<USHORT> TCPIP_EVENT_IDS = {
     1017, 1033, 1034, 1038, 1039, 1040, 1043, 1044, 1045, 1046, 1047, 1048, 1183, 1186,
     1176, 1184, 1201, 1479
 };
+static const std::vector<USHORT> CODE_INTEGRITY_EVENT_IDS = {3076, 3077};
 
 static const ULONG ETW_PENDING_LIMIT = 4096;
 static const ULONG ETW_PENDING_MILLISECONDS = 5000;
@@ -383,6 +386,8 @@ bool EtwCollector::Start(std::string& error)
     EnableProvider(DNS_CLIENT, L"Microsoft-Windows-DNS-Client");
     EnableProvider(RPC_EVENTS, L"Microsoft-Windows-RPC");
     EnableProvider(TCPIP_EVENTS, L"Microsoft-Windows-TCPIP", TCPIP_KEYWORDS, TCPIP_EVENT_IDS, false);
+    EnableProvider(CODE_INTEGRITY_EVENTS, L"Microsoft-Windows-CodeIntegrity", 0,
+                   CODE_INTEGRITY_EVENT_IDS, false);
 
     EVENT_TRACE_LOGFILEW log{};
     log.LoggerName = loggerName_.data();
@@ -450,6 +455,8 @@ void EtwCollector::OnRecord(PEVENT_RECORD record)
         type = MsMonEtwRpc;
     } else if (IsEqualGUID(record->EventHeader.ProviderId, TCPIP_EVENTS)) {
         type = MsMonEtwTcp;
+    } else if (IsEqualGUID(record->EventHeader.ProviderId, CODE_INTEGRITY_EVENTS)) {
+        type = MsMonEtwCodeIntegrity;
     } else {
         return;
     }
@@ -470,6 +477,10 @@ void EtwCollector::OnRecord(PEVENT_RECORD record)
     parsed_[ProviderIndex(type)].fetch_add(1);
     if (type == MsMonEtwTcp) {
         OnTcpRecord(record, info);
+        return;
+    }
+    if (type == MsMonEtwCodeIntegrity) {
+        OnCodeIntegrityRecord(record, info);
         return;
     }
 
@@ -663,6 +674,44 @@ void EtwCollector::OnTcpRecord(PEVENT_RECORD record, const TRACE_EVENT_INFO* inf
     Emit(std::move(event));
 }
 
+void EtwCollector::OnCodeIntegrityRecord(PEVENT_RECORD record, const TRACE_EVENT_INFO* info)
+{
+    const USHORT id = record->EventHeader.EventDescriptor.Id;
+    if (id != 3076 && id != 3077) return;
+
+    TelemetryEvent event;
+    event.source = "etw";
+    event.header.Size = sizeof(event.header);
+    event.header.Version = MSMON_PROTOCOL_VERSION;
+    event.header.Type = MsMonEtwCodeIntegrity;
+    event.header.Flags = MsMonFlagObserverRecord;
+    event.header.Timestamp = static_cast<uint64_t>(record->EventHeader.TimeStamp.QuadPart);
+    event.header.SessionId = sessionId_;
+    event.header.ProcessId = record->EventHeader.ProcessId;
+    event.header.ProcessStartTime = scope_.StartTime(event.header.ProcessId);
+    event.header.ThreadId = record->EventHeader.ThreadId;
+    event.header.Attribution = MsMonAttributionUnknown;
+    event.header.Value0 = id;
+    event.component = L"WDAC";
+    event.detail = L"decision=" + std::wstring(id == 3076 ? L"would_block" : L"blocked") +
+                   L";event_id=" + std::to_wstring(id);
+
+    std::wstring value;
+    if (PropertyString(record, info, L"File Name", event.text) ||
+        PropertyString(record, info, L"FileNameBuffer", event.text) ||
+        PropertyString(record, info, L"FileName", event.text) ||
+        PropertyString(record, info, L"ImageName", event.text)) {
+    }
+    if (PropertyString(record, info, L"PolicyNameBuffer", value) ||
+        PropertyString(record, info, L"PolicyName", value)) AppendField(event.detail, L"policy", value);
+    if (PropertyString(record, info, L"PolicyID", value) ||
+        PropertyString(record, info, L"PolicyIdBuffer", value) ||
+        PropertyString(record, info, L"PolicyId", value)) AppendField(event.detail, L"policy_id", value);
+    uint64_t number = 0;
+    if (PropertyNumber(record, info, L"Status", number)) event.header.Status = static_cast<LONG>(number);
+    Emit(std::move(event));
+}
+
 void EtwCollector::ReplayProcess(DWORD pid)
 {
     std::vector<TelemetryEvent> ready;
@@ -737,6 +786,7 @@ std::wstring EtwCollector::ProviderName(unsigned long type) const
     case MsMonEtwDns: return L"Microsoft-Windows-DNS-Client";
     case MsMonEtwRpc: return L"Microsoft-Windows-RPC";
     case MsMonEtwTcp: return L"Microsoft-Windows-TCPIP";
+    case MsMonEtwCodeIntegrity: return L"Microsoft-Windows-CodeIntegrity";
     default: return L"unknown";
     }
 }
