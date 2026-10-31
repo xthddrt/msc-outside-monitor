@@ -24,4 +24,11 @@ pushd "%ROOT%"
 "%OUT%\integration_regression.exe"
 set "RESULT=%errorlevel%"
 popd
-exit /b %RESULT%
+if not "%RESULT%"=="0" exit /b %RESULT%
+where python >nul 2>nul
+if errorlevel 1 (
+  echo [warn] Python was not found; the verify_log gate was skipped.
+  exit /b 0
+)
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$r = & python '%ROOT%\tools\verify_log.py' '%OUT%\integration-events.jsonl' | ConvertFrom-Json; if ($r.events -ne 3 -or $r.missing_events -ne 0) { Write-Host ('verify_log events=' + $r.events + ' missing=' + $r.missing_events + '; expected 3/0'); exit 1 }"
+exit /b %errorlevel%

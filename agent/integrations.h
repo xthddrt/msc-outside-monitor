@@ -48,8 +48,10 @@ typedef struct _KFILTER_READ_REQUEST_4 {
 } KFILTER_READ_REQUEST_4;
 #pragma pack(pop)
 
-TelemetryEvent KFilterDecisionEvent(const KFILTER_EVENT_4& event, uint64_t sessionId);
+/* sequence is required: every decision must carry a non-zero per-source sequence. */
+TelemetryEvent KFilterDecisionEvent(const KFILTER_EVENT_4& event, uint64_t sessionId, uint64_t sequence);
 std::wstring KFilterStatusDetail(const KFILTER_STATUS_4& status, const KFILTER_STATUS_4* start);
+std::wstring IntegrationCoverageState(bool etwEnabled, const std::wstring& kfilterState);
 
 class KFilterReader {
 public:
@@ -63,5 +65,6 @@ public:
 
 private:
     uint64_t sessionId_;
+    uint64_t sequence_ = 0;
     HANDLE handle_ = INVALID_HANDLE_VALUE;
 };

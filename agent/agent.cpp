@@ -1354,9 +1354,7 @@ int wmain(int argc, wchar_t** argv)
                                 L";registry_enum_names=" + registryState +
                                 L";memory=false;ui=false;hardware_direct=false";
         if (!startCoverageSupported) manifest += L";driver_registration=unknown";
-        manifest += L";etw=";
-        manifest += (enableEtw ? L"wmi,dns,rpc,tcp,codeintegrity" : L"disabled");
-        manifest += L";kfilter=" + kfilterState;
+        manifest += L";" + IntegrationCoverageState(enableEtw, kfilterState);
         manifest += sessionDir.empty() ? L";file_snapshots=disabled" : L";file_snapshots=client_text_files";
         manifest += L";etw_level=verbose;payload_mode=";
         manifest += capturePayloads ? L"full" : L"metadata";

@@ -36,7 +36,7 @@ static const wchar_t* KFilterActionName(unsigned long action)
     }
 }
 
-TelemetryEvent KFilterDecisionEvent(const KFILTER_EVENT_4& source, uint64_t sessionId)
+TelemetryEvent KFilterDecisionEvent(const KFILTER_EVENT_4& source, uint64_t sessionId, uint64_t sequence)
 {
     TelemetryEvent event;
     event.source = "agent";
@@ -44,6 +44,7 @@ TelemetryEvent KFilterDecisionEvent(const KFILTER_EVENT_4& source, uint64_t sess
     event.header.Version = MSMON_PROTOCOL_VERSION;
     event.header.Type = MsMonKfilterDecision;
     event.header.Flags = MsMonFlagObserverRecord;
+    event.header.Sequence = sequence;
     event.header.Timestamp = source.Timestamp;
     event.header.SessionId = sessionId;
     event.header.ProcessId = source.ProcessId;
@@ -93,6 +94,13 @@ std::wstring KFilterStatusDetail(const KFILTER_STATUS_4& status, const KFILTER_S
                           L";registered=" + HexValue(status.Registered) +
                           L";degraded=" + HexValue(status.Degraded);
     return detail;
+}
+
+std::wstring IntegrationCoverageState(bool etwEnabled, const std::wstring& kfilterState)
+{
+    return std::wstring(etwEnabled ? L"etw=wmi,dns,rpc,tcp,codeintegrity" : L"etw=disabled") +
+           L";kfilter=" + kfilterState +
+           L";wdac=" + (etwEnabled ? L"etw" : L"disabled");
 }
 
 KFilterReader::KFilterReader(uint64_t sessionId) : sessionId_(sessionId) {}
@@ -173,7 +181,7 @@ bool KFilterReader::Drain(std::vector<TelemetryEvent>& events, std::wstring& err
         }
         const unsigned count = bytes / sizeof(KFILTER_EVENT_4);
         for (unsigned index = 0; index < count; index++) {
-            events.push_back(KFilterDecisionEvent(buffer[index], sessionId_));
+            events.push_back(KFilterDecisionEvent(buffer[index], sessionId_, ++sequence_));
         }
         total += count;
         if (count < std::size(buffer) || total >= 2048) return true;
