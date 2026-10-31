@@ -92,6 +92,16 @@ bool CountsAsSessionEvent(const TelemetryEvent& event)
     return !(event.source == "agent" && event.header.Sequence == 0);
 }
 
+void AccountSessionEvent(SessionSummary& summary, const TelemetryEvent& event,
+                         uint64_t& totalEvents,
+                         std::unordered_map<unsigned long, uint64_t>& eventCounts)
+{
+    if (!CountsAsSessionEvent(event)) return;
+    summary.Add(event);
+    totalEvents++;
+    eventCounts[event.header.Type]++;
+}
+
 void SessionSummary::Add(const TelemetryEvent& event)
 {
     if (!CountsAsSessionEvent(event)) return;

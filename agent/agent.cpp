@@ -1449,11 +1449,7 @@ int wmain(int argc, wchar_t** argv)
             }
         }
         classifier.Classify(event);
-        summary.Add(event);
-        if (CountsAsSessionEvent(event)) {
-            totalEvents++;
-            eventCounts[event.header.Type]++;
-        }
+        AccountSessionEvent(summary, event, totalEvents, eventCounts);
         return writer.Write(TelemetryJson(event));
     };
 

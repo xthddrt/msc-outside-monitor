@@ -2,6 +2,7 @@
 
 #include "telemetry.h"
 #include <map>
+#include <unordered_map>
 
 /* An agent record with sequence 0 is observer coverage, not a session event; every other
  * record carries the per-source identity tools/verify_log.py counts. */
@@ -48,3 +49,9 @@ private:
     std::map<DWORD, uint64_t> targets_;
     std::map<std::wstring, uint64_t> modules_;
 };
+
+/* The session-event accounting the agent writes to session_meta.json and coverage.json: the
+ * summary, the total and the per-type counts move together, so they cannot drift apart. */
+void AccountSessionEvent(SessionSummary& summary, const TelemetryEvent& event,
+                         uint64_t& totalEvents,
+                         std::unordered_map<unsigned long, uint64_t>& eventCounts);

@@ -117,8 +117,9 @@ int main()
     coverage.source = "agent";
     coverage.header.Size = sizeof(coverage.header);
     coverage.header.Version = MSMON_PROTOCOL_VERSION;
-    coverage.header.Type = MsMonCoverage;
+    coverage.header.Type = MsMonCoverageUsage;
     coverage.header.Flags = MsMonFlagObserverRecord;
+    coverage.header.Sequence = 0;
     coverage.header.Timestamp = source.Timestamp;
     coverage.header.SessionId = 77;
     coverage.text = L"coverage_usage";
@@ -135,6 +136,25 @@ int main()
     summary.Add(integrity);
     ok &= Check(summary.Json(statistics, 0, 0, 0).find("\"events\":3") != std::string::npos,
                 "observer_summary counts only identified events");
+
+    /*
+     * The unit the agent uses for session_meta.json and coverage.json: the summary, the total
+     * and the per-type counts must come from one decision, or the counts drift from verify_log.
+     */
+    SessionSummary accounted;
+    uint64_t accountedTotal = 0;
+    std::unordered_map<unsigned long, uint64_t> accountedCounts;
+    AccountSessionEvent(accounted, coverage, accountedTotal, accountedCounts);
+    AccountSessionEvent(accounted, firstDecision, accountedTotal, accountedCounts);
+    AccountSessionEvent(accounted, secondDecision, accountedTotal, accountedCounts);
+    AccountSessionEvent(accounted, integrity, accountedTotal, accountedCounts);
+    ok &= Check(accountedTotal == 3, "session_meta event total matches the verifier");
+    ok &= Check(accounted.Json(statistics, 0, 0, 0).find("\"events\":3") != std::string::npos,
+                "accounted summary matches the session total");
+    ok &= Check(accountedCounts.size() == 2 &&
+                accountedCounts.count(MsMonCoverage) == 0 &&
+                accountedCounts.count(MsMonCoverageUsage) == 0,
+                "coverage records stay out of event_counts");
 
     JsonlWriter writer(L"build\\tests\\integration-events.jsonl", 0);
     ok &= Check(writer.Open(), "open JSONL output");
@@ -160,6 +180,19 @@ int main()
     ok &= Check(sequences.size() == 2, "two decisions were written");
     ok &= Check(sequences.size() == 2 && sequences[0] == "1" && sequences[1] == "2",
                 "written decisions are numbered 1..N");
+
+    /* The fixture must be the record class production writes at shutdown (type 111). */
+    std::ifstream serialized(L"build\\tests\\integration-events.jsonl");
+    unsigned coverageUsageRecords = 0;
+    while (std::getline(serialized, line)) {
+        if (line.find("\"type\":\"coverage_usage\"") == std::string::npos) continue;
+        coverageUsageRecords++;
+        ok &= Check(line.find("\"type_id\":111") != std::string::npos,
+                    "serialized coverage record has the production type id");
+        ok &= Check(line.find("\"sequence\":0") != std::string::npos,
+                    "serialized coverage record stays a non-event");
+    }
+    ok &= Check(coverageUsageRecords == 1, "exactly one coverage_usage record was written");
 
     const std::wstring manifestOn = IntegrationCoverageState(true, L"kfilter_available");
     ok &= Check(manifestOn.find(L"etw=wmi,dns,rpc,tcp,codeintegrity") != std::wstring::npos,
