@@ -2,6 +2,7 @@
 setlocal
 set "ROOT=%~dp0.."
 set "OUT=%ROOT%\build\tests"
+set "PYTHON=python"
 set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
 set "VCVARS="
 if exist "%ProgramFiles%\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat" set "VCVARS=%ProgramFiles%\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
@@ -23,12 +24,42 @@ if errorlevel 1 exit /b 1
 pushd "%ROOT%"
 "%OUT%\integration_regression.exe"
 set "RESULT=%errorlevel%"
-popd
-if not "%RESULT%"=="0" exit /b %RESULT%
-where python >nul 2>nul
-if errorlevel 1 (
-  echo [warn] Python was not found; the verify_log gate was skipped.
-  exit /b 0
+if not "%RESULT%"=="0" goto finished
+
+call :gate "build\tests\integration-events.jsonl"
+set "RESULT=%errorlevel%"
+if not "%RESULT%"=="0" goto finished
+
+"%PYTHON%" -c "p='build/tests/integration-events.jsonl';l=open(p).read().splitlines();open('build/tests/integration-events-bad.jsonl','w').write('\n'.join(l[:-1])+'\n')"
+set "RESULT=%errorlevel%"
+if not "%RESULT%"=="0" goto finished
+call :gate "build\tests\integration-events-bad.jsonl"
+if "%errorlevel%"=="0" (
+  echo [fail] verify_log accepted a truncated two-event log
+  set "RESULT=1"
+  goto finished
 )
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$r = & python '%ROOT%\tools\verify_log.py' '%OUT%\integration-events.jsonl' | ConvertFrom-Json; if ($r.events -ne 3 -or $r.missing_events -ne 0) { Write-Host ('verify_log events=' + $r.events + ' missing=' + $r.missing_events + '; expected 3/0'); exit 1 }"
+
+set "PYTHON=__no_such_python__"
+call :gate "build\tests\integration-events.jsonl"
+if "%errorlevel%"=="0" (
+  echo [fail] missing Python was accepted
+  set "RESULT=1"
+  goto finished
+)
+set "RESULT=0"
+
+:finished
+popd
+exit /b %RESULT%
+
+:gate
+where "%PYTHON%" >nul 2>nul
+if errorlevel 1 (
+  echo [fail] %PYTHON% not found; verify_log gate cannot run
+  exit /b 1
+)
+"%PYTHON%" "%ROOT%\tools\verify_log.py" %~1
+if errorlevel 1 exit /b 1
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$r = & '%PYTHON%' '%ROOT%\tools\verify_log.py' '%OUT%\%~nx1' | ConvertFrom-Json; if ($r.events -ne 3 -or $r.missing_events -ne 0) { Write-Host ('verify_log events=' + $r.events + ' missing=' + $r.missing_events + '; expected 3/0'); exit 1 }"
 exit /b %errorlevel%

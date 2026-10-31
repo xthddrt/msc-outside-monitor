@@ -109,9 +109,8 @@ int main()
         sequences.push_back(line.substr(at + 11, stop - at - 11));
     }
     ok &= Check(sequences.size() == 2, "two decisions were written");
-    ok &= Check(sequences.size() == 2 && sequences[0] != "0" && sequences[1] != "0" &&
-                sequences[0] != sequences[1],
-                "written decisions are numbered and distinct");
+    ok &= Check(sequences.size() == 2 && sequences[0] == "1" && sequences[1] == "2",
+                "written decisions are numbered 1..N");
 
     const std::wstring manifestOn = IntegrationCoverageState(true, L"kfilter_available");
     ok &= Check(manifestOn.find(L"etw=wmi,dns,rpc,tcp,codeintegrity") != std::wstring::npos,
