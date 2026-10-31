@@ -26,7 +26,7 @@ public:
     uint64_t PendingOverflow() const { return pendingOverflow_.load(); }
     uint64_t LostEvents() const { return lostEvents_.load(); }
     uint64_t ParseFailures() const { return parseFailures_.load(); }
-    static constexpr int PROVIDERS = 4;
+    static constexpr int PROVIDERS = 5;
     uint64_t Received(int index) const { return index >= 0 && index < PROVIDERS ? received_[index].load() : 0; }
     uint64_t Parsed(int index) const { return index >= 0 && index < PROVIDERS ? parsed_[index].load() : 0; }
     uint64_t Emitted(int index) const { return index >= 0 && index < PROVIDERS ? emitted_[index].load() : 0; }
@@ -37,6 +37,7 @@ private:
     static ULONG WINAPI BufferCallback(PEVENT_TRACE_LOGFILEW logfile);
     void OnRecord(PEVENT_RECORD record);
     void OnTcpRecord(PEVENT_RECORD record, const TRACE_EVENT_INFO* info);
+    void OnCodeIntegrityRecord(PEVENT_RECORD record, const TRACE_EVENT_INFO* info);
     void EnableProvider(const GUID& provider, const std::wstring& name, ULONGLONG anyKeyword = 0,
                         const std::vector<USHORT>& eventIds = {}, bool stacks = true);
     void Emit(TelemetryEvent&& event);

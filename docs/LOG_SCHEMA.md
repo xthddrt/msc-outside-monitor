@@ -112,8 +112,18 @@ No packet bytes or TLS plaintext.
 | 101 | `etw_dns` | query name | query type/options | provider event ID |
 | 102 | `etw_rpc` | endpoint/protocol | operation/interface | provider event ID |
 | 103 | `etw_unattributed` | provider name | reason/event ID/PID | original type / original event ID |
+| 104 | `etw_tcp` | endpoints | connection event and reason | provider event ID / TCB pointer |
+| 105 | `etw_code_integrity` | blocked or audited image path | `would_block` or `blocked`, event/policy metadata | CodeIntegrity event ID (3076/3077) |
 
-WMI query text is preserved in full-payload mode; `--no-payloads` sanitizes it. Result rows are unavailable.
+WMI query text is preserved in full-payload mode; `--no-payloads` sanitizes it. Result rows are unavailable. CodeIntegrity events are system-wide and do not establish client causality. `--no-etw` disables them with the other ETW sensors.
+
+### Enforcement integrations
+
+| ID | Type | Source/component | Fields |
+|---|---|---|---|
+| 120 | `kfilter_decision` | `agent` / `kfilter.sys` | `text` is the decision path; `detail` preserves target, action, `would_deny`/enforced decision, flags, rights, rule ID, and generation. `value0` is the target ID, `value1` the rule ID, and `desired_access` the rights mask. |
+
+KFilter status coverage records include mode, generation, session tag, counters, and dropped-event deltas. A KFilter denial can precede and prevent the monitor's native post-operation callback, so a paired native failure record is not guaranteed.
 
 ### Coverage
 

@@ -52,6 +52,14 @@ The agent auto-detects `appdata` as the process scope when `--client` names the 
 - Validate logs with `python tools\verify_log.py <parts-in-order>`. Confirm malformed Base64, duplicate/missing/out-of-order chunks, incorrect decoded values, and hash-chain tampering are rejected or reported.
 - Review logs for exact registry values, hardware identifiers, paths, command lines, DNS names, and original WMI queries before sharing them. Never commit real payload logs.
 
+## KFilter and WDAC integration checklist
+
+- Run `tests\integration_regression.cmd` to check synthetic ABI conversion, including `would_deny` versus enforced `deny`, and status drop deltas.
+- With KFilter stopped and no BlackCat policy active, repeat the standalone fixture scenarios. Existing monitor events must still arrive; KFilter absence must produce only `kfilter_unavailable` coverage. Run `verify_log.py`, `session_pack.py`, `validate_schema.py --session`, `sensor_report.py`, and `scenario_check.py` on the bundle.
+- Load KFilter in audit mode and use its synthetic probe for file, registry, volume, handle, process-create, raw-device, pipe, and configured network decisions. Operations must succeed and produce `kfilter_decision` with `decision=would_deny`. Switch to block mode and require `decision=deny`, expected probe failures, matching rule/path/PID, and continuing allowed monitor events. Do not run `kfilterctl watch` or `clear` during collection.
+- Install the BlackCat WDAC policy in Audit first and confirm CodeIntegrity 3076 produces `etw_code_integrity` with `decision=would_block`. After testing Enforce and rebooting, run `Test-BlackCatBlockPolicy.ps1 -TryLoad`; require its documented service refusal, a matching 3077 with `decision=blocked`, and no `blackcat_loaded` event.
+- Run all three together and verify one valid chain, final KFilter status/drop accounting, and normal shutdown. Confirm `fltmc` altitudes 370030 and 385700, run Driver Verifier for both drivers, and stress the KFilter ring until drops are reported. A denied pre-operation need not have a paired native monitor record.
+
 ## Legacy compatibility subsystem
 
 `build\compat\msmon-legacy.sys` and `msmon-legacyctl.exe` are **not part of the default build**. Build them with `build.cmd --with-compat` only. They contain the legacy capability set; inline kernel hooks are compiled in for `trace.c` but disabled by the runtime gate. Do not enable them expecting PatchGuard stability. The build never installs either driver, and compat is not a coverage substitute for the main monitor.

@@ -65,7 +65,7 @@ def main():
                 errors.append(f"{sensor_id}: duplicate registration slot {slot}")
             registration_slots.add(slot)
         elif kind == "agent":
-            if item.get("provider") not in ("wmi", "dns", "rpc"):
+            if item.get("provider") not in ("wmi", "dns", "rpc", "codeintegrity"):
                 errors.append(f"{sensor_id}: invalid provider")
         elif kind == "blind_spot":
             if item.get("status") != "blind_spot":
