@@ -34,7 +34,8 @@ IDENTITY_TEXT = re.compile(
     r"shell folders|volatile environment|identitycrl|susclientid|defaultusername|defaultdomainname",
     re.I,
 )
-CONNECTIONS = {"network_connect", "network_accept", "network_flow_established", "etw_tcp"}
+CONNECTIONS = {"network_connect", "network_accept", "network_flow_established",
+               "network_flow_close", "etw_tcp"}
 DIRECT = {"etw_wmi", "etw_dns", "etw_rpc"}
 
 
@@ -64,7 +65,7 @@ def risk_rules(policy_path):
     with open(policy_path, encoding="utf-8-sig") as stream:
         for line in stream:
             fields = line.strip().split("|")
-            if len(fields) < 4 or fields[0] != "allow":
+            if len(fields) < 4 or fields[0] not in ("allow", "audit", "deny"):
                 continue
             risks = [field[5:] for field in fields[3:] if field.startswith("risk=") and len(field) > 5]
             if risks:
@@ -131,22 +132,30 @@ def self_test():
             {"type": "etw_rpc", "timestamp": "t3", "process_id": 7, "detail": "interface=SAMR;operation=SamrLookupNamesInDomain"},
             {"type": "kfilter_decision", "timestamp": "t4", "process_id": 7, "detail": "action=RISK;rule_id=4"},
             {"type": "registry_query", "timestamp": "t5", "process_id": 7, "text": "\\REGISTRY\\USER\\S-1-5-21\\Software\\Valve"},
+            {"type": "network_flow_close", "timestamp": "t7", "process_id": 8,
+             "text": "10.0.0.5:52000 -> 203.0.113.10:443", "detail": "flow=17;state=closed"},
             {"type": "file_read", "timestamp": "t6", "process_id": 7, "text": "ordinary.txt"},
         ]
         with open(bundle / "events.jsonl", "w", encoding="utf-8") as stream:
             for record in records:
                 stream.write(json.dumps(record) + "\n")
         with open(bundle / "summary.json", "w", encoding="utf-8") as stream:
-            json.dump({"events": 6, "driver_dropped_events": 2}, stream)
+            json.dump({"events": 7, "driver_dropped_events": 2}, stream)
         policy = root / "policy.txt"
-        policy.write_text("allow|network|ip=192.0.2.1/32|port=443|proto=tcp|rights=connect|uses=1|risk=login-endpoint\n", encoding="utf-8")
+        policy.write_text(
+            "allow|network|ip=192.0.2.1/32|port=443|proto=tcp|rights=connect|uses=1|risk=login-endpoint\n"
+            "audit|registry|\\REGISTRY\\MACHINE\\AuditKey|rights=read|risk=audit-reason\n"
+            "deny|registry|\\REGISTRY\\MACHINE\\DenyKey|rights=read|risk=deny-reason\n",
+            encoding="utf-8")
         output = root / "identity.md"
         counts = append_identity_log(bundle, policy, output)
-        assert counts == (5, 1), counts
+        assert counts == (6, 3), counts
         text = output.read_text(encoding="utf-8")
         for expected in ("Win32_ComputerSystemProduct", "login.example", "SamrLookupNamesInDomain",
                          "action=RISK", "Software\\Valve", "login-endpoint", "CPUID/MSR",
-                         "driver_dropped=2", "ordinary.txt"):
+                         "driver_dropped=2", "10.0.0.5:52000 -> 203.0.113.10:443",
+                         "audit-reason", "deny-reason", "\\REGISTRY\\MACHINE\\AuditKey",
+                         "\\REGISTRY\\MACHINE\\DenyKey", "ordinary.txt"):
             if expected == "ordinary.txt":
                 assert expected not in text
             else:
