@@ -1,5 +1,6 @@
 #include "../agent/integrations.h"
 #include "../agent/classify.h"
+#include "../agent/rpc_names.h"
 #include <fstream>
 #include <iostream>
 #include <string>
@@ -14,6 +15,27 @@ static bool Check(bool condition, const char* message)
 int main()
 {
     bool ok = true;
+    const auto& opnumProperties = RpcOpnumProperties();
+    ok &= Check(opnumProperties.size() == 3 && opnumProperties[0] == L"ProcNum" &&
+                opnumProperties[1] == L"OpNum" && opnumProperties[2] == L"OperationNum",
+                "RPC opnum property aliases");
+    GUID wkssvc{ 0x6bffd098, 0xa112, 0x3610,
+                 { 0x98, 0x33, 0x46, 0xc3, 0xf8, 0x7e, 0x34, 0x5a } };
+    ok &= Check(RpcGuidText(wkssvc) == L"6bffd098-a112-3610-9833-46c3f87e345a",
+                "RPC GUID decoding");
+    std::wstring service;
+    std::wstring method;
+    ok &= Check(RpcOperationName(L"{6BFFD098-A112-3610-9833-46C3F87E345A}", 0, service, method) &&
+                service == L"Wkssvc" && method == L"NetrWkstaGetInfo", "Wkssvc operation name");
+    ok &= Check(RpcOperationName(L"5ca4a760-ebb1-11cf-8611-00a0245420ed", 5, service, method) &&
+                service == L"WTS/TermSrvSession" && method == L"RpcGetUserName", "WTS operation name");
+    ok &= Check(RpcOperationName(L"12345778-1234-abcd-ef00-0123456789ab", 7, service, method) &&
+                service == L"LSA/lsarpc" && method == L"LsarQueryInformationPolicy", "LSA operation name");
+    ok &= Check(RpcOperationName(L"12345778-1234-abcd-ef00-0123456789ac", 17, service, method) &&
+                service == L"SAMR" && method == L"SamrLookupNamesInDomain", "SAMR operation name");
+    ok &= Check(!RpcOperationName(L"12345778-1234-abcd-ef00-0123456789ac", 999, service, method),
+                "unknown RPC operation stays raw");
+
     ok &= Check(sizeof(KFILTER_EVENT_4) == 1064 && sizeof(KFILTER_STATUS_4) == 80 &&
                 sizeof(KFILTER_READ_REQUEST_4) == 8, "ABI 4 layouts");
     KFILTER_EVENT_4 source{};
@@ -58,6 +80,12 @@ int main()
     event = KFilterDecisionEvent(source, 77, 4);
     ok &= Check(event.detail.find(L"decision=audit") != std::wstring::npos,
                 "explicit audit rule stays audit");
+    source.Action = 4;
+    event = KFilterDecisionEvent(source, 77, 5);
+    ok &= Check(event.detail.find(L"decision=RISK") != std::wstring::npos &&
+                event.detail.find(L"action=RISK") != std::wstring::npos,
+                "risk rule use is decoded");
+    source.Action = 1;
 
     /* The decision ring survives across runs: only events from this session may be written. */
     ok &= Check(!KFilterDecisionInSession(source, source.Timestamp + 1),
@@ -85,7 +113,7 @@ int main()
     KFILTER_STATUS_4 start{};
     start.DroppedEvents = 3;
     KFILTER_STATUS_4 end = start;
-    end.AbiVersion = 4;
+    end.AbiVersion = 5;
     end.Mode = 2;
     end.DroppedEvents = 8;
     const std::wstring status = KFilterStatusDetail(end, &start);

@@ -34,6 +34,7 @@ Field meanings are in `docs/LOG_SCHEMA.md` and `schema/event-v1.json`. Conventio
 | `time_window.py SESSION START END [--all]` | Every event in a UTC window (`19:52:19.5 19:52:21`) with its calling module; high-volume reads and queries are counted but not listed unless `--all` |
 | `outside_activity.py SESSION` | Command lines (launcher token redacted), file reads outside the client folder, registry writes outside the game's own settings |
 | `payload_unavailable.py SESSION` | Why registry or volume values were not captured |
+| `identity_log.py --bundle SESSION --policy POLICY --out LOG` | Append WMI/DNS/RPC, identity, connection, driver-load and RISK events plus every current `risk=` rule to the kfilter identity log. Run after every captured game session. |
 
 Typical order: `session_health.py`, then `session_activity.py`, then the narrower scripts for a question.
 The game sessions are large (hundreds of MB), so each script takes a minute or two.

@@ -2,7 +2,7 @@
 
 #include "telemetry.h"
 
-#define KFILTER_ABI_VERSION_4 4u
+#define KFILTER_ABI_VERSION_5 5u
 #define KFILTER_MAX_NAME_4 512u
 #define KFILTER_EVENT_FLAG_WOULD_DENY_4 0x00000001u
 

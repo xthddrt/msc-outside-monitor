@@ -32,6 +32,7 @@ static const wchar_t* KFilterActionName(unsigned long action)
     case 1u: return L"audit";
     case 2u: return L"allow";
     case 3u: return L"deny";
+    case 4u: return L"RISK";
     default: return L"unknown";
     }
 }
@@ -157,9 +158,9 @@ bool KFilterReader::Open(KFILTER_STATUS_4& status, std::wstring& state, std::wst
         Close();
         return false;
     }
-    if (status.AbiVersion != KFILTER_ABI_VERSION_4) {
+    if (status.AbiVersion != KFILTER_ABI_VERSION_5) {
         state = L"kfilter_unsupported";
-        detail = L"abi=" + std::to_wstring(status.AbiVersion) + L";required=4";
+        detail = L"abi=" + std::to_wstring(status.AbiVersion) + L";required=5";
         Close();
         return false;
     }

@@ -110,7 +110,7 @@ No packet bytes or TLS plaintext.
 |---|---|---|---|---|
 | 100 | `etw_wmi` | namespace/provider | operation/query/language | provider event ID / operation ID |
 | 101 | `etw_dns` | query name | query type/options | provider event ID |
-| 102 | `etw_rpc` | endpoint/protocol | operation/interface | provider event ID |
+| 102 | `etw_rpc` | endpoint/protocol | service/interface, operation/method, raw interface UUID and opnum | provider event ID |
 | 103 | `etw_unattributed` | provider name | reason/event ID/PID | original type / original event ID |
 | 104 | `etw_tcp` | endpoints | connection event and reason | provider event ID / TCB pointer |
 | 105 | `etw_code_integrity` | blocked or audited image path | `would_block` or `blocked`, event/policy metadata | CodeIntegrity event ID (3076/3077) |
