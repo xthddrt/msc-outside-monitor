@@ -37,6 +37,15 @@ int main()
                 service == L"SAMR" && method == L"SamrLookupNamesInDomain", "SAMR operation name");
     ok &= Check(!RpcOperationName(L"12345778-1234-abcd-ef00-0123456789ac", 999, service, method),
                 "unknown RPC operation stays raw");
+    ok &= Check(MsMonNetworkUnregisterComplete(0) != 0, "callout unregister success is complete");
+    ok &= Check(MsMonNetworkUnregisterComplete(static_cast<long>(0xC0220001)) != 0,
+                "callout already absent is complete");
+    ok &= Check(MsMonNetworkUnregisterComplete(static_cast<long>(0xC022000A)) == 0,
+                "callout in use is not complete");
+    ok &= Check(MsMonNetworkUnregisterComplete(static_cast<long>(0x80000011)) == 0,
+                "busy callout is not complete");
+    ok &= Check(MsMonNetworkUnregisterComplete(static_cast<long>(0xC0000001)) == 0,
+                "ordinary unregister failure is not complete");
 
     ok &= Check(sizeof(KFILTER_EVENT_4) == 1064 && sizeof(KFILTER_STATUS_4) == 80 &&
                 sizeof(KFILTER_READ_REQUEST_4) == 8, "ABI 4 layouts");
