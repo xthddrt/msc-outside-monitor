@@ -44,6 +44,9 @@ int main()
         scope.AddProcess(42, 100, L"C:\\client.exe");
         ok &= Check(collector.ReplayProcess(42) == 1, "the deferred event is released for its incarnation");
         ok &= Check(collector.PendingCount() == 0, "a released event leaves the pending queue");
+        std::vector<TelemetryEvent> emitted;
+        ok &= Check(queue.Drain(emitted, 1) == 1 && emitted[0].header.ProcessStartTime == 100,
+                    "a replayed event keeps its captured incarnation");
         collector.Defer(TelemetryEvent(deferred), 0);
         ok &= Check(collector.ReplayProcess(42) == 0, "an event with no known identity never replays");
         ok &= Check(collector.PendingCount() == 1, "an unidentified event is left to expire");
@@ -65,13 +68,26 @@ int main()
         ok &= Check(collector.RememberTcpOwner(9, 42, 100, L"192.0.2.1:443"),
                     "the live owner is cached");
         DWORD owner = 0;
+        uint64_t ownerStart = 0;
         std::wstring ownerEndpoints;
-        ok &= Check(collector.TcpOwner(9, owner, ownerEndpoints) && owner == 42 &&
-                        ownerEndpoints == L"192.0.2.1:443",
-                    "a cached owner is resolved for its own incarnation");
-        ok &= Check(!collector.TcpOwner(10, owner, ownerEndpoints), "an unknown TCB has no owner");
+        ProcessFacts stale;
+        stale.ok = true;
+        stale.created = 101;
+        ok &= Check(!collector.ResolveTcpOwner(10, 42, stale, ownerEndpoints, owner, ownerStart),
+                    "a direct TCP owner must match the tracked incarnation");
+        ProcessFacts live;
+        live.ok = true;
+        live.created = 100;
+        ok &= Check(collector.ResolveTcpOwner(10, 42, live, ownerEndpoints, owner, ownerStart) &&
+                        owner == 42 && ownerStart == 100,
+                    "a direct TCP owner returns its validated incarnation");
+        ProcessFacts unknown;
+        ok &= Check(collector.ResolveTcpOwner(9, 0, unknown, ownerEndpoints, owner, ownerStart) &&
+                        owner == 42 && ownerStart == 100 && ownerEndpoints == L"192.0.2.1:443",
+                    "a cached TCP owner returns its captured incarnation");
         scope.AddProcess(42, 101, L"C:\\client.exe");
-        ok &= Check(!collector.TcpOwner(9, owner, ownerEndpoints),
+        ok &= Check(ownerStart == 100, "TCP attribution does not re-read a reused PID's start time");
+        ok &= Check(!collector.ResolveTcpOwner(9, 0, unknown, ownerEndpoints, owner, ownerStart),
                     "a reused PID no longer owns the cached connection");
     }
     const auto& opnumProperties = RpcOpnumProperties();

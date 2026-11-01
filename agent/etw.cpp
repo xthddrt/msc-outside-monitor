@@ -626,7 +626,7 @@ void EtwCollector::OnRecord(PEVENT_RECORD record)
         return;
     }
 
-    event.header.ProcessStartTime = scope_.StartTime(attributedPid);
+    event.header.ProcessStartTime = current.created;
     Emit(std::move(event));
 }
 
@@ -681,21 +681,9 @@ void EtwCollector::OnTcpRecord(PEVENT_RECORD record, const TRACE_EVENT_INFO* inf
      * FIN-delivery event carries no addresses, so the connection's TCB pointer
      * carries the owner and addresses forward.
      */
-    const ProcessFacts owner = FactsForPid(pid);
-    const uint64_t ownerStart = owner.ok ? owner.created : 0;
-    if (pid != 0 && tcb != 0) {
-        RememberTcpOwner(tcb, pid, ownerStart, endpoints);
-    }
-    if (pid == 0 || ownerStart == 0 || !scope_.IsTracked(pid, ownerStart)) {
-        /* The provider named no live incarnation (or PID 0 for a system-context
-         * event): only a cached owner that is still that exact incarnation may
-         * carry the event forward. */
-        DWORD cachedPid = 0;
-        std::wstring cachedEndpoints;
-        if (!TcpOwner(tcb, cachedPid, cachedEndpoints)) return;
-        pid = cachedPid;
-        if (endpoints.empty()) endpoints = cachedEndpoints;
-    }
+    DWORD ownerPid = 0;
+    uint64_t ownerStart = 0;
+    if (!ResolveTcpOwner(tcb, pid, FactsForPid(pid), endpoints, ownerPid, ownerStart)) return;
 
     TelemetryEvent event;
     event.source = "etw";
@@ -705,8 +693,8 @@ void EtwCollector::OnTcpRecord(PEVENT_RECORD record, const TRACE_EVENT_INFO* inf
     event.header.Flags = MsMonFlagObserverRecord;
     event.header.Timestamp = static_cast<uint64_t>(record->EventHeader.TimeStamp.QuadPart);
     event.header.SessionId = sessionId_;
-    event.header.ProcessId = pid;
-    event.header.ProcessStartTime = scope_.StartTime(pid);
+    event.header.ProcessId = ownerPid;
+    event.header.ProcessStartTime = ownerStart;
     event.header.ThreadId = record->EventHeader.ThreadId;
     event.header.Attribution = MsMonAttributionProcessOnly;
     event.header.Value0 = id;
@@ -783,17 +771,13 @@ size_t EtwCollector::ReplayProcess(DWORD pid)
                 ++it;
                 continue;
             }
+            if (it->event.header.ProcessStartTime == 0) it->event.header.ProcessStartTime = it->created;
             ready.push_back(std::move(it->event));
             it = pending_.erase(it);
         }
     }
     const size_t emitted = ready.size();
-    for (auto& event : ready) {
-        if (event.header.ProcessStartTime == 0) {
-            event.header.ProcessStartTime = scope_.StartTime(pid);
-        }
-        Emit(std::move(event));
-    }
+    for (auto& event : ready) Emit(std::move(event));
     return emitted;
 }
 
@@ -809,7 +793,7 @@ bool EtwCollector::RememberTcpOwner(uint64_t tcb, DWORD pid, uint64_t created,
     return true;
 }
 
-bool EtwCollector::TcpOwner(uint64_t tcb, DWORD& pid, std::wstring& endpoints) const
+bool EtwCollector::TcpOwner(uint64_t tcb, DWORD& pid, uint64_t& created, std::wstring& endpoints) const
 {
     auto found = tcb != 0 ? tcbConnections_.find(tcb) : tcbConnections_.end();
     if (found == tcbConnections_.end()) return false;
@@ -819,7 +803,30 @@ bool EtwCollector::TcpOwner(uint64_t tcb, DWORD& pid, std::wstring& endpoints) c
         return false;
     }
     pid = found->second.pid;
+    created = found->second.created;
     endpoints = found->second.endpoints;
+    return true;
+}
+
+bool EtwCollector::ResolveTcpOwner(uint64_t tcb, DWORD providerPid, const ProcessFacts& facts,
+                                   std::wstring& endpoints, DWORD& pid, uint64_t& created)
+{
+    const uint64_t providerStart = facts.ok ? facts.created : 0;
+    if (providerPid != 0 && tcb != 0) {
+        (void)RememberTcpOwner(tcb, providerPid, providerStart, endpoints);
+    }
+    if (providerPid != 0 && providerStart != 0 && scope_.IsTracked(providerPid, providerStart)) {
+        pid = providerPid;
+        created = providerStart;
+        return true;
+    }
+    DWORD cachedPid = 0;
+    uint64_t cachedStart = 0;
+    std::wstring cachedEndpoints;
+    if (!TcpOwner(tcb, cachedPid, cachedStart, cachedEndpoints)) return false;
+    pid = cachedPid;
+    created = cachedStart;
+    if (endpoints.empty()) endpoints = cachedEndpoints;
     return true;
 }
 

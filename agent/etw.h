@@ -35,7 +35,9 @@ public:
      * incarnation, and resolve a cached owner only while that same incarnation
      * is still tracked. */
     bool RememberTcpOwner(uint64_t tcb, DWORD pid, uint64_t created, const std::wstring& endpoints);
-    bool TcpOwner(uint64_t tcb, DWORD& pid, std::wstring& endpoints) const;
+    bool TcpOwner(uint64_t tcb, DWORD& pid, uint64_t& created, std::wstring& endpoints) const;
+    bool ResolveTcpOwner(uint64_t tcb, DWORD providerPid, const ProcessFacts& facts,
+                         std::wstring& endpoints, DWORD& pid, uint64_t& created);
     /* Expire unmatched events and emit an etw_unattributed coverage record. */
     void ExpirePending(uint64_t nowTick);
     uint64_t PendingCount() const;
