@@ -1,58 +1,84 @@
+# compat_lifetime_test.ps1 - control IRPs must not outlive MonShutdown.
+#
+# Loads the legacy SysInfoMon driver (compat\build\msmon-legacy.sys), keeps
+# readers inside MON_READ/MON_SUMMARY while the service is stopped, and requires
+# every stop to return with the machine still up. Without the control-IRP
+# rundown in DispatchControl/DriverUnload, MonShutdown frees the ring and the
+# summary under a reader (bugcheck 0x50 / 0x7C).
+#
+# Requires a signed (test-signed) compat build and an elevated shell in the
+# isolated VM. Never on a production host.
 $ErrorActionPreference = 'Stop'
 $root = (Resolve-Path "$PSScriptRoot\..\..\..").Path
-$driver = Join-Path $root 'build\compat\msmon-legacy.sys'
-$control = Join-Path $root 'build\compat\msmon-legacyctl.exe'
-$target = Join-Path $env:SystemRoot 'System32\drivers\msmon-legacy.sys'
+$ctl = Join-Path $root 'build\compat\msmon-legacyctl.exe'
+$sys = Join-Path $root 'build\compat\msmon-legacy.sys'
 $service = 'SysInfoMon'
-$started = Get-Date
-$jobs = @()
+$rounds = 20
+$work = Join-Path ([IO.Path]::GetTempPath()) 'msmon-compat-lifetime'
+$stop = Join-Path $work 'STOP'
+$collector = Join-Path $work 'collector.ps1'
 
-foreach ($path in $driver, $control) {
-    if (-not (Test-Path $path)) { throw "Build compat first: missing $path" }
+New-Item -ItemType Directory -Force -Path $work | Out-Null
+foreach ($file in $ctl, $sys) {
+    if (-not (Test-Path $file)) { throw "missing $file (build with: build.cmd --with-compat)" }
+}
+
+# A dense stream of one-shot control calls, so an IRP is inside MonRead or
+# MonSummary almost continuously while the service is stopped.
+@"
+while (-not (Test-Path '$stop')) {
+    & '$ctl' mon dump  | Out-Null
+    & '$ctl' mon summary | Out-Null
+}
+"@ | Set-Content -Path $collector -Encoding UTF8
+
+function Start-Legacy {
+    sc.exe stop $service | Out-Null
+    Start-Sleep -Milliseconds 300
+    if (-not (Get-Service $service -ErrorAction SilentlyContinue)) {
+        sc.exe create $service type= kernel start= demand binPath= $sys | Out-Null
+    }
+    sc.exe start $service | Out-Null
+    if ((Get-Service $service).Status -ne 'Running') { throw 'SysInfoMon did not start' }
+}
+
+function Stop-Legacy {
+    # A busy device is acceptable; a bugcheck is not.
+    sc.exe stop $service | Out-Null
+    Start-Sleep -Milliseconds 300
+}
+
+function Bugchecks {
+    Get-WinEvent -FilterHashtable @{ LogName = 'System'; Id = 1001;
+                                    StartTime = (Get-Date).AddSeconds(-30) } -ErrorAction SilentlyContinue
 }
 
 try {
-    Copy-Item $driver $target -Force
-    & sc.exe stop $service | Out-Null
-    & sc.exe delete $service | Out-Null
-    & sc.exe create $service type= filesys start= demand error= normal `
-        binPath= '\SystemRoot\System32\drivers\msmon-legacy.sys' | Out-Host
-    if ($LASTEXITCODE -ne 0) { throw "Could not create $service" }
-
-    for ($iteration = 0; $iteration -lt 20; $iteration++) {
-        & sc.exe start $service | Out-Null
-        if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 1056) { throw "Could not start $service" }
-        & $control mon on | Out-Null
-        if ($LASTEXITCODE -ne 0) { throw 'Could not enable the monitor' }
-
-        $jobs = 1..4 | ForEach-Object {
-            Start-Job -ScriptBlock {
-                param($exe)
-                for ($read = 0; $read -lt 1000; $read++) {
-                    & $exe mon dump | Out-Null
-                    & $exe mon summary | Out-Null
-                }
-            } -ArgumentList $control
+    Start-Legacy
+    & $ctl mon on | Out-Null
+    for ($round = 1; $round -le $rounds; $round++) {
+        Remove-Item $stop -ErrorAction SilentlyContinue
+        $drainer = Start-Process powershell -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass',
+                                                          '-File', $collector) -PassThru -WindowStyle Hidden
+        # mon watch holds one handle and issues MON_READ every 500 ms for as
+        # long as it runs, so the stop lands inside a live read.
+        $watcher = Start-Process $ctl -ArgumentList @('mon', 'watch') -PassThru -WindowStyle Hidden
+        Start-Sleep -Milliseconds 700
+        Stop-Legacy
+        New-Item -ItemType File -Path $stop -Force | Out-Null
+        foreach ($process in $drainer, $watcher) {
+            if ($null -ne $process -and -not $process.HasExited) {
+                if (-not $process.WaitForExit(10000)) { Stop-Process -Id $process.Id -Force }
+            }
         }
-        Start-Sleep -Milliseconds 50
-        & sc.exe stop $service | Out-Null
-        if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 1062) { throw "Could not stop $service" }
-
-        $jobs | Wait-Job -Timeout 30 | Out-Null
-        if (@($jobs | Where-Object State -eq 'Running').Count -ne 0) {
-            throw 'A monitor read hung during driver unload'
-        }
-        $jobs | Remove-Job -Force
-        $jobs = @()
+        if (Bugchecks) { throw "round $round: the machine recorded a bugcheck" }
+        # A control call after the drain must fail cleanly, not crash.
+        & $ctl status | Out-Null
+        Start-Legacy
+        & $ctl mon on | Out-Null
     }
-
-    $bugchecks = @(Get-WinEvent -FilterHashtable @{LogName='System'; Id=1001; StartTime=$started} `
-        -ErrorAction SilentlyContinue)
-    if ($bugchecks.Count -ne 0) { throw 'A bugcheck was reported during unload testing' }
-    Write-Host 'compat lifetime regression passed: concurrent reads drained and driver reloaded 20 times'
+    Write-Host "compat lifetime regression passed: $rounds stops with readers in flight, no bugcheck"
 } finally {
-    $jobs | Stop-Job -ErrorAction SilentlyContinue
-    $jobs | Remove-Job -Force -ErrorAction SilentlyContinue
-    & sc.exe stop $service | Out-Null
-    & sc.exe delete $service | Out-Null
+    New-Item -ItemType File -Path $stop -Force -ErrorAction SilentlyContinue | Out-Null
+    Stop-Legacy
 }

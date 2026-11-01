@@ -24,8 +24,18 @@ public:
     void Stop();
     const std::vector<std::wstring>& Warnings() const { return warnings_; }
 
-    /* Re-emit events that arrived before the driver's process-start record. */
-    void ReplayProcess(DWORD pid);
+    /* Hold an event until its process-start record arrives. created is the
+     * incarnation captured with the event (0 = identity was not established). */
+    void Defer(TelemetryEvent&& event, uint64_t created);
+    /* Re-emit events that arrived before the driver's process-start record, only
+     * for the incarnation each was captured for. Returns how many were emitted;
+     * the rest stay pending and expire as unattributed. */
+    size_t ReplayProcess(DWORD pid);
+    /* Remember a connection's owner only while it is the live tracked
+     * incarnation, and resolve a cached owner only while that same incarnation
+     * is still tracked. */
+    bool RememberTcpOwner(uint64_t tcb, DWORD pid, uint64_t created, const std::wstring& endpoints);
+    bool TcpOwner(uint64_t tcb, DWORD& pid, std::wstring& endpoints) const;
     /* Expire unmatched events and emit an etw_unattributed coverage record. */
     void ExpirePending(uint64_t nowTick);
     uint64_t PendingCount() const;
@@ -61,6 +71,7 @@ private:
 
     struct PendingEvent {
         TelemetryEvent event;
+        uint64_t created = 0;
         uint64_t deadline = 0;
     };
 
@@ -88,6 +99,7 @@ private:
     std::atomic<uint64_t> expired_[PROVIDERS]{};
     struct TcpConnection {
         DWORD pid = 0;
+        uint64_t created = 0;
         std::wstring endpoints;
     };
     /* TCP connection (TCB) -> tracked owner and addresses; touched only on the ETW worker thread. */

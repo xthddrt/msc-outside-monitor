@@ -622,14 +622,7 @@ void EtwCollector::OnRecord(PEVENT_RECORD record)
             /* Long-running or unrelated process: out of scope, as before. */
             return;
         }
-        const uint64_t deadline = GetTickCount64() + ETW_PENDING_MILLISECONDS;
-        std::lock_guard<std::mutex> lock(pendingMutex_);
-        if (pending_.size() >= ETW_PENDING_LIMIT) {
-            pending_.pop_front();
-            pendingOverflow_.fetch_add(1);
-        }
-        pending_.push_back({ std::move(event), deadline });
-        deferred_[ProviderIndex(type)].fetch_add(1);
+        Defer(std::move(event), current.ok ? current.created : 0);
         return;
     }
 
@@ -688,17 +681,20 @@ void EtwCollector::OnTcpRecord(PEVENT_RECORD record, const TRACE_EVENT_INFO* inf
      * FIN-delivery event carries no addresses, so the connection's TCB pointer
      * carries the owner and addresses forward.
      */
-    if (pid != 0 && tcb != 0 && scope_.IsTracked(pid)) {
-        if (tcbConnections_.size() >= 16384) tcbConnections_.clear();
-        auto& connection = tcbConnections_[tcb];
-        connection.pid = pid;
-        if (!endpoints.empty()) connection.endpoints = endpoints;
+    const ProcessFacts owner = FactsForPid(pid);
+    const uint64_t ownerStart = owner.ok ? owner.created : 0;
+    if (pid != 0 && tcb != 0) {
+        RememberTcpOwner(tcb, pid, ownerStart, endpoints);
     }
-    if (pid == 0 || !scope_.IsTracked(pid)) {
-        auto found = tcb != 0 ? tcbConnections_.find(tcb) : tcbConnections_.end();
-        if (found == tcbConnections_.end()) return;
-        pid = found->second.pid;
-        if (endpoints.empty()) endpoints = found->second.endpoints;
+    if (pid == 0 || ownerStart == 0 || !scope_.IsTracked(pid, ownerStart)) {
+        /* The provider named no live incarnation (or PID 0 for a system-context
+         * event): only a cached owner that is still that exact incarnation may
+         * carry the event forward. */
+        DWORD cachedPid = 0;
+        std::wstring cachedEndpoints;
+        if (!TcpOwner(tcb, cachedPid, cachedEndpoints)) return;
+        pid = cachedPid;
+        if (endpoints.empty()) endpoints = cachedEndpoints;
     }
 
     TelemetryEvent event;
@@ -761,26 +757,70 @@ void EtwCollector::OnCodeIntegrityRecord(PEVENT_RECORD record, const TRACE_EVENT
     Emit(std::move(event));
 }
 
-void EtwCollector::ReplayProcess(DWORD pid)
+void EtwCollector::Defer(TelemetryEvent&& event, uint64_t created)
+{
+    const uint64_t deadline = GetTickCount64() + ETW_PENDING_MILLISECONDS;
+    const int slot = ProviderIndex(event.header.Type);
+    std::lock_guard<std::mutex> lock(pendingMutex_);
+    if (pending_.size() >= ETW_PENDING_LIMIT) {
+        pending_.pop_front();
+        pendingOverflow_.fetch_add(1);
+    }
+    pending_.push_back({ std::move(event), created, deadline });
+    if (slot >= 0) deferred_[slot].fetch_add(1);
+}
+
+size_t EtwCollector::ReplayProcess(DWORD pid)
 {
     std::vector<TelemetryEvent> ready;
     {
         std::lock_guard<std::mutex> lock(pendingMutex_);
         for (auto it = pending_.begin(); it != pending_.end();) {
-            if (it->event.header.ProcessId == pid) {
-                ready.push_back(std::move(it->event));
-                it = pending_.erase(it);
-            } else {
+            /* Only the incarnation the event was captured for may release it:
+             * a reused PID must not inherit another process's deferred event. */
+            if (it->event.header.ProcessId != pid || it->created == 0 ||
+                !scope_.IsTracked(pid, it->created)) {
                 ++it;
+                continue;
             }
+            ready.push_back(std::move(it->event));
+            it = pending_.erase(it);
         }
     }
+    const size_t emitted = ready.size();
     for (auto& event : ready) {
         if (event.header.ProcessStartTime == 0) {
             event.header.ProcessStartTime = scope_.StartTime(pid);
         }
         Emit(std::move(event));
     }
+    return emitted;
+}
+
+bool EtwCollector::RememberTcpOwner(uint64_t tcb, DWORD pid, uint64_t created,
+                                    const std::wstring& endpoints)
+{
+    if (tcb == 0 || pid == 0 || created == 0 || !scope_.IsTracked(pid, created)) return false;
+    if (tcbConnections_.size() >= 16384) tcbConnections_.clear();
+    auto& connection = tcbConnections_[tcb];
+    connection.pid = pid;
+    connection.created = created;
+    if (!endpoints.empty()) connection.endpoints = endpoints;
+    return true;
+}
+
+bool EtwCollector::TcpOwner(uint64_t tcb, DWORD& pid, std::wstring& endpoints) const
+{
+    auto found = tcb != 0 ? tcbConnections_.find(tcb) : tcbConnections_.end();
+    if (found == tcbConnections_.end()) return false;
+    /* The cached owner must still be the tracked incarnation, not a reused PID. */
+    if (found->second.created == 0 ||
+        !scope_.IsTracked(found->second.pid, found->second.created)) {
+        return false;
+    }
+    pid = found->second.pid;
+    endpoints = found->second.endpoints;
+    return true;
 }
 
 void EtwCollector::ExpirePending(uint64_t nowTick)

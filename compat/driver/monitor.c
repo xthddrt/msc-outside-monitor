@@ -12,6 +12,7 @@
  * Nothing here patches code, so it is compatible with HVCI/VBS.
  */
 #include "monitor.h"
+#include "subject.h"
 #include "util.h"
 #include "hooks.h"
 #include "syscall.h"
@@ -621,10 +622,9 @@ SummaryAdd(_In_ const SYSINFO_MON_EVENT *event, _In_ const WCHAR *subject)
             return;
         }
 
-        if ((entry->Type == (event->Type & 0x0FFFFFFFu)) &&
-            entry->Pid == event->Pid &&
-            entry->Subject[0] == subject[0] &&
-            RtlEqualMemory(entry->Subject, subject, sizeof(subject))) {
+        if (MonSummaryEntryMatches(entry->Type, entry->Pid, entry->Subject,
+                                   event->Type & 0x0FFFFFFFu, event->Pid, subject,
+                                   RTL_NUMBER_OF(entry->Subject))) {
             entry->Count++;
             entry->Last = event->Stamp;
             entry->Access = event->Op;

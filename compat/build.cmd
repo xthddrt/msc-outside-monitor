@@ -56,6 +56,12 @@ cl /nologo /W4 /O2 /MT /Zi /D_CRT_SECURE_NO_WARNINGS ^
    /link /SUBSYSTEM:CONSOLE /DYNAMICBASE /NXCOMPAT advapi32.lib psapi.lib
 if errorlevel 1 ( echo [!] tool build failed & exit /b 1 )
 
+echo === compatibility tests ===
+cl /nologo /W4 /O2 /MT /Fe:"%OUT%\summary_subject_test.exe" "%ROOT%tests\summary_subject_test.c"
+if errorlevel 1 ( echo [!] summary subject test build failed & exit /b 1 )
+"%OUT%\summary_subject_test.exe"
+if errorlevel 1 ( echo [!] summary subject test failed & exit /b 1 )
+
 echo built:
 echo   %OUT%\%SYSN%
 echo   %OUT%\%EXEN%

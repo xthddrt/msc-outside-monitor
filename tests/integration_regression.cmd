@@ -19,7 +19,7 @@ if not defined VCVARS (
 call "%VCVARS%" >nul
 if errorlevel 1 exit /b 1
 if not exist "%OUT%" mkdir "%OUT%"
-cl /nologo /W4 /WX /O2 /EHsc /std:c++17 /Fo"%OUT%\\" /Fe:"%OUT%\integration_regression.exe" "%~dp0integration_regression.cpp" "%ROOT%\agent\integrations.cpp" "%ROOT%\agent\telemetry.cpp" "%ROOT%\agent\classify.cpp" "%ROOT%\agent\rpc_names.cpp" bcrypt.lib
+cl /nologo /W4 /WX /O2 /EHsc /std:c++17 /Fo"%OUT%\\" /Fe:"%OUT%\integration_regression.exe" "%~dp0integration_regression.cpp" "%ROOT%\agent\integrations.cpp" "%ROOT%\agent\telemetry.cpp" "%ROOT%\agent\classify.cpp" "%ROOT%\agent\rpc_names.cpp" "%ROOT%\agent\etw.cpp" bcrypt.lib tdh.lib advapi32.lib
 if errorlevel 1 exit /b 1
 pushd "%ROOT%"
 "%OUT%\integration_regression.exe"

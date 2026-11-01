@@ -1,5 +1,6 @@
 #include "../agent/integrations.h"
 #include "../agent/classify.h"
+#include "../agent/etw.h"
 #include "../agent/rpc_names.h"
 #include <fstream>
 #include <iostream>
@@ -20,6 +21,59 @@ int main()
     ok &= Check(processScope.IsTracked(41, 100), "tracked PID accepts its process incarnation");
     ok &= Check(!processScope.IsTracked(41, 101), "tracked PID rejects a reused incarnation");
     ok &= Check(!processScope.IsTracked(42, 100), "unknown PID is not tracked");
+
+    /*
+     * A deferred ETW event belongs to the incarnation it was captured for: a
+     * reused PID must not release it, and an unknown identity never does.
+     */
+    {
+        EventQueue queue;
+        ProcessScope scope;
+        EtwCollector collector(scope, queue, 1, true, {});
+        TelemetryEvent deferred;
+        deferred.source = "etw";
+        deferred.header.Size = sizeof(deferred.header);
+        deferred.header.Version = MSMON_PROTOCOL_VERSION;
+        deferred.header.Type = MsMonEtwWmi;
+        deferred.header.ProcessId = 42;
+        collector.Defer(TelemetryEvent(deferred), 100);
+        scope.AddProcess(42, 101, L"C:\\client.exe");
+        ok &= Check(collector.ReplayProcess(42) == 0,
+                    "a reused PID does not release another incarnation's deferred event");
+        ok &= Check(collector.PendingCount() == 1, "the mismatched event stays pending to expire");
+        scope.AddProcess(42, 100, L"C:\\client.exe");
+        ok &= Check(collector.ReplayProcess(42) == 1, "the deferred event is released for its incarnation");
+        ok &= Check(collector.PendingCount() == 0, "a released event leaves the pending queue");
+        collector.Defer(TelemetryEvent(deferred), 0);
+        ok &= Check(collector.ReplayProcess(42) == 0, "an event with no known identity never replays");
+        ok &= Check(collector.PendingCount() == 1, "an unidentified event is left to expire");
+    }
+
+    /*
+     * TCP attribution: a connection's cached owner is only usable while that
+     * exact incarnation is tracked; a reused PID is not the old owner.
+     */
+    {
+        EventQueue queue;
+        ProcessScope scope;
+        EtwCollector collector(scope, queue, 1, true, {});
+        scope.AddProcess(42, 100, L"C:\\client.exe");
+        ok &= Check(!collector.RememberTcpOwner(9, 42, 101, L"192.0.2.1:443"),
+                    "a stale incarnation is not cached as a connection owner");
+        ok &= Check(!collector.RememberTcpOwner(9, 42, 0, L"192.0.2.1:443"),
+                    "an unknown identity is not cached as a connection owner");
+        ok &= Check(collector.RememberTcpOwner(9, 42, 100, L"192.0.2.1:443"),
+                    "the live owner is cached");
+        DWORD owner = 0;
+        std::wstring ownerEndpoints;
+        ok &= Check(collector.TcpOwner(9, owner, ownerEndpoints) && owner == 42 &&
+                        ownerEndpoints == L"192.0.2.1:443",
+                    "a cached owner is resolved for its own incarnation");
+        ok &= Check(!collector.TcpOwner(10, owner, ownerEndpoints), "an unknown TCB has no owner");
+        scope.AddProcess(42, 101, L"C:\\client.exe");
+        ok &= Check(!collector.TcpOwner(9, owner, ownerEndpoints),
+                    "a reused PID no longer owns the cached connection");
+    }
     const auto& opnumProperties = RpcOpnumProperties();
     ok &= Check(opnumProperties.size() == 3 && opnumProperties[0] == L"ProcNum" &&
                 opnumProperties[1] == L"OpNum" && opnumProperties[2] == L"OperationNum",
