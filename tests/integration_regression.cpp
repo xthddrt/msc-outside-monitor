@@ -15,6 +15,11 @@ static bool Check(bool condition, const char* message)
 int main()
 {
     bool ok = true;
+    ProcessScope processScope;
+    processScope.AddProcess(41, 100, L"C:\\client.exe");
+    ok &= Check(processScope.IsTracked(41, 100), "tracked PID accepts its process incarnation");
+    ok &= Check(!processScope.IsTracked(41, 101), "tracked PID rejects a reused incarnation");
+    ok &= Check(!processScope.IsTracked(42, 100), "unknown PID is not tracked");
     const auto& opnumProperties = RpcOpnumProperties();
     ok &= Check(opnumProperties.size() == 3 && opnumProperties[0] == L"ProcNum" &&
                 opnumProperties[1] == L"OpNum" && opnumProperties[2] == L"OperationNum",

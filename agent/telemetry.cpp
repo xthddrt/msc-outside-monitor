@@ -70,10 +70,12 @@ void ProcessScope::AddImage(DWORD pid, uint64_t base, uint64_t size, const std::
     InsertModule(found->second.modules, base, size, path);
 }
 
-bool ProcessScope::IsTracked(DWORD pid) const
+bool ProcessScope::IsTracked(DWORD pid, uint64_t expectedStartTime) const
 {
     std::lock_guard<std::mutex> lock(mutex_);
-    return processes_.find(pid) != processes_.end();
+    auto found = processes_.find(pid);
+    return found != processes_.end() &&
+           (expectedStartTime == 0 || found->second.startTime == expectedStartTime);
 }
 
 uint64_t ProcessScope::StartTime(DWORD pid) const

@@ -47,7 +47,7 @@ public:
     void AddProcess(DWORD pid, uint64_t startTime, const std::wstring& path);
     void RemoveProcess(DWORD pid, uint64_t startTime);
     void AddImage(DWORD pid, uint64_t base, uint64_t size, const std::wstring& path);
-    bool IsTracked(DWORD pid) const;
+    bool IsTracked(DWORD pid, uint64_t expectedStartTime = 0) const;
     uint64_t StartTime(DWORD pid) const;
     std::wstring Path(DWORD pid) const;
     std::vector<std::wstring> ResolveStack(DWORD pid, const uint64_t* addresses, size_t count,

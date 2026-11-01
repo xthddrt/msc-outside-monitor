@@ -32,6 +32,7 @@ static UNICODE_STRING g_DeviceName;
 static UNICODE_STRING g_SymLink;
 static ULONG          g_FlagsAtEntry;
 static volatile LONG  g_Stopped;
+static EX_RUNDOWN_REF g_ControlRundown;
 
 /* -------------------------------------------------------------- control device */
 
@@ -67,6 +68,13 @@ DispatchControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
     ULONG    information = 0;
 
     UNREFERENCED_PARAMETER(DeviceObject);
+
+    if (!ExAcquireRundownProtection(&g_ControlRundown)) {
+        Irp->IoStatus.Status = STATUS_DELETE_PENDING;
+        Irp->IoStatus.Information = 0;
+        IoCompleteRequest(Irp, IO_NO_INCREMENT);
+        return STATUS_DELETE_PENDING;
+    }
 
     switch (code) {
     case SYSINFO_IOCTL_STATUS: {
@@ -137,6 +145,7 @@ DispatchControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
 
     Irp->IoStatus.Status = status;
     Irp->IoStatus.Information = information;
+    ExReleaseRundownProtection(&g_ControlRundown);
     IoCompleteRequest(Irp, IO_NO_INCREMENT);
     return status;
 }
@@ -192,6 +201,7 @@ DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING RegistryPath)
     RtlInitUnicodeString(&g_DeviceName, SYSINFO_DEVICE_NAME);
     RtlInitUnicodeString(&g_SymLink, SYSINFO_DOS_NAME);
 
+    ExInitializeRundownProtection(&g_ControlRundown);
     DriverObject->DriverUnload = DriverUnload;
 
     g_FlagsAtEntry = DriverObject->Flags;
@@ -236,7 +246,9 @@ DriverUnload(_In_ PDRIVER_OBJECT DriverObject)
 {
     UNREFERENCED_PARAMETER(DriverObject);
 
+    ExWaitForRundownProtectionRelease(&g_ControlRundown);
     MonitorStopHooks();
+    ExRundownCompleted(&g_ControlRundown);
 
     if (g_Device != NULL) {
         IoUnregisterShutdownNotification(g_Device);

@@ -8,6 +8,13 @@
 #include <mutex>
 #include <thread>
 
+struct ProcessFacts {
+    bool ok = false;
+    uint64_t created = 0;
+    DWORD parent = 0;
+    std::wstring image;
+};
+
 class EtwCollector {
 public:
     EtwCollector(ProcessScope& scope, EventQueue& queue, uint64_t sessionId, bool capturePayloads,
@@ -43,11 +50,13 @@ private:
     void Emit(TelemetryEvent&& event);
     std::wstring ProviderName(unsigned long type) const;
     bool MayBelongToClient(DWORD pid, uint64_t nowFileTime);
+    ProcessFacts FactsForPid(DWORD pid);
 
     struct CandidateDecision {
-        uint64_t created = 0;
+        ProcessFacts facts;
         uint64_t checkedTick = 0;
         bool candidate = false;
+        bool classified = false;
     };
 
     struct PendingEvent {

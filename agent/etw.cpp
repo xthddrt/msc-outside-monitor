@@ -91,13 +91,6 @@ static const int ETW_CANDIDATE_ANCESTOR_DEPTH = 4;
  * tree are deferred: one whose image, or a recent ancestor's image, is under
  * the scope root, or whose parent is already tracked.
  */
-struct ProcessFacts {
-    bool ok = false;
-    uint64_t created = 0;
-    DWORD parent = 0;
-    std::wstring image;
-};
-
 static ProcessFacts QueryProcessFacts(DWORD pid)
 {
     using QueryInformationProcess = NTSTATUS (NTAPI*)(HANDLE, PROCESSINFOCLASS, PVOID, ULONG, PULONG);
@@ -273,19 +266,39 @@ EtwCollector::EtwCollector(ProcessScope& scope, EventQueue& queue, uint64_t sess
                            const std::vector<std::wstring>& scopeRoots)
     : scope_(scope), queue_(queue), scopeRoots_(scopeRoots), sessionId_(sessionId), capturePayloads_(capturePayloads) {}
 
+ProcessFacts EtwCollector::FactsForPid(DWORD pid)
+{
+    const uint64_t nowTick = GetTickCount64();
+    auto cached = candidates_.find(pid);
+    if (cached != candidates_.end() && nowTick - cached->second.checkedTick < ETW_CANDIDATE_RECHECK_MILLISECONDS) {
+        return cached->second.facts;
+    }
+
+    ProcessFacts facts = QueryProcessFacts(pid);
+    CandidateDecision decision;
+    decision.facts = facts;
+    decision.checkedTick = nowTick;
+    if (candidates_.size() >= 4096) candidates_.clear();
+    candidates_[pid] = decision;
+    return facts;
+}
+
 bool EtwCollector::MayBelongToClient(DWORD pid, uint64_t nowFileTime)
 {
     const uint64_t window = static_cast<uint64_t>(ETW_PENDING_MILLISECONDS) * 10000ULL;
     const uint64_t nowTick = GetTickCount64();
     auto cached = candidates_.find(pid);
-    if (cached != candidates_.end() && nowTick - cached->second.checkedTick < ETW_CANDIDATE_RECHECK_MILLISECONDS) {
-        return cached->second.candidate && nowFileTime - cached->second.created <= window;
+    if (cached != candidates_.end() && cached->second.classified &&
+        nowTick - cached->second.checkedTick < ETW_CANDIDATE_RECHECK_MILLISECONDS) {
+        return cached->second.candidate && nowFileTime >= cached->second.facts.created &&
+               nowFileTime - cached->second.facts.created <= window;
     }
 
-    ProcessFacts node = QueryProcessFacts(pid);
+    ProcessFacts node = FactsForPid(pid);
     CandidateDecision decision;
-    decision.created = node.created;
+    decision.facts = node;
     decision.checkedTick = nowTick;
+    decision.classified = true;
     if (node.ok && nowFileTime >= node.created && nowFileTime - node.created <= window) {
         for (int depth = 0; depth <= ETW_CANDIDATE_ANCESTOR_DEPTH; depth++) {
             if (std::any_of(scopeRoots_.begin(), scopeRoots_.end(),
@@ -304,7 +317,6 @@ bool EtwCollector::MayBelongToClient(DWORD pid, uint64_t nowFileTime)
             node = std::move(parent);
         }
     }
-    if (candidates_.size() >= 4096) candidates_.clear();
     candidates_[pid] = decision;
     return decision.candidate;
 }
@@ -599,7 +611,8 @@ void EtwCollector::OnRecord(PEVENT_RECORD record)
         }
     }
 
-    if (!scope_.IsTracked(attributedPid)) {
+    const ProcessFacts current = FactsForPid(attributedPid);
+    if (!current.ok || !scope_.IsTracked(attributedPid, current.created)) {
         FILETIME nowFileTime;
         ULARGE_INTEGER now;
         GetSystemTimeAsFileTime(&nowFileTime);
