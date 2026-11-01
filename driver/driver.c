@@ -185,11 +185,23 @@ VOID MsMonDriverUnload(PDRIVER_OBJECT DriverObject)
     MsMonRecordStatus(L"DriverUnloadStart", STATUS_SUCCESS);
 
     /*
-     * Wake a collector that is blocked in MSMON_IOCTL_READ_EVENTS before
-     * waiting for in-flight IRPs; the read timeout alone can be one second and
-     * the session must be stopped from another thread.
+     * Wake a collector that is blocked in MSMON_IOCTL_READ_EVENTS first: it
+     * holds a rundown reference and would otherwise make the wait below sit out
+     * its read timeout, which can be one second.
      */
     MsMonEventsWakeAll();
+
+    /*
+     * Drain the control plane before any sensor is torn down. A control IRP
+     * already inside MsMonStartSession would otherwise re-arm the event queue
+     * and the process session (allocating roots in MsMonProcessStartSession)
+     * after MsMonProcessUninitialize has stopped and freed that state. Once the
+     * rundown is complete the acquire in MsMonDeviceControl fails, so a later
+     * START_SESSION, TRACK, STOP or READ gets STATUS_DELETE_PENDING instead of
+     * running against half-freed state. ExRundownCompleted must follow the wait.
+     */
+    ExWaitForRundownProtectionRelease(&gIoRundown);
+    ExRundownCompleted(&gIoRundown);
 
     MsMonNetworkUninitialize();
     MsMonRecordStatus(L"NetworkStopped", STATUS_SUCCESS);
@@ -202,15 +214,6 @@ VOID MsMonDriverUnload(PDRIVER_OBJECT DriverObject)
     MsMonProcessUninitialize();
     MsMonRecordStatus(L"ProcessStopped", STATUS_SUCCESS);
     MsMonAttributionStop();
-
-    /*
-     * ExWaitForRundownProtectionRelease refuses new acquisitions and blocks
-     * until the control IRPs already in flight (bounded by the read timeout,
-     * which the event above shortens) have finished. ExRundownCompleted marks
-     * the rundown finished and must follow the wait, per its documentation.
-     */
-    ExWaitForRundownProtectionRelease(&gIoRundown);
-    ExRundownCompleted(&gIoRundown);
 
     MsMonEventsUninitialize();
     RtlInitUnicodeString(&dosName, MSMON_DOS_DEVICE_NAME);

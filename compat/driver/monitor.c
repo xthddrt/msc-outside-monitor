@@ -374,43 +374,9 @@ SummaryIgnored(_In_ const WCHAR *subject)
 }
 
 /*
- * A name relative to the program's directory is the program's own file.  Keep
- * the information but collapse the tail: "Data\Packs\Skill_00001.ms" becomes
- * "Data\..." and a debug-symbol probe "ntdll.pdb" becomes "*.pdb".  Names with
- * neither a separator nor a .pdb suffix are short and unique enough to keep.
+ * The fold itself lives in subject.h so the same code the driver runs is
+ * exercised by compat/tests (see MonFoldRelative there).
  */
-static VOID
-FoldRelative(_Inout_updates_(chars) WCHAR *subject, _In_ ULONG chars)
-{
-    ULONG i, n;
-
-    if (subject[0] == L'\\') return;
-    if (subject[0] != 0 && subject[1] == L':') return;
-
-    for (i = 0; subject[i] != 0; i++) {
-        if (subject[i] == L'\\') {
-            if (i + 4 < chars) {
-                subject[i]     = L'\\';
-                subject[i + 1] = L'.';
-                subject[i + 2] = L'.';
-                subject[i + 3] = L'.';
-                subject[i + 4] = 0;
-            } else {
-                subject[i] = 0;
-            }
-            return;
-        }
-    }
-
-    if (i < 4) return;
-    if (RtlUpcaseUnicodeChar(subject[i - 4]) != L'.') return;
-    if (RtlUpcaseUnicodeChar(subject[i - 3]) != L'P') return;
-    if (RtlUpcaseUnicodeChar(subject[i - 2]) != L'D') return;
-    if (RtlUpcaseUnicodeChar(subject[i - 1]) != L'B') return;
-
-    for (n = 0; n < 5 && n + 1 < chars; n++) subject[n] = L"*.pdb"[n];
-    subject[n] = 0;
-}
 
 static ULONG
 SumHash(_In_ ULONG Type, _In_ ULONG Pid, _In_ const WCHAR *Subject)
@@ -712,7 +678,7 @@ PushEvent(_In_ ULONG type, _In_ ULONG op, _In_opt_ PCUNICODE_STRING path,
     SumSubject(&event, subject, RTL_NUMBER_OF(subject));
     if (g_IgnoreRelative != 0 &&
         (type == SYSINFO_MON_FILE || type == SYSINFO_MON_KEY || type == SYSINFO_MON_REG)) {
-        FoldRelative(subject, RTL_NUMBER_OF(subject));
+        MonFoldRelative(subject, RTL_NUMBER_OF(subject));
     }
     SummaryAdd(&event, subject);
 

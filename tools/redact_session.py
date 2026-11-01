@@ -27,6 +27,11 @@ def redact_record(record, keep_paths, keep_commands):
     had_payload = "payload" in record
     record.pop("payload", None)
     if had_payload:
+        # The agent writes a friendly copy of the same bytes next to the payload
+        # (decoded_value, telemetry.cpp AppendDecodedValue); dropping only the
+        # Base64 chunk would leave the exact registry value, volume serial or
+        # label in the bundle this tool exists to make safe to share.
+        record.pop("decoded_value", None)
         record["payload_redacted"] = True
     if record.get("type") == "etw_wmi":
         record["detail"] = redact_detail(record.get("detail", ""))
