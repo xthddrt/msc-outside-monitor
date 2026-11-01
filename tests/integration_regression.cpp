@@ -111,6 +111,15 @@ int main()
                 event.detail.find(L"action=RISK") != std::wstring::npos,
                 "risk rule use is decoded");
     source.Action = 1;
+    source.Target = 0x20;
+    source.Value = 0x006D0008;
+    event = KFilterDecisionEvent(source, 77, 6);
+    ok &= Check(event.detail.find(L"target=device") != std::wstring::npos &&
+                event.detail.find(L"ioctl=0x006D0008") != std::wstring::npos &&
+                event.detail.find(L"rights=") == std::wstring::npos,
+                "device decisions expose the IOCTL");
+    source.Target = 4;
+    source.Value = 0x81;
 
     /* The decision ring survives across runs: only events from this session may be written. */
     ok &= Check(!KFilterDecisionInSession(source, source.Timestamp + 1),

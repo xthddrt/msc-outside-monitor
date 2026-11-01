@@ -64,7 +64,7 @@ TelemetryEvent KFilterDecisionEvent(const KFILTER_EVENT_4& source, uint64_t sess
                           L";target_id=" + std::to_wstring(source.Target) +
                           L";action_id=" + std::to_wstring(source.Action) +
                           L";flags=" + HexValue(source.Flags) +
-                          L";rights=" + HexValue(source.Value) +
+                          (source.Target == 0x00000020u ? L";ioctl=" : L";rights=") + HexValue(source.Value) +
                           L";rule_id=" + std::to_wstring(source.RuleId) +
                           L";generation=" + std::to_wstring(source.Generation);
     event.detail = std::move(detail);

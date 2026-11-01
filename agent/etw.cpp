@@ -502,7 +502,7 @@ void EtwCollector::OnRecord(PEVENT_RECORD record)
     DWORD nativePid = record->EventHeader.ProcessId;
     DWORD attributedPid = nativePid;
     uint64_t number = 0;
-    if (type != MsMonEtwDns && PropertyNumber(record, info, L"ClientProcessId", number) && number <= MAXDWORD) {
+    if (PropertyNumber(record, info, L"ClientProcessId", number) && number <= MAXDWORD) {
         attributedPid = static_cast<DWORD>(number);
     }
 
@@ -526,7 +526,8 @@ void EtwCollector::OnRecord(PEVENT_RECORD record)
 
     std::wstring value;
     if (type == MsMonEtwWmi) {
-        PropertyString(record, info, L"NamespaceName", event.text);
+        PropertyString(record, info, L"Namespace", event.text);
+        if (event.text.empty()) PropertyString(record, info, L"NamespaceName", event.text);
         if (event.text.empty()) PropertyString(record, info, L"ProviderName", event.text);
         if (PropertyString(record, info, L"Operation", value)) AppendField(event.detail, L"operation", value);
         if (PropertyString(record, info, L"Query", value)) {
