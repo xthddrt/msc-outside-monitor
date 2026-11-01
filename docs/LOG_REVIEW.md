@@ -133,3 +133,13 @@ Ordered by value for the next capture:
 8. **Split verbosity per event class** (`--file-read=off|aggregate|all`), so a
    question about registry or network behaviour does not pay for 143,000 read
    records.
+
+## Identity evidence after every run
+
+Append the session's identity-relevant events and the complete current risk-rule table:
+
+```bat
+python tools\analysis\identity_log.py --bundle <session-bundle> --policy ..\kernel-filter\policy\default-policy.txt --out ..\kernel-filter\policy\identity-log.md
+```
+
+The tool reads the session bundle, including KFilter RISK decisions; it does not compete with the collector for KFilter's destructive event ring.

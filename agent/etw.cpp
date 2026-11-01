@@ -1,4 +1,5 @@
 #include "etw.h"
+#include "rpc_names.h"
 #include <tdh.h>
 #include <winternl.h>
 #include <algorithm>
@@ -199,6 +200,20 @@ static bool PropertyNumber(PEVENT_RECORD record, const TRACE_EVENT_INFO* info,
     size_t size = data.size();
     if (size != 1 && size != 2 && size != 4 && size != 8) return false;
     std::memcpy(&output, data.data(), size);
+    return true;
+}
+
+static bool PropertyGuid(PEVENT_RECORD record, const TRACE_EVENT_INFO* info,
+                         const std::wstring& name, std::wstring& output)
+{
+    const auto* property = FindProperty(info, name);
+    std::vector<BYTE> data;
+    GUID guid{};
+    if (property == nullptr || (property->Flags & PropertyStruct) != 0 ||
+        property->nonStructType.InType != TDH_INTYPE_GUID ||
+        !PropertyData(record, info, name, data) || data.size() != sizeof(guid)) return false;
+    std::memcpy(&guid, data.data(), sizeof(guid));
+    output = RpcGuidText(guid);
     return true;
 }
 
@@ -531,10 +546,30 @@ void EtwCollector::OnRecord(PEVENT_RECORD record)
     } else {
         PropertyString(record, info, L"Endpoint", event.text);
         if (event.text.empty()) PropertyString(record, info, L"Protocol", event.text);
-        if (PropertyNumber(record, info, L"OperationNum", number)) {
+        bool hasOperation = false;
+        for (const auto& property : RpcOpnumProperties()) {
+            if (PropertyNumber(record, info, property, number)) {
+                hasOperation = true;
+                break;
+            }
+        }
+        bool hasInterface = PropertyGuid(record, info, L"InterfaceUuid", value) ||
+                            PropertyString(record, info, L"InterfaceUuid", value);
+        if (hasOperation) AppendField(event.detail, L"op", std::to_wstring(number));
+        if (hasInterface) {
+            AppendField(event.detail, L"interface_uuid", value);
+            std::wstring service;
+            std::wstring method;
+            if (hasOperation && RpcOperationName(value, number, service, method)) {
+                AppendField(event.detail, L"interface", service);
+                AppendField(event.detail, L"operation", method);
+            } else {
+                AppendField(event.detail, L"interface", value);
+                if (hasOperation) AppendField(event.detail, L"operation", std::to_wstring(number));
+            }
+        } else if (hasOperation) {
             AppendField(event.detail, L"operation", std::to_wstring(number));
         }
-        if (PropertyString(record, info, L"InterfaceUuid", value)) AppendField(event.detail, L"interface", value);
     }
 
     /*

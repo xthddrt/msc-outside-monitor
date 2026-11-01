@@ -216,6 +216,22 @@ typedef MSMON_STATISTICS* PMSMON_STATISTICS;
 #define MSMON_IOCTL_REFRESH_MODULES CTL_CODE(FILE_DEVICE_UNKNOWN, 0x806, METHOD_BUFFERED, FILE_WRITE_ACCESS)
 #define MSMON_IOCTL_COVERAGE CTL_CODE(FILE_DEVICE_UNKNOWN, 0x807, METHOD_BUFFERED, FILE_READ_ACCESS)
 
+static __inline int MsMonNetworkUnregisterComplete(long Status)
+{
+    return Status == 0 || (unsigned long)Status == 0xC0220001u;
+}
+
+/*
+ * FwpsFlowRemoveContext0: STATUS_SUCCESS removed the association (flowDeleteFn already
+ * ran synchronously); STATUS_UNSUCCESSFUL means no context is associated. Everything
+ * else - notably STATUS_PENDING (0x103), which is success-valued but leaves an
+ * asynchronous flowDeleteFn still to come - means the removal is not finished.
+ */
+static __inline int MsMonFlowRemoveComplete(long Status)
+{
+    return Status == 0 || (unsigned long)Status == 0xC0000001u;
+}
+
 #ifdef __cplusplus
 }
 #endif

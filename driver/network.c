@@ -57,6 +57,8 @@ static BOOLEAN gFlowListInitialized;
 static BOOLEAN gNetworkActive;
 static ULONG gNetworkLayerMask;
 static NTSTATUS gNetworkLayerStatus[MSMON_CALLOUT_COUNT];
+static EX_RUNDOWN_REF gNetworkRundown;
+static BOOLEAN gNetworkRundownInitialized;
 
 static VOID NTAPI MsMonWfpFlowDelete(UINT16 LayerId, UINT32 CalloutId, UINT64 FlowContext);
 
@@ -250,7 +252,7 @@ static VOID MsMonAssociateFlow(
     KeReleaseSpinLock(&gFlowLock, oldIrql);
 }
 
-static VOID NTAPI MsMonWfpClassify(
+static VOID NTAPI MsMonWfpClassifyInner(
     const FWPS_INCOMING_VALUES0* InFixedValues,
     const FWPS_INCOMING_METADATA_VALUES0* InMetaValues,
     void* LayerData,
@@ -352,6 +354,27 @@ static VOID NTAPI MsMonWfpClassify(
     }
 }
 
+static VOID NTAPI MsMonWfpClassify(
+    const FWPS_INCOMING_VALUES0* InFixedValues,
+    const FWPS_INCOMING_METADATA_VALUES0* InMetaValues,
+    void* LayerData,
+    const void* ClassifyContext,
+    const FWPS_FILTER3* Filter,
+    UINT64 FlowContext,
+    FWPS_CLASSIFY_OUT0* ClassifyOut
+)
+{
+    if (!gNetworkRundownInitialized || !ExAcquireRundownProtection(&gNetworkRundown)) {
+        if (ClassifyOut != NULL && (ClassifyOut->rights & FWPS_RIGHT_ACTION_WRITE) != 0) {
+            ClassifyOut->actionType = FWP_ACTION_PERMIT;
+        }
+        return;
+    }
+    MsMonWfpClassifyInner(InFixedValues, InMetaValues, LayerData, ClassifyContext,
+                          Filter, FlowContext, ClassifyOut);
+    ExReleaseRundownProtection(&gNetworkRundown);
+}
+
 static NTSTATUS NTAPI MsMonWfpNotify(
     FWPS_CALLOUT_NOTIFY_TYPE NotifyType,
     const GUID* FilterKey,
@@ -365,7 +388,7 @@ static NTSTATUS NTAPI MsMonWfpNotify(
     return STATUS_SUCCESS;
 }
 
-static VOID NTAPI MsMonWfpFlowDelete(UINT16 LayerId, UINT32 CalloutId, UINT64 FlowContext)
+static VOID NTAPI MsMonWfpFlowDeleteInner(UINT16 LayerId, UINT32 CalloutId, UINT64 FlowContext)
 {
     PLIST_ENTRY link;
     PMSMON_FLOW_CONTEXT context = NULL;
@@ -389,6 +412,13 @@ static VOID NTAPI MsMonWfpFlowDelete(UINT16 LayerId, UINT32 CalloutId, UINT64 Fl
                         context->Endpoints, L"flow_close");
         ExFreePoolWithTag(context, MSMON_POOL_TAG);
     }
+}
+
+static VOID NTAPI MsMonWfpFlowDelete(UINT16 LayerId, UINT32 CalloutId, UINT64 FlowContext)
+{
+    if (!gNetworkRundownInitialized || !ExAcquireRundownProtection(&gNetworkRundown)) return;
+    MsMonWfpFlowDeleteInner(LayerId, CalloutId, FlowContext);
+    ExReleaseRundownProtection(&gNetworkRundown);
 }
 
 static NTSTATUS MsMonAddCallout(
@@ -449,6 +479,8 @@ NTSTATUS MsMonNetworkInitialize(PDEVICE_OBJECT DeviceObject)
     FWPM_SESSION session;
     NTSTATUS status;
     ULONG index;
+    ExInitializeRundownProtection(&gNetworkRundown);
+    gNetworkRundownInitialized = TRUE;
     KeInitializeSpinLock(&gFlowLock);
     InitializeListHead(&gFlows);
     gFlowListInitialized = TRUE;
@@ -490,16 +522,21 @@ ULONG MsMonNetworkCoverage(VOID)
 VOID MsMonNetworkUninitialize(VOID)
 {
     ULONG index;
+    ULONG failures = 0;
     KIRQL oldIrql;
+    LARGE_INTEGER delay;
+
+    delay.QuadPart = -10000;
     gNetworkActive = FALSE;
     /*
-     * Remove flow contexts while the callouts and the engine are still alive,
-     * otherwise FwpsFlowRemoveContext0 fails and the flow-delete callback can
-     * still fire for a context this routine already freed.
+     * A pending removal calls flowDeleteFn asynchronously. The context is already
+     * out of our list, so retain ownership and do not free it until WFP confirms
+     * that its association is gone.
      */
     if (gFlowListInitialized) {
         for (;;) {
             PMSMON_FLOW_CONTEXT context = NULL;
+            NTSTATUS status;
             KeAcquireSpinLock(&gFlowLock, &oldIrql);
             if (!IsListEmpty(&gFlows)) {
                 PLIST_ENTRY entry = RemoveHeadList(&gFlows);
@@ -507,7 +544,12 @@ VOID MsMonNetworkUninitialize(VOID)
             }
             KeReleaseSpinLock(&gFlowLock, oldIrql);
             if (context == NULL) break;
-            (VOID)FwpsFlowRemoveContext0(context->FlowId, context->LayerId, context->CalloutId);
+            do {
+                status = FwpsFlowRemoveContext0(context->FlowId, context->LayerId, context->CalloutId);
+                if (!MsMonFlowRemoveComplete((long)status)) {
+                    KeDelayExecutionThread(KernelMode, FALSE, &delay);
+                }
+            } while (!MsMonFlowRemoveComplete((long)status));
             MsMonLogNetwork(MsMonNetworkFlowClose, context->ProcessId, context->FlowId,
                             context->Protocol, context->LocalPort, context->RemotePort,
                             context->Endpoints, L"flow_close_monitor_stop");
@@ -520,20 +562,25 @@ VOID MsMonNetworkUninitialize(VOID)
         gEngine = NULL;
     }
     for (index = 0; index < MSMON_CALLOUT_COUNT; index++) {
-        if (gCalloutRegistered[index]) {
-            /*
-             * Only clear the registered flag when the callout really went away.
-             * Leaving a registered callout behind after the driver image is
-             * unmapped faults the next time traffic hits that layer.
-             */
+        while (gCalloutRegistered[index]) {
             NTSTATUS status = FwpsCalloutUnregisterById0(gCalloutIds[index]);
-            if (NT_SUCCESS(status)) {
+            if (MsMonNetworkUnregisterComplete(status)) {
                 gCalloutRegistered[index] = FALSE;
-            } else {
+                gNetworkLayerStatus[index] = STATUS_SUCCESS;
+                break;
+            }
+            gNetworkLayerStatus[index] = status;
+            failures++;
+            if ((failures & 0x3FFu) == 1u) {
                 DbgPrint("MsMon: WFP callout %lu unregister failed 0x%08X\n", index, status);
             }
+            KeDelayExecutionThread(KernelMode, FALSE, &delay);
         }
-        gNetworkLayerStatus[index] = STATUS_SUCCESS;
+    }
+    if (gNetworkRundownInitialized) {
+        ExWaitForRundownProtectionRelease(&gNetworkRundown);
+        ExRundownCompleted(&gNetworkRundown);
+        gNetworkRundownInitialized = FALSE;
     }
     gNetworkLayerMask = 0;
 }
