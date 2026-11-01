@@ -546,10 +546,10 @@ VOID MsMonNetworkUninitialize(VOID)
             if (context == NULL) break;
             do {
                 status = FwpsFlowRemoveContext0(context->FlowId, context->LayerId, context->CalloutId);
-                if (!NT_SUCCESS(status) && status != STATUS_UNSUCCESSFUL) {
+                if (!MsMonFlowRemoveComplete((long)status)) {
                     KeDelayExecutionThread(KernelMode, FALSE, &delay);
                 }
-            } while (!NT_SUCCESS(status) && status != STATUS_UNSUCCESSFUL);
+            } while (!MsMonFlowRemoveComplete((long)status));
             MsMonLogNetwork(MsMonNetworkFlowClose, context->ProcessId, context->FlowId,
                             context->Protocol, context->LocalPort, context->RemotePort,
                             context->Endpoints, L"flow_close_monitor_stop");

@@ -46,6 +46,20 @@ int main()
                 "busy callout is not complete");
     ok &= Check(MsMonNetworkUnregisterComplete(static_cast<long>(0xC0000001)) == 0,
                 "ordinary unregister failure is not complete");
+    /*
+     * Flow removal has its own terminal set: STATUS_SUCCESS (flowDeleteFn already ran
+     * synchronously) and STATUS_UNSUCCESSFUL (no context associated). STATUS_PENDING is
+     * success-valued but the asynchronous flowDeleteFn is still to come, so freeing the
+     * context there frees memory the engine still references.
+     */
+    ok &= Check(MsMonFlowRemoveComplete(0) != 0, "flow removal success is complete");
+    ok &= Check(MsMonFlowRemoveComplete(static_cast<long>(0xC0000001)) != 0,
+                "already-removed flow is complete");
+    ok &= Check(MsMonFlowRemoveComplete(0x00000103) == 0, "pending flow removal is not complete");
+    ok &= Check(MsMonFlowRemoveComplete(static_cast<long>(0xC0000225)) == 0,
+                "generic not-found flow removal is not complete");
+    ok &= Check(MsMonFlowRemoveComplete(static_cast<long>(0xC0000022)) == 0,
+                "an ordinary flow removal failure is not complete");
 
     ok &= Check(sizeof(KFILTER_EVENT_4) == 1064 && sizeof(KFILTER_STATUS_4) == 80 &&
                 sizeof(KFILTER_READ_REQUEST_4) == 8, "ABI 4 layouts");

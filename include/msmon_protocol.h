@@ -221,6 +221,17 @@ static __inline int MsMonNetworkUnregisterComplete(long Status)
     return Status == 0 || (unsigned long)Status == 0xC0220001u;
 }
 
+/*
+ * FwpsFlowRemoveContext0: STATUS_SUCCESS removed the association (flowDeleteFn already
+ * ran synchronously); STATUS_UNSUCCESSFUL means no context is associated. Everything
+ * else - notably STATUS_PENDING (0x103), which is success-valued but leaves an
+ * asynchronous flowDeleteFn still to come - means the removal is not finished.
+ */
+static __inline int MsMonFlowRemoveComplete(long Status)
+{
+    return Status == 0 || (unsigned long)Status == 0xC0000001u;
+}
+
 #ifdef __cplusplus
 }
 #endif
