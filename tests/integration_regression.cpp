@@ -27,8 +27,10 @@ int main()
     std::wstring method;
     ok &= Check(RpcOperationName(L"{6BFFD098-A112-3610-9833-46C3F87E345A}", 0, service, method) &&
                 service == L"Wkssvc" && method == L"NetrWkstaGetInfo", "Wkssvc operation name");
-    ok &= Check(RpcOperationName(L"5ca4a760-ebb1-11cf-8611-00a0245420ed", 5, service, method) &&
+    ok &= Check(RpcOperationName(L"484809d6-4239-471b-b5bc-61df8c23ac48", 5, service, method) &&
                 service == L"WTS/TermSrvSession" && method == L"RpcGetUserName", "WTS operation name");
+    ok &= Check(!RpcOperationName(L"5ca4a760-ebb1-11cf-8611-00a0245420ed", 5, service, method),
+                "Legacy WTS operation is not mislabeled");
     ok &= Check(RpcOperationName(L"12345778-1234-abcd-ef00-0123456789ab", 7, service, method) &&
                 service == L"LSA/lsarpc" && method == L"LsarQueryInformationPolicy", "LSA operation name");
     ok &= Check(RpcOperationName(L"12345778-1234-abcd-ef00-0123456789ac", 17, service, method) &&
