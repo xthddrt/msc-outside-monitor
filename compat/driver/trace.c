@@ -1745,12 +1745,31 @@ HookNtQuerySystemInformation(
     if (MonActive()) {
         CHAR detail[SYSINFO_MON_MAX_DETAIL];
         ULONG pos = 0;
+        ULONG reported = 0;
 
+        /*
+         * ReturnLength is a user-mode pointer for a user-mode caller.  Probe it
+         * and copy it under a handler: the hooked routine may have returned
+         * STATUS_ACCESS_VIOLATION without writing, and a raw dereference here
+         * would fault in kernel mode with no handler (bugcheck 0x1E/0x50).
+         */
+        if (ReturnLength != NULL) {
+            __try {
+                if (ExGetPreviousMode() != KernelMode) {
+                    ProbeForRead(ReturnLength, sizeof(*ReturnLength), sizeof(ULONG));
+                }
+                reported = *ReturnLength;
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                reported = 0;
+            }
+        } else {
+            reported = bytes;
+        }
         detail[0] = 0;
         AppendStr(detail, sizeof(detail), &pos, "class ");
         AppendDec(detail, sizeof(detail), &pos, (ULONG)SystemInformationClass);
         AppendStr(detail, sizeof(detail), &pos, " bytes ");
-        AppendDec(detail, sizeof(detail), &pos, ReturnLength != NULL ? *ReturnLength : bytes);
+        AppendDec(detail, sizeof(detail), &pos, reported);
         if (!NT_SUCCESS(status)) AppendStr(detail, sizeof(detail), &pos, " FAILED");
         MonEvent(SYSINFO_MON_SYSINFO, (ULONG)SystemInformationClass, NULL, detail);
     }

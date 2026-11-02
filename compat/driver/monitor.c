@@ -887,7 +887,7 @@ ImageNotify(_In_opt_ PUNICODE_STRING fullImageName, _In_ HANDLE processId,
         /* Kernel images have no user process, so the image filter cannot apply:
          * a driver the target loads is exactly what we must not miss. */
         if (g_KernelImages == 0) return;
-        op |= SYSINFO_MON_KERNEL;
+        type |= SYSINFO_MON_KERNEL;
     } else if (!MonWantsPid(processId)) {
         return;
     }

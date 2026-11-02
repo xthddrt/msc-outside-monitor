@@ -123,6 +123,24 @@ $disable = $config.IndexOf('TraceSetUnsafeHooksEnabled(0)')
 if ($early -lt 0 -or $disable -lt 0 -or $disable -gt $early -or $config.Contains('if (!config->Enable)')) {
     throw 'mon off does not disable unsafe hooks'
 }
+# --- #92: the kernel-image flag lives in Type, where the consumers read it ---
+$image = Body $monitor 'ImageNotify(_In_opt_ PUNICODE_STRING fullImageName' 'ProcessNotifyEx(_In_ PEPROCESS Process'
+if (-not $image.Contains('type |= SYSINFO_MON_KERNEL;') -or $image.Contains('op |= SYSINFO_MON_KERNEL')) {
+    throw 'a kernel image is not marked in the event Type'
+}
+$toolSource = Get-Content (Join-Path $root 'tools\sysinfoctl.c') -Raw
+if ([regex]::Matches($toolSource, 'e->Type & SYSINFO_MON_KERNEL').Count -lt 3) {
+    throw 'the kernel-image consumers no longer read the flag from Type'
+}
+# --- #93: a caller-supplied length pointer is probed and read under a handler
+$sysinfo = Body $trace 'HookNtQuerySystemInformation(' 'LogCallback('
+if (-not $sysinfo.Contains('__try') -or -not $sysinfo.Contains('ProbeForRead(ReturnLength') -or
+    $sysinfo.Contains('? *ReturnLength :')) {
+    throw 'the NtQuerySystemInformation length pointer is read without a probe and handler'
+}
+if ($sysinfo.IndexOf('ProbeForRead(ReturnLength') -gt $sysinfo.IndexOf('reported = *ReturnLength')) {
+    throw 'ReturnLength is read before it is probed'
+}
 $summary = Body $monitor 'MonSummary(_In_reads_bytes_' '/* pid/tid of 0 means'
 $take = $summary.IndexOf('KeAcquireSpinLock(&g_SumLock')
 $copy = $summary.IndexOf('entries[count++] = g_Sum[i]')

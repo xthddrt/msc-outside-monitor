@@ -89,6 +89,47 @@ def main():
               "records are renumbered in write order")
         check(all(re.fullmatch(r"[0-9a-f]{64}", record["chain"]) for record in redacted),
               "every output record carries the new chain")
+
+    with tempfile.TemporaryDirectory() as temporary:
+        root = pathlib.Path(temporary)
+        source = root / "session"
+        source.mkdir()
+        destination = root / "redacted"
+        destination.mkdir()
+        identifying = [
+            {"type": "file_read", "timestamp": "t1", "process_id": 7,
+             "text": "\\Device\\HarddiskVolume3\\Users\\alice\\Documents\\notes.txt",
+             "detail": "read"},
+            {"type": "registry_query", "timestamp": "t2", "process_id": 7,
+             "text": "\\REGISTRY\\USER\\S-1-5-21-111-222-333-1001\\Software",
+             "detail": "value"},
+            {"type": "network_connect", "timestamp": "t3", "process_id": 7,
+             "text": "10.0.0.5:52000 -> 1.2.3.4:443",
+             "detail": "tcp"},
+        ]
+        with open(source / "events.jsonl", "w", encoding="utf-8") as stream:
+            for record in identifying:
+                stream.write(json.dumps(record) + "\n")
+
+        redact_session.rewrite([source / "events.jsonl"], destination, False, False)
+        text = (destination / "events.jsonl").read_text(encoding="utf-8")
+        for secret in ("Users", "S-1-5-21-", "10.0.0.5", "1.2.3.4"):
+            check(secret not in text, f"the redacted bundle still contains {secret}")
+        redacted = [json.loads(line) for line in text.splitlines() if line.strip()]
+        check(redacted[0]["text"] == "<redacted-path>", "a profile path is replaced")
+        check(redacted[1]["text"] == "<redacted-path>", "a user SID path is replaced")
+        check(redacted[2]["text"] == "<redacted-ip>:52000 -> <redacted-ip>:443",
+              "network endpoints are replaced")
+
+        kept = root / "kept"
+        kept.mkdir()
+        redact_session.rewrite([source / "events.jsonl"], kept, True, False)
+        kept_text = (kept / "events.jsonl").read_text(encoding="utf-8")
+        kept_records = [json.loads(line) for line in kept_text.splitlines() if line.strip()]
+        check(kept_records[0]["text"] == identifying[0]["text"] and
+              kept_records[1]["text"] == identifying[1]["text"] and
+              kept_records[2]["text"] == identifying[2]["text"],
+              "--keep-paths leaves paths and endpoints intact")
     print("redact_session regression passed")
 
 

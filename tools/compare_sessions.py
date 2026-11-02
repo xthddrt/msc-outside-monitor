@@ -25,12 +25,24 @@ def verify(directory):
     manifest = load_json(directory / "manifest.json")
     checksums = load_json(directory / "checksums.json")
     errors = []
-    for part in checksums.get("parts", []):
+    parts = checksums.get("parts", [])
+    for part in parts:
         path = directory / part["name"]
         if not path.exists():
             errors.append(f"missing {part['name']}")
         elif sha256_file(path) != part["sha256"]:
             errors.append(f"hash mismatch {part['name']}")
+    # session_pack computes bundle_sha256 over the manifest plus every part so
+    # the manifest (which supplies everything compared below) cannot be edited
+    # without detection; the schema check does not cover it.
+    expected = checksums.get("bundle_sha256")
+    if not expected:
+        errors.append("missing bundle_sha256")
+    else:
+        material = sha256_file(directory / "manifest.json") + "".join(
+            part["sha256"] for part in parts)
+        if hashlib.sha256(material.encode("ascii")).hexdigest() != expected:
+            errors.append("manifest hash mismatch")
     return manifest, errors
 
 

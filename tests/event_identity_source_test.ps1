@@ -58,4 +58,17 @@ $insert = $process.IndexOf('InsertTailList(&gProcesses', $check)
 if ($check -lt 0 -or $insert -lt 0) {
     throw 'the incarnation check does not precede the tracked-list insertion'
 }
+# --- #91: a legacy create whose image name fails is not a process exit ------
+$from = $process.IndexOf('static VOID MsMonProcessNotifyLegacy(')
+$to = if ($from -ge 0) { $process.IndexOf('static VOID MsMonRemoveProcessNotify(', $from) } else { -1 }
+if ($from -lt 0 -or $to -le $from) { throw 'MsMonProcessNotifyLegacy not found' }
+$legacy = $process.Substring($from, $to - $from)
+if (-not $legacy.Contains('if (Create) {')) { throw 'legacy create branch not found' }
+if ([regex]::Matches($legacy, 'MsMonProcessNotifyInner\(process, ProcessId, NULL\)').Count -ne 1) {
+    throw 'a legacy create with no image name is still passed as an exit'
+}
+if ([regex]::Matches($legacy, 'MsMonProcessNotifyInner\(process, ProcessId, &info\)').Count -ne 2 -or
+    -not $legacy.Contains('info.ParentProcessId = ParentId;')) {
+    throw 'a failed legacy create is not reported as a create without a path'
+}
 Write-Host 'event identity regression passed'

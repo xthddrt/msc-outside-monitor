@@ -433,7 +433,17 @@ static VOID MsMonProcessNotifyLegacy(HANDLE ParentId, HANDLE ProcessId, BOOLEAN 
                 MsMonProcessNotifyInner(process, ProcessId, &info);
                 ExFreePool(imageName);
             } else {
-                MsMonProcessNotifyInner(process, ProcessId, NULL);
+                /*
+                 * A create whose image name cannot be resolved is still a
+                 * create: passing NULL would be read as an exit, emitting a
+                 * bogus process_exit and untracking the process. Report the
+                 * create without a path instead (the inner routine accepts a
+                 * NULL ImageFileName).
+                 */
+                PS_CREATE_NOTIFY_INFO info;
+                RtlZeroMemory(&info, sizeof(info));
+                info.ParentProcessId = ParentId;
+                MsMonProcessNotifyInner(process, ProcessId, &info);
             }
         } else {
             MsMonProcessNotifyInner(process, ProcessId, NULL);

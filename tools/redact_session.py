@@ -5,12 +5,32 @@ import argparse
 import hashlib
 import json
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 PACK = ROOT / "tools" / "session_pack.py"
+
+# The account name in a profile path, a user SID, and IP literals: none may
+# survive into a bundle that is handed to someone else. IPv6 needs at least
+# four groups (or a "::") so clock times such as 10:00:21 are left alone.
+IDENTIFYING = re.compile(r"\\Users\\[^\\]+|S-1-5-21(?:-\d+){3,}", re.I)
+IP_LITERAL = re.compile(
+    r"\b(?:\d{1,3}\.){3}\d{1,3}\b"
+    r"|(?<![0-9A-Fa-f:])(?:(?:[0-9A-Fa-f]{1,4}:){3,7}[0-9A-Fa-f]{1,4}|[0-9A-Fa-f:]*::[0-9A-Fa-f:]*)"
+    r"(?![0-9A-Fa-f:])"
+)
+
+
+def redact_identifying(text):
+    if not isinstance(text, str) or not text:
+        return text
+    if IDENTIFYING.search(text):
+        return "<redacted-path>"
+    return IP_LITERAL.sub("<redacted-ip>", text)
+
 
 
 def redact_detail(detail):
@@ -39,6 +59,11 @@ def redact_record(record, keep_paths, keep_commands):
         record["text"] = "<redacted-dns>"
     if not keep_paths:
         record["process_path"] = ""
+        # text/detail carry the same NT/registry paths (and endpoints) the
+        # bundle is being shared to hide; replace the identifying parts.
+        for field in ("text", "detail"):
+            if field in record:
+                record[field] = redact_identifying(record[field])
     if not keep_commands and record.get("type") == "process_start":
         record["detail"] = "<redacted-command-line>"
     return record
