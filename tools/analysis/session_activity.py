@@ -71,18 +71,21 @@ class Process:
 def incarnation_spans(session_dir):
     """Log timestamps of every incarnation a process_start/exit record proves."""
     spans = collections.defaultdict(list)
-    latest = {}
     for event in iter_events(session_dir):
         kind = event.get("type")
         pid = event.get("process_id") or 0
         start = event.get("process_start_time") or 0
         stamp = event.get("timestamp") or ""
         if start == 0:
-            if kind == "process_exit" and pid in latest:
-                spans[pid][latest[pid]][2] = stamp
+            if kind == "process_exit":
+                ended = incarnation_at(spans, pid, stamp)
+                if ended is not None:
+                    for span in spans[pid]:
+                        if span[0] == ended:
+                            span[2] = stamp
+                            break
             continue
         if kind == "process_start":
-            latest[pid] = len(spans[pid])
             spans[pid].append([start, stamp, None])
         elif kind == "process_exit":
             for span in spans[pid]:

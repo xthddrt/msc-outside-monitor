@@ -47,6 +47,8 @@ typedef struct _MSMON_FLOW_CONTEXT {
     UINT8 Protocol;
     UINT16 LocalPort;
     UINT16 RemotePort;
+    BOOLEAN Associating;
+    BOOLEAN Deleted;
     WCHAR Endpoints[128];
 } MSMON_FLOW_CONTEXT, *PMSMON_FLOW_CONTEXT;
 
@@ -242,17 +244,19 @@ static VOID MsMonAssociateFlow(
     PMSMON_FLOW_CONTEXT context;
     KIRQL oldIrql;
     NTSTATUS status;
-    UINT64 flowId;
-    UINT16 layerId;
-    UINT32 calloutId;
+    UINT64 flowId = FlowId;
+    UINT16 layerId = InFixedValues->layerId;
+    UINT32 calloutId = gCalloutIds[Index];
+    BOOLEAN deleted;
+    BOOLEAN active;
     if (!gFlowListInitialized || (InMetaValues->currentMetadataValues & FWPS_METADATA_FIELD_FLOW_HANDLE) == 0 ||
         FlowId == 0) return;
     context = ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(*context), MSMON_POOL_TAG);
     if (context == NULL) return;
     RtlZeroMemory(context, sizeof(*context));
-    context->FlowId = FlowId;
-    context->CalloutId = gCalloutIds[Index];
-    context->LayerId = InFixedValues->layerId;
+    context->FlowId = flowId;
+    context->CalloutId = calloutId;
+    context->LayerId = layerId;
     context->ProcessId = UlongToHandle((ULONG)InMetaValues->processId);
     context->ProcessStartTime = MsMonProcessStartTime(context->ProcessId);
     context->Protocol = Protocol;
@@ -260,39 +264,41 @@ static VOID MsMonAssociateFlow(
     context->RemotePort = RemotePort;
     (VOID)RtlStringCchCopyW(context->Endpoints, RTL_NUMBER_OF(context->Endpoints), Endpoints);
 
-    /*
-     * WFP is called without holding gFlowLock. Holding a spinlock across
-     * FwpsFlowAssociateContext0 risks a lock-order inversion with the flow
-     * teardown path, which calls MsMonWfpFlowDelete and takes the same lock.
-     */
-    status = FwpsFlowAssociateContext0(FlowId, InFixedValues->layerId,
-                                       gCalloutIds[Index], (UINT64)context);
+    /* The delete callback can mark but never frees an associating context. */
+    KeAcquireSpinLock(&gFlowLock, &oldIrql);
+    context->Associating = TRUE;
+    InsertTailList(&gFlows, &context->Link);
+    KeReleaseSpinLock(&gFlowLock, oldIrql);
+    status = FwpsFlowAssociateContext0(flowId, layerId, calloutId, (UINT64)context);
+
+    KeAcquireSpinLock(&gFlowLock, &oldIrql);
+    context->Associating = FALSE;
+    deleted = context->Deleted;
+    active = gNetworkActive;
+    if (!NT_SUCCESS(status) && !deleted) RemoveEntryList(&context->Link);
+    KeReleaseSpinLock(&gFlowLock, oldIrql);
     if (!NT_SUCCESS(status)) {
         ExFreePoolWithTag(context, MSMON_POOL_TAG);
         return;
     }
-
-    KeAcquireSpinLock(&gFlowLock, &oldIrql);
-    if (!gNetworkActive) {
-        flowId = context->FlowId;
-        layerId = context->LayerId;
-        calloutId = context->CalloutId;
-
-        InsertTailList(&gFlows, &context->Link);   /* the list owns it from here */
-        KeReleaseSpinLock(&gFlowLock, oldIrql);
-        status = FwpsFlowRemoveContext0(flowId, layerId, calloutId);
-        if ((ULONG)status == 0xC0000001u) {
-            /* No association was present, so no flowDeleteFn will come: take the
-             * entry back by flow id and free it here. */
-            if (MsMonFlowUnlink(flowId)) ExFreePoolWithTag(context, MSMON_POOL_TAG);
-        }
-        /* STATUS_SUCCESS: the synchronous flowDeleteFn found the linked entry and
-         * freed it. PENDING (or any incomplete result): the delayed flowDeleteFn
-         * or the unload drain frees it. */
+    if (deleted) {
+        MsMonLogNetwork(MsMonNetworkFlowClose, context->ProcessId, context->ProcessStartTime,
+                        flowId, context->Protocol, context->LocalPort, context->RemotePort,
+                        context->Endpoints, L"flow_close");
+        ExFreePoolWithTag(context, MSMON_POOL_TAG);
         return;
     }
-    InsertTailList(&gFlows, &context->Link);
-    KeReleaseSpinLock(&gFlowLock, oldIrql);
+    if (active) return;
+
+    status = FwpsFlowRemoveContext0(flowId, layerId, calloutId);
+    if ((ULONG)status == 0xC0000001u) {
+        /* No association was present, so no flowDeleteFn will come: take the
+         * entry back by flow id and free it here. */
+        if (MsMonFlowUnlink(flowId)) ExFreePoolWithTag(context, MSMON_POOL_TAG);
+    }
+    /* STATUS_SUCCESS: the synchronous flowDeleteFn found the linked entry and
+     * freed it. PENDING (or any incomplete result): the delayed flowDeleteFn
+     * or the unload drain frees it. */
 }
 
 static VOID NTAPI MsMonWfpClassifyInner(
@@ -394,7 +400,7 @@ static VOID NTAPI MsMonWfpClassifyInner(
         }
     } while (0);
     if ((ClassifyOut->rights & FWPS_RIGHT_ACTION_WRITE) != 0) {
-        ClassifyOut->actionType = FWP_ACTION_PERMIT;
+        ClassifyOut->actionType = FWP_ACTION_CONTINUE;
     }
 }
 
@@ -410,7 +416,7 @@ static VOID NTAPI MsMonWfpClassify(
 {
     if (!gNetworkRundownInitialized || !ExAcquireRundownProtection(&gNetworkRundown)) {
         if (ClassifyOut != NULL && (ClassifyOut->rights & FWPS_RIGHT_ACTION_WRITE) != 0) {
-            ClassifyOut->actionType = FWP_ACTION_PERMIT;
+            ClassifyOut->actionType = FWP_ACTION_CONTINUE;
         }
         return;
     }
@@ -445,7 +451,11 @@ static VOID NTAPI MsMonWfpFlowDeleteInner(UINT16 LayerId, UINT32 CalloutId, UINT
         PMSMON_FLOW_CONTEXT candidate = CONTAINING_RECORD(link, MSMON_FLOW_CONTEXT, Link);
         if ((UINT64)candidate == FlowContext) {
             RemoveEntryList(&candidate->Link);
-            context = candidate;
+            if (candidate->Associating) {
+                candidate->Deleted = TRUE;
+            } else {
+                context = candidate;
+            }
             break;
         }
     }

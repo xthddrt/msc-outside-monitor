@@ -129,6 +129,9 @@ def main():
             event("process_start", 42, 100, r"C:\old.exe", "2026-01-01T00:00:03.000Z"),
             event("kfilter_decision", 42, 0, r"\Device\Nsi", "2026-01-01T00:00:03.500Z",
                   component="kfilter.sys", detail="target=device;action=deny;ioctl=0x00000000"),
+            event("process_exit", 42, 0, "", "2026-01-01T00:00:04.000Z"),
+            event("kfilter_decision", 42, 0, r"\Device\Nsi", "2026-01-01T00:00:04.500Z",
+                  component="kfilter.sys", detail="target=device;action=deny;ioctl=0x00000000"),
         ]
         with open(bundle / "events.jsonl", "w", encoding="utf-8", newline="\n") as stream:
             for record in out_of_order:
@@ -137,7 +140,9 @@ def main():
         rows = {(row["pid"], row["process_start_time"]): row for row in report["processes"]}
         assert set(rows) == {(42, 100), (42, 200)}, rows.keys()
         assert dict(rows[(42, 200)]["types"])["kfilter_decision"] == 1, rows[(42, 200)]
-        assert "kfilter_decision" not in dict(rows[(42, 100)]["types"]), rows[(42, 100)]
+        assert dict(rows[(42, 100)]["types"])["kfilter_decision"] == 1, rows[(42, 100)]
+        assert rows[(42, 200)]["end"] == "2026-01-01T00:00:04.000Z", rows[(42, 200)]
+        assert rows[(42, 100)]["end"] is None, rows[(42, 100)]
 
     print("activity analysis regression passed")
     return 0
