@@ -37,6 +37,8 @@ for %%a in (%*) do (
 )
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0tests\etw_owner_source_test.ps1"
 if errorlevel 1 exit /b 1
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0tests\flow_owner_test.ps1"
+if errorlevel 1 exit /b 1
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0tests\unload_order_test.ps1"
 if errorlevel 1 exit /b 1
 exit /b 0

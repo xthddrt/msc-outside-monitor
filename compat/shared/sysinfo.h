@@ -290,6 +290,22 @@ typedef struct _SYSINFO_MON_BATCH {
 #define SYSINFO_IOCTL_MON_READ   CTL_CODE(FILE_DEVICE_UNKNOWN, 0x811, METHOD_BUFFERED, FILE_READ_DATA | FILE_WRITE_DATA)
 #define SYSINFO_IOCTL_MON_SUMMARY CTL_CODE(FILE_DEVICE_UNKNOWN, 0x812, METHOD_BUFFERED, FILE_READ_DATA | FILE_WRITE_DATA)
 
+/*
+ * Bytes a MON_READ / MON_SUMMARY response actually contains.  Both IOCTLs are
+ * METHOD_BUFFERED, so the I/O manager copies exactly IoStatus.Information bytes
+ * back; reporting the caller's buffer length would return untouched pool bytes
+ * past the records that were produced.
+ */
+static __inline ULONG SysinfoMonReadBytes(ULONG Count)
+{
+    return (ULONG)sizeof(SYSINFO_MON_BATCH) + Count * (ULONG)sizeof(SYSINFO_MON_EVENT);
+}
+
+static __inline ULONG SysinfoSummaryBytes(ULONG Count)
+{
+    return (ULONG)sizeof(SYSINFO_SUMMARY_HEAD) + Count * (ULONG)sizeof(SYSINFO_SUMMARY_ENTRY);
+}
+
 /* --------------------------------------------------------------- guard */
 /*
  * Policy-driven access guard.  The driver watches the target process images

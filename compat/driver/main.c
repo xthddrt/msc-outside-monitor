@@ -114,12 +114,16 @@ DispatchControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
 
     case SYSINFO_IOCTL_MON_READ:
         status = MonRead(buffer, outLength);
-        if (NT_SUCCESS(status)) information = outLength;
+        if (NT_SUCCESS(status)) {
+            information = SysinfoMonReadBytes(((PSYSINFO_MON_BATCH)buffer)->Count);
+        }
         break;
 
     case SYSINFO_IOCTL_MON_SUMMARY:
         status = MonSummary(buffer, inLength, buffer, outLength);
-        if (NT_SUCCESS(status)) information = outLength;
+        if (NT_SUCCESS(status)) {
+            information = SysinfoSummaryBytes(((PSYSINFO_SUMMARY_HEAD)buffer)->Count);
+        }
         break;
 
     case SYSINFO_IOCTL_GUARD_CONFIG:

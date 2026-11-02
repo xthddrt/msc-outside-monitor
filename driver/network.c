@@ -201,6 +201,30 @@ static VOID MsMonLogNetwork(
                         MsMonCategoryNetwork, FlowId, packed, &text, &detail);
 }
 
+/* Take the entry for FlowId out of gFlows and report whether this caller owns it.
+ * Keyed on the flow id the branch captured before it linked the context, never on
+ * the context address: a context a flowDeleteFn already freed, or a new one that
+ * reused its address, must not be unlinked or freed here. */
+static BOOLEAN MsMonFlowUnlink(UINT64 FlowId)
+{
+    PLIST_ENTRY link;
+    BOOLEAN removed = FALSE;
+    KIRQL oldIrql;
+
+    if (!gFlowListInitialized || FlowId == 0) return FALSE;
+    KeAcquireSpinLock(&gFlowLock, &oldIrql);
+    for (link = gFlows.Flink; link != &gFlows; link = link->Flink) {
+        PMSMON_FLOW_CONTEXT candidate = CONTAINING_RECORD(link, MSMON_FLOW_CONTEXT, Link);
+        if (candidate->FlowId == FlowId) {
+            RemoveEntryList(&candidate->Link);
+            removed = TRUE;
+            break;
+        }
+    }
+    KeReleaseSpinLock(&gFlowLock, oldIrql);
+    return removed;
+}
+
 static VOID MsMonAssociateFlow(
     const FWPS_INCOMING_VALUES0* InFixedValues,
     const FWPS_INCOMING_METADATA_VALUES0* InMetaValues,
@@ -215,6 +239,9 @@ static VOID MsMonAssociateFlow(
     PMSMON_FLOW_CONTEXT context;
     KIRQL oldIrql;
     NTSTATUS status;
+    UINT64 flowId;
+    UINT16 layerId;
+    UINT32 calloutId;
     if (!gFlowListInitialized || (InMetaValues->currentMetadataValues & FWPS_METADATA_FIELD_FLOW_HANDLE) == 0 ||
         FlowId == 0) return;
     context = ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(*context), MSMON_POOL_TAG);
@@ -243,9 +270,21 @@ static VOID MsMonAssociateFlow(
 
     KeAcquireSpinLock(&gFlowLock, &oldIrql);
     if (!gNetworkActive) {
+        flowId = context->FlowId;
+        layerId = context->LayerId;
+        calloutId = context->CalloutId;
+
+        InsertTailList(&gFlows, &context->Link);   /* the list owns it from here */
         KeReleaseSpinLock(&gFlowLock, oldIrql);
-        (VOID)FwpsFlowRemoveContext0(context->FlowId, context->LayerId, context->CalloutId);
-        ExFreePoolWithTag(context, MSMON_POOL_TAG);
+        status = FwpsFlowRemoveContext0(flowId, layerId, calloutId);
+        if ((ULONG)status == 0xC0000001u) {
+            /* No association was present, so no flowDeleteFn will come: take the
+             * entry back by flow id and free it here. */
+            if (MsMonFlowUnlink(flowId)) ExFreePoolWithTag(context, MSMON_POOL_TAG);
+        }
+        /* STATUS_SUCCESS: the synchronous flowDeleteFn found the linked entry and
+         * freed it. PENDING (or any incomplete result): the delayed flowDeleteFn
+         * or the unload drain frees it. */
         return;
     }
     InsertTailList(&gFlows, &context->Link);
@@ -529,6 +568,17 @@ VOID MsMonNetworkUninitialize(VOID)
     delay.QuadPart = -10000;
     gNetworkActive = FALSE;
     /*
+     * Stop classify and flowDelete work before touching the list. The inactive
+     * association branch links a context before removing it, so a classify
+     * callback still in flight could otherwise link one after the drain. The
+     * wait refuses new acquisitions; ExRundownCompleted follows the drain.
+     * DriverEntry's failure path calls this before MsMonNetworkInitialize, so
+     * the guard stays.
+     */
+    if (gNetworkRundownInitialized) {
+        ExWaitForRundownProtectionRelease(&gNetworkRundown);
+    }
+    /*
      * A pending removal calls flowDeleteFn asynchronously. The context is already
      * out of our list, so retain ownership and do not free it until WFP confirms
      * that its association is gone.
@@ -578,7 +628,6 @@ VOID MsMonNetworkUninitialize(VOID)
         }
     }
     if (gNetworkRundownInitialized) {
-        ExWaitForRundownProtectionRelease(&gNetworkRundown);
         ExRundownCompleted(&gNetworkRundown);
         gNetworkRundownInitialized = FALSE;
     }

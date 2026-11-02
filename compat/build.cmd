@@ -62,6 +62,14 @@ if errorlevel 1 ( echo [!] summary subject test build failed & exit /b 1 )
 "%OUT%\summary_subject_test.exe"
 if errorlevel 1 ( echo [!] summary subject test failed & exit /b 1 )
 
+cl /nologo /W4 /WX /O2 /MT /Fe:"%OUT%\ioctl_bytes_test.exe" "%ROOT%tests\ioctl_bytes_test.c"
+if errorlevel 1 ( echo [!] ioctl byte-count test build failed & exit /b 1 )
+"%OUT%\ioctl_bytes_test.exe"
+if errorlevel 1 ( echo [!] ioctl byte-count test failed & exit /b 1 )
+
+powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%tests\guard_config_test.ps1"
+if errorlevel 1 ( echo [!] guard config source regression failed & exit /b 1 )
+
 echo built:
 echo   %OUT%\%SYSN%
 echo   %OUT%\%EXEN%
