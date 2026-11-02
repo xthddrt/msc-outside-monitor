@@ -176,10 +176,13 @@ def main():
         destination.mkdir()
         endpoints = ("2001:0db8:0000:0000:0000:0000:0000:0001:443 -> "
                      "fe80:0000:0000:0000:0202:b3ff:fe1e:8329:52000")
+        bracketed = ("[2001:0db8:0000:0000:0000:0000:0000:0001]:443 -> "
+                     "[fe80:0000:0000:0000:0202:b3ff:fe1e:8329]:52000")
         with open(source / "events.jsonl", "w", encoding="utf-8") as stream:
-            stream.write(json.dumps({"type": "network_connect", "timestamp": "t1",
-                                     "process_id": 7, "text": endpoints,
-                                     "detail": "tcp"}) + "\n")
+            for index, value in enumerate((endpoints, bracketed), 1):
+                stream.write(json.dumps({"type": "network_connect", "timestamp": f"t{index}",
+                                         "process_id": 7, "text": value,
+                                         "detail": "tcp"}) + "\n")
 
         redact_session.rewrite([source / "events.jsonl"], destination, False, False)
         text = (destination / "events.jsonl").read_text(encoding="utf-8")
@@ -188,6 +191,8 @@ def main():
         redacted = [json.loads(line) for line in text.splitlines() if line.strip()]
         check(redacted[0]["text"] == "<redacted-ip> -> <redacted-ip>",
               "uncompressed IPv6 endpoints are replaced")
+        check(redacted[1]["text"] == "<redacted-ip> -> <redacted-ip>",
+              "bracketed IPv6 endpoints and their ports are replaced")
         check(redact_session.redact_identifying("10:00:21 -> 10:00:22") == "10:00:21 -> 10:00:22",
               "clock-like strings are not over-matched")
 
@@ -228,8 +233,9 @@ def main():
             "client_root": r"C:\Users\alice\Nexon",
             "scope_root": r"C:\Users\alice\Nexon\appdata"}), encoding="utf-8")
         (source / "summary.json").write_text(json.dumps({
-            "events": 3,
-            "by_module": {r"C:\Users\alice\Nexon\evil.dll": 3,
+            "events": 10,
+            "by_module": {r"C:\Users\alice\a.dll": 3,
+                          r"C:\Users\bob\b.dll": 5,
                           r"C:\Windows\System32\ntdll.dll": 2}}), encoding="utf-8")
 
         redact_session.copy_metadata(source, destination, False)
@@ -237,18 +243,19 @@ def main():
         summary = (destination / "summary.json").read_text(encoding="utf-8")
         check("Users" not in meta and "alice" not in meta,
               "redacted session metadata still contains a profile path")
-        check("Users" not in summary and "alice" not in summary,
+        check("Users" not in summary and "alice" not in summary and "bob" not in summary,
               "redacted summary still contains a profile path")
         data = json.loads(summary)
-        check(data["by_module"]["<redacted-path>"] == 3 and
-              data["by_module"][r"C:\Windows\System32\ntdll.dll"] == 2,
-              "redacted by_module keys keep their counts")
+        check(data["by_module"] == {"<redacted-path>": 8,
+                                    r"C:\Windows\System32\ntdll.dll": 2},
+              "colliding redacted module keys keep their combined count")
 
         kept = root / "kept"
         kept.mkdir()
         redact_session.copy_metadata(source, kept, True)
+        kept_summary = (kept / "summary.json").read_text(encoding="utf-8")
         check("alice" in (kept / "session_meta.json").read_text(encoding="utf-8") and
-              "alice" in (kept / "summary.json").read_text(encoding="utf-8"),
+              "alice" in kept_summary and "bob" in kept_summary,
               "--keep-paths preserves metadata paths")
 
     with tempfile.TemporaryDirectory() as temporary:
@@ -287,8 +294,9 @@ def main():
         }
         (source / "session_meta.json").write_text(json.dumps(meta), encoding="utf-8")
         (source / "summary.json").write_text(json.dumps({
-            "events": 1,
-            "by_module": {r"C:\Users\alice\Nexon\evil.dll": 1}}), encoding="utf-8")
+            "events": 8,
+            "by_module": {r"C:\Users\alice\a.dll": 3,
+                          r"C:\Users\bob\b.dll": 5}}), encoding="utf-8")
         (source / "events.jsonl").write_text(json.dumps(event) + "\n", encoding="utf-8")
 
         old_argv = sys.argv
@@ -301,8 +309,10 @@ def main():
         check(result == 0, f"redacted bundle main succeeds ({result})")
         for name in ("events.jsonl", "session_meta.json", "summary.json"):
             text = (destination / name).read_text(encoding="utf-8")
-            check("Users" not in text and "alice" not in text,
+            check("Users" not in text and "alice" not in text and "bob" not in text,
                   f"{name} in the redacted bundle still contains a profile path")
+        check(json.loads((destination / "summary.json").read_text(encoding="utf-8"))["by_module"] ==
+              {"<redacted-path>": 8}, "full redaction merges module counts")
 
         kept = root / "kept"
         sys.argv = ["redact_session.py", str(source), "--output", str(kept),
@@ -314,7 +324,8 @@ def main():
         check(result == 0, f"redacted bundle main with --keep-paths succeeds ({result})")
         check("alice" in (kept / "events.jsonl").read_text(encoding="utf-8") and
               "alice" in (kept / "session_meta.json").read_text(encoding="utf-8") and
-              "alice" in (kept / "summary.json").read_text(encoding="utf-8"),
+              "alice" in (kept / "summary.json").read_text(encoding="utf-8") and
+              "bob" in (kept / "summary.json").read_text(encoding="utf-8"),
               "--keep-paths preserves the full bundle")
 
     print("redact_session regression passed")
