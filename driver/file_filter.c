@@ -331,7 +331,8 @@ static FLT_POSTOP_CALLBACK_STATUS MsMonPostOperation(
     path = context->NameInfo != NULL ? &context->NameInfo->Name : NULL;
 
     if ((Flags & FLTFL_POST_OPERATION_DRAINING) == 0 && context->Tracked) {
-        if (Data->Iopb->MajorFunction == IRP_MJ_QUERY_VOLUME_INFORMATION && MsMonPayloadEnabled()) {
+        if (Data->Iopb->MajorFunction == IRP_MJ_QUERY_VOLUME_INFORMATION && MsMonPayloadEnabled() &&
+            Data->Iopb->Parameters.QueryVolumeInformation.FsInformationClass == FileFsVolumeInformation) {
             MsMonCaptureVolume(Data, context);
         } else {
             (VOID)MsMonLogEvent(MsMonEventType(Data->Iopb->MajorFunction),

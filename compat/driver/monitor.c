@@ -997,10 +997,11 @@ OpenProcessHook(
     _In_ POBJECT_ATTRIBUTES ObjectAttributes,
     _In_opt_ PCLIENT_ID ClientId)
 {
-    PFN_NtOpenProcess original = (PFN_NtOpenProcess)g_OpenProcessHook.Trampoline;
+    PFN_NtOpenProcess original;
     NTSTATUS status;
 
     HookEnter();
+    original = (PFN_NtOpenProcess)g_OpenProcessHook.Trampoline;
     InterlockedIncrement(&g_OpenCalls);
 
     if (ClientId != NULL && GuardProcessHandleBlocked(ClientId->UniqueProcess, DesiredAccess)) {
@@ -1035,10 +1036,11 @@ OpenThreadHook(
     _In_ POBJECT_ATTRIBUTES ObjectAttributes,
     _In_opt_ PCLIENT_ID ClientId)
 {
-    PFN_NtOpenThread original = (PFN_NtOpenThread)g_OpenThreadHook.Trampoline;
+    PFN_NtOpenThread original;
     NTSTATUS status;
 
     HookEnter();
+    original = (PFN_NtOpenThread)g_OpenThreadHook.Trampoline;
     InterlockedIncrement(&g_OpenCalls);
 
     if (ClientId != NULL && GuardProcessHandleBlocked(ClientId->UniqueProcess, DesiredAccess)) {

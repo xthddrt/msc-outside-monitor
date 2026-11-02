@@ -444,6 +444,41 @@ int main()
                 accountedCounts.count(MsMonCoverageUsage) == 0,
                 "coverage records stay out of event_counts");
 
+    {
+        auto volumeEvent = [](ULONG informationClass, const std::vector<BYTE>& bytes) {
+            TelemetryEvent volume;
+            volume.header.Size = sizeof(volume.header);
+            volume.header.Version = MSMON_PROTOCOL_VERSION;
+            volume.header.Type = MsMonFileQueryVolumeInformation;
+            volume.header.Flags = MsMonFlagPayloadPresent | MsMonFlagPayloadFinalChunk;
+            volume.header.Value0 = informationClass;
+            volume.header.PayloadKind = MsMonPayloadVolumeInformation;
+            volume.header.PayloadChunkCount = 1;
+            volume.header.PayloadTotalBytes = bytes.size();
+            volume.payload = bytes;
+            return volume;
+        };
+        std::vector<BYTE> identity(26, 0);
+        const uint32_t serial = 0x12345678;
+        const uint32_t labelBytes = 8;
+        std::memcpy(identity.data() + 8, &serial, sizeof(serial));
+        std::memcpy(identity.data() + 12, &labelBytes, sizeof(labelBytes));
+        const wchar_t label[] = L"VOL1";
+        std::memcpy(identity.data() + 18, label, labelBytes);
+        const std::string identityJson = TelemetryJson(volumeEvent(1, identity));
+        ok &= Check(identityJson.find("\"volume_serial_hex\":\"12345678\"") != std::string::npos &&
+                        identityJson.find("\"volume_label\":\"VOL1\"") != std::string::npos,
+                    "a volume-information payload keeps its real serial and label");
+
+        std::vector<BYTE> sizeInformation(24, 0);
+        const uint32_t clusters = 0x11223344;
+        std::memcpy(sizeInformation.data() + 8, &clusters, sizeof(clusters));
+        const std::string sizeJson = TelemetryJson(volumeEvent(3, sizeInformation));
+        ok &= Check(sizeJson.find("volume_serial_number") == std::string::npos &&
+                        sizeJson.find("volume_label") == std::string::npos,
+                    "a size-information payload is not decoded as a volume identity");
+    }
+
     JsonlWriter writer(L"build\\tests\\integration-events.jsonl", 0);
     ok &= Check(writer.Open(), "open JSONL output");
     ok &= Check(writer.Write(TelemetryJson(firstDecision)), "write first KFilter JSON");

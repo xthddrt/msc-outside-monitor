@@ -460,7 +460,7 @@ HookNtCreateFile(
     _In_opt_ PVOID EaBuffer,
     _In_ ULONG EaLength)
 {
-    PFN_NtCreateFile original = (PFN_NtCreateFile)g_Hooks[0].Trampoline;
+    PFN_NtCreateFile original;
     NTSTATUS status;
     WCHAR pathBuffer[SYSINFO_MON_MAX_PATH];
     WCHAR fullBuffer[SYSINFO_MON_MAX_PATH * 2];
@@ -469,6 +469,7 @@ HookNtCreateFile(
     BOOLEAN havePath;
 
     HookEnter();
+    original = (PFN_NtCreateFile)g_Hooks[0].Trampoline;
     havePath = FALSE;
     if (MonActive() || GuardIsTargetProcess()) {
         havePath = CaptureObjectName(ObjectAttributes, &path, pathBuffer,
@@ -552,10 +553,11 @@ HookNtWriteFile(
     _In_opt_ PLARGE_INTEGER ByteOffset,
     _In_opt_ PULONG Key)
 {
-    PFN_NtWriteFile original = (PFN_NtWriteFile)g_Hooks[18].Trampoline;
+    PFN_NtWriteFile original;
     NTSTATUS status;
 
     HookEnter();
+    original = (PFN_NtWriteFile)g_Hooks[18].Trampoline;
     status = original(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
                       Buffer, Length, ByteOffset, Key);
 
@@ -586,7 +588,7 @@ HookNtSetInformationFile(
     _In_ ULONG Length,
     _In_ FILE_INFORMATION_CLASS FileInformationClass)
 {
-    PFN_NtSetInformationFile original = (PFN_NtSetInformationFile)g_Hooks[19].Trampoline;
+    PFN_NtSetInformationFile original;
     WCHAR pathBuffer[SYSINFO_MON_MAX_PATH];
     UNICODE_STRING path;
     BOOLEAN havePath = FALSE;
@@ -594,6 +596,9 @@ HookNtSetInformationFile(
 
     UNREFERENCED_PARAMETER(FileInformation);
     UNREFERENCED_PARAMETER(Length);
+
+    HookEnter();
+    original = (PFN_NtSetInformationFile)g_Hooks[19].Trampoline;
 
     /*
      * Resolved before the call on purpose: a successful rename updates the file
@@ -606,8 +611,6 @@ HookNtSetInformationFile(
          FileInformationClass == FileDispositionInformationEx)) {
         havePath = FileHandlePath(FileHandle, &path, pathBuffer, RTL_NUMBER_OF(pathBuffer));
     }
-
-    HookEnter();
     status = original(FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
 
     if (havePath) {
@@ -671,12 +674,13 @@ HookMmCopyVirtualMemory(
     _In_ KPROCESSOR_MODE PreviousMode,
     _Out_ PSIZE_T ReturnSize)
 {
-    PFN_MmCopyVirtualMemory original = (PFN_MmCopyVirtualMemory)g_Hooks[20].Trampoline;
+    PFN_MmCopyVirtualMemory original;
     NTSTATUS status;
 
     UNREFERENCED_PARAMETER(TargetAddress);
 
     HookEnter();
+    original = (PFN_MmCopyVirtualMemory)g_Hooks[20].Trampoline;
     status = original(SourceProcess, SourceAddress, TargetProcess, TargetAddress,
                       BufferSize, PreviousMode, ReturnSize);
 
@@ -710,9 +714,10 @@ HookMmCopyVirtualMemory(
 static VOID NTAPI
 HookKeStackAttachProcess(_In_ PRKPROCESS Process, _Out_ PVOID ApcState)
 {
-    PFN_KeStackAttachProcess original = (PFN_KeStackAttachProcess)g_Hooks[21].Trampoline;
+    PFN_KeStackAttachProcess original;
 
     HookEnter();
+    original = (PFN_KeStackAttachProcess)g_Hooks[21].Trampoline;
 
     {
         ULONG_PTR ret = (ULONG_PTR)_ReturnAddress();
@@ -779,10 +784,11 @@ HookNtDuplicateObject(
     _In_ ULONG HandleAttributes,
     _In_ ULONG Options)
 {
-    PFN_NtDuplicateObject original = (PFN_NtDuplicateObject)g_Hooks[26].Trampoline;
+    PFN_NtDuplicateObject original;
     NTSTATUS status;
 
     HookEnter();
+    original = (PFN_NtDuplicateObject)g_Hooks[26].Trampoline;
     status = original(SourceProcessHandle, SourceHandle, TargetProcessHandle, TargetHandle,
                       DesiredAccess, HandleAttributes, Options);
 
@@ -825,13 +831,14 @@ HookNtQueryDirectoryFile(
     _In_opt_ PUNICODE_STRING FileName,
     _In_ BOOLEAN RestartScan)
 {
-    PFN_NtQueryDirectoryFile original = (PFN_NtQueryDirectoryFile)g_Hooks[27].Trampoline;
+    PFN_NtQueryDirectoryFile original;
     NTSTATUS status;
 
     UNREFERENCED_PARAMETER(FileInformation);
     UNREFERENCED_PARAMETER(ReturnSingleEntry);
 
     HookEnter();
+    original = (PFN_NtQueryDirectoryFile)g_Hooks[27].Trampoline;
     status = original(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
                       FileInformation, Length, FileInformationClass, ReturnSingleEntry,
                       FileName, RestartScan);
@@ -879,13 +886,14 @@ HookNtEnumerateValueKey(
     _In_ ULONG Length,
     _Out_opt_ PULONG ResultLength)
 {
-    PFN_NtEnumerateValueKey original = (PFN_NtEnumerateValueKey)g_Hooks[22].Trampoline;
+    PFN_NtEnumerateValueKey original;
     NTSTATUS status;
 
     UNREFERENCED_PARAMETER(KeyValueInformation);
     UNREFERENCED_PARAMETER(Length);
 
     HookEnter();
+    original = (PFN_NtEnumerateValueKey)g_Hooks[22].Trampoline;
     status = original(KeyHandle, Index, KeyValueInformationClass, KeyValueInformation,
                       Length, ResultLength);
 
@@ -937,13 +945,14 @@ HookNtEnumerateKey(
     _In_ ULONG Length,
     _Out_opt_ PULONG ResultLength)
 {
-    PFN_NtEnumerateKey original = (PFN_NtEnumerateKey)g_Hooks[23].Trampoline;
+    PFN_NtEnumerateKey original;
     NTSTATUS status;
 
     UNREFERENCED_PARAMETER(KeyInformation);
     UNREFERENCED_PARAMETER(Length);
 
     HookEnter();
+    original = (PFN_NtEnumerateKey)g_Hooks[23].Trampoline;
     status = original(KeyHandle, Index, KeyInformationClass, KeyInformation,
                       Length, ResultLength);
 
@@ -1045,7 +1054,7 @@ HookNtQueueApcThread(
     _In_opt_ PVOID ApcArgument2,
     _In_opt_ PVOID ApcArgument3)
 {
-    PFN_NtQueueApcThread original = (PFN_NtQueueApcThread)g_Hooks[24].Trampoline;
+    PFN_NtQueueApcThread original;
     NTSTATUS status;
 
     UNREFERENCED_PARAMETER(ApcArgument1);
@@ -1053,6 +1062,7 @@ HookNtQueueApcThread(
     UNREFERENCED_PARAMETER(ApcArgument3);
 
     HookEnter();
+    original = (PFN_NtQueueApcThread)g_Hooks[24].Trampoline;
     status = original(ThreadHandle, ApcRoutine, ApcArgument1, ApcArgument2, ApcArgument3);
 
     if (MonActive()) {
@@ -1075,12 +1085,13 @@ HookNtQueueApcThread(
 static NTSTATUS NTAPI
 HookNtSetContextThread(_In_ HANDLE ThreadHandle, _In_ PVOID ThreadContext)
 {
-    PFN_NtSetContextThread original = (PFN_NtSetContextThread)g_Hooks[25].Trampoline;
+    PFN_NtSetContextThread original;
     NTSTATUS status;
 
     UNREFERENCED_PARAMETER(ThreadContext);
 
     HookEnter();
+    original = (PFN_NtSetContextThread)g_Hooks[25].Trampoline;
     status = original(ThreadHandle, ThreadContext);
 
     if (MonActive()) {
@@ -1106,7 +1117,7 @@ HookNtOpenKey(
     _In_ ACCESS_MASK DesiredAccess,
     _In_ POBJECT_ATTRIBUTES ObjectAttributes)
 {
-    PFN_NtOpenKey original = (PFN_NtOpenKey)g_Hooks[1].Trampoline;
+    PFN_NtOpenKey original;
     NTSTATUS status;
     WCHAR pathBuffer[SYSINFO_MON_MAX_PATH];
     UNICODE_STRING path;
@@ -1114,6 +1125,7 @@ HookNtOpenKey(
     BOOLEAN havePath;
 
     HookEnter();
+    original = (PFN_NtOpenKey)g_Hooks[1].Trampoline;
     havePath = FALSE;
     if (MonActive() || GuardIsTargetProcess()) {
         havePath = CaptureObjectName(ObjectAttributes, &path, pathBuffer, RTL_NUMBER_OF(pathBuffer), &root);
@@ -1147,7 +1159,7 @@ HookNtOpenKeyEx(
     _In_ POBJECT_ATTRIBUTES ObjectAttributes,
     _In_ ULONG OpenOptions)
 {
-    PFN_NtOpenKeyEx original = (PFN_NtOpenKeyEx)g_Hooks[15].Trampoline;
+    PFN_NtOpenKeyEx original;
     NTSTATUS status;
     WCHAR pathBuffer[SYSINFO_MON_MAX_PATH];
     UNICODE_STRING path;
@@ -1157,6 +1169,7 @@ HookNtOpenKeyEx(
     UNREFERENCED_PARAMETER(OpenOptions);
 
     HookEnter();
+    original = (PFN_NtOpenKeyEx)g_Hooks[15].Trampoline;
     havePath = FALSE;
     if (MonActive() || GuardIsTargetProcess()) {
         havePath = CaptureObjectName(ObjectAttributes, &path, pathBuffer, RTL_NUMBER_OF(pathBuffer), &root);
@@ -1193,7 +1206,7 @@ HookNtCreateKey(
     _In_ ULONG CreateOptions,
     _Out_opt_ PULONG Disposition)
 {
-    PFN_NtCreateKey original = (PFN_NtCreateKey)g_Hooks[2].Trampoline;
+    PFN_NtCreateKey original;
     NTSTATUS status;
     WCHAR pathBuffer[SYSINFO_MON_MAX_PATH];
     UNICODE_STRING path;
@@ -1204,6 +1217,7 @@ HookNtCreateKey(
     UNREFERENCED_PARAMETER(CreateOptions);
 
     HookEnter();
+    original = (PFN_NtCreateKey)g_Hooks[2].Trampoline;
     havePath = FALSE;
     if (MonActive() || GuardIsTargetProcess()) {
         havePath = CaptureObjectName(ObjectAttributes, &path, pathBuffer, RTL_NUMBER_OF(pathBuffer), &root);
@@ -1252,7 +1266,7 @@ HookNtSetValueKey(
     _In_opt_ PVOID Data,
     _In_ ULONG DataSize)
 {
-    PFN_NtSetValueKey original = (PFN_NtSetValueKey)g_Hooks[3].Trampoline;
+    PFN_NtSetValueKey original;
     NTSTATUS status;
     WCHAR guardPathBuffer[128];
     UNICODE_STRING guardPath;
@@ -1261,6 +1275,7 @@ HookNtSetValueKey(
     UNREFERENCED_PARAMETER(Data);
 
     HookEnter();
+    original = (PFN_NtSetValueKey)g_Hooks[3].Trampoline;
     guardHavePath = FALSE;
     if (GuardIsTargetProcess()) {
         guardHavePath = KeyPath(KeyHandle, &guardPath, guardPathBuffer, RTL_NUMBER_OF(guardPathBuffer));
@@ -1338,13 +1353,14 @@ HookNtDeleteValueKey(
     _In_ HANDLE KeyHandle,
     _In_opt_ PUNICODE_STRING ValueName)
 {
-    PFN_NtDeleteValueKey original = (PFN_NtDeleteValueKey)g_Hooks[4].Trampoline;
+    PFN_NtDeleteValueKey original;
     NTSTATUS status;
     WCHAR guardPathBuffer[128];
     UNICODE_STRING guardPath;
     BOOLEAN guardHavePath;
 
     HookEnter();
+    original = (PFN_NtDeleteValueKey)g_Hooks[4].Trampoline;
     guardHavePath = FALSE;
     if (GuardIsTargetProcess()) {
         guardHavePath = KeyPath(KeyHandle, &guardPath, guardPathBuffer, RTL_NUMBER_OF(guardPathBuffer));
@@ -1389,13 +1405,14 @@ HookNtDeleteValueKey(
 static NTSTATUS NTAPI
 HookNtDeleteKey(_In_ HANDLE KeyHandle)
 {
-    PFN_NtDeleteKey original = (PFN_NtDeleteKey)g_Hooks[5].Trampoline;
+    PFN_NtDeleteKey original;
     NTSTATUS status;
     WCHAR guardPathBuffer[128];
     UNICODE_STRING guardPath;
     BOOLEAN guardHavePath;
 
     HookEnter();
+    original = (PFN_NtDeleteKey)g_Hooks[5].Trampoline;
     guardHavePath = FALSE;
     if (GuardIsTargetProcess()) {
         guardHavePath = KeyPath(KeyHandle, &guardPath, guardPathBuffer, RTL_NUMBER_OF(guardPathBuffer));
@@ -1430,13 +1447,14 @@ HookNtProtectVirtualMemory(
     _In_ ULONG NewAccessProtection,
     _Out_opt_ PULONG OldAccessProtection)
 {
-    PFN_NtProtectVirtualMemory original = (PFN_NtProtectVirtualMemory)g_Hooks[6].Trampoline;
+    PFN_NtProtectVirtualMemory original;
     PVOID base = NULL;
     SIZE_T size = 0;
     KPROCESSOR_MODE mode;
     NTSTATUS status;
 
     HookEnter();
+    original = (PFN_NtProtectVirtualMemory)g_Hooks[6].Trampoline;
     mode = ExGetPreviousMode();
     __try {
         if (BaseAddress != NULL) {
@@ -1489,7 +1507,7 @@ HookNtMapViewOfSection(
     _In_ ULONG AllocationType,
     _In_ ULONG Win32Protect)
 {
-    PFN_NtMapViewOfSection original = (PFN_NtMapViewOfSection)g_Hooks[7].Trampoline;
+    PFN_NtMapViewOfSection original;
     NTSTATUS status;
 
     UNREFERENCED_PARAMETER(SectionHandle);
@@ -1499,6 +1517,7 @@ HookNtMapViewOfSection(
     UNREFERENCED_PARAMETER(AllocationType);
 
     HookEnter();
+    original = (PFN_NtMapViewOfSection)g_Hooks[7].Trampoline;
     status = original(SectionHandle, ProcessHandle, BaseAddress, ZeroBits, CommitSize,
                       SectionOffset, ViewSize, InheritDisposition, AllocationType,
                       Win32Protect);
@@ -1550,13 +1569,14 @@ HookNtCreateSection(
     _In_ ULONG AllocationAttributes,
     _In_opt_ HANDLE FileHandle)
 {
-    PFN_NtCreateSection original = (PFN_NtCreateSection)g_Hooks[8].Trampoline;
+    PFN_NtCreateSection original;
     NTSTATUS status;
 
     UNREFERENCED_PARAMETER(AllocationAttributes);
     UNREFERENCED_PARAMETER(FileHandle);
 
     HookEnter();
+    original = (PFN_NtCreateSection)g_Hooks[8].Trampoline;
     status = original(SectionHandle, DesiredAccess, ObjectAttributes, MaximumSize,
                       SectionPageProtection, AllocationAttributes, FileHandle);
 
@@ -1602,12 +1622,13 @@ HookNtReadVirtualMemory(_In_ HANDLE ProcessHandle, _In_ PVOID BaseAddress,
                         _Out_ PVOID Buffer, _In_ SIZE_T NumberOfBytesToRead,
                         _Out_opt_ PSIZE_T NumberOfBytesRead)
 {
-    PFN_NtReadVirtualMemory original = (PFN_NtReadVirtualMemory)g_Hooks[16].Trampoline;
+    PFN_NtReadVirtualMemory original;
     NTSTATUS status;
 
     UNREFERENCED_PARAMETER(Buffer);
 
     HookEnter();
+    original = (PFN_NtReadVirtualMemory)g_Hooks[16].Trampoline;
 
     if (GuardMemoryBlocked(ProcessHandle, PROCESS_VM_READ)) {
         HookLeave();
@@ -1647,12 +1668,13 @@ HookNtWriteVirtualMemory(_In_ HANDLE ProcessHandle, _In_ PVOID BaseAddress,
                          _In_ PVOID Buffer, _In_ SIZE_T NumberOfBytesToWrite,
                          _Out_opt_ PSIZE_T NumberOfBytesWritten)
 {
-    PFN_NtWriteVirtualMemory original = (PFN_NtWriteVirtualMemory)g_Hooks[17].Trampoline;
+    PFN_NtWriteVirtualMemory original;
     NTSTATUS status;
 
     UNREFERENCED_PARAMETER(Buffer);
 
     HookEnter();
+    original = (PFN_NtWriteVirtualMemory)g_Hooks[17].Trampoline;
 
     if (GuardMemoryBlocked(ProcessHandle, PROCESS_VM_WRITE)) {
         HookLeave();
@@ -1700,10 +1722,11 @@ HookNtDeviceIoControlFile(
     _Out_opt_ PVOID OutputBuffer,
     _In_ ULONG OutputBufferLength)
 {
-    PFN_NtDeviceIoControlFile original = (PFN_NtDeviceIoControlFile)g_Hooks[28].Trampoline;
+    PFN_NtDeviceIoControlFile original;
     NTSTATUS status;
 
     HookEnter();
+    original = (PFN_NtDeviceIoControlFile)g_Hooks[28].Trampoline;
     status = original(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
                       IoControlCode, InputBuffer, InputBufferLength,
                       OutputBuffer, OutputBufferLength);
@@ -1736,11 +1759,12 @@ HookNtQuerySystemInformation(
     ULONG SystemInformationLength,
     PULONG ReturnLength)
 {
-    PFN_NtQuerySystemInformation original = (PFN_NtQuerySystemInformation)g_Hooks[29].Trampoline;
+    PFN_NtQuerySystemInformation original;
     ULONG bytes = 0;
     NTSTATUS status;
 
     HookEnter();
+    original = (PFN_NtQuerySystemInformation)g_Hooks[29].Trampoline;
     status = original(SystemInformationClass, SystemInformation,
                       SystemInformationLength, ReturnLength != NULL ? ReturnLength : &bytes);
     if (MonActive()) {
@@ -1808,20 +1832,30 @@ LogCallback(_In_ PCSTR what, _In_ PVOID routine, _In_opt_ PCUNICODE_STRING altit
 static NTSTATUS NTAPI
 HookPsSetCreateThreadNotifyRoutine(_In_ PVOID NotifyRoutine)
 {
-    PFN_PsSetNotify1 original = (PFN_PsSetNotify1)g_Hooks[10].Trampoline;
-    NTSTATUS status = original(NotifyRoutine);
+    PFN_PsSetNotify1 original;
+    NTSTATUS status;
+
+    HookEnter();
+    original = (PFN_PsSetNotify1)g_Hooks[10].Trampoline;
+    status = original(NotifyRoutine);
 
     LogCallback("thread-notify", NotifyRoutine, NULL, FALSE);
+    HookLeave();
     return status;
 }
 
 static NTSTATUS NTAPI
 HookPsSetLoadImageNotifyRoutine(_In_ PVOID NotifyRoutine)
 {
-    PFN_PsSetNotify1 original = (PFN_PsSetNotify1)g_Hooks[11].Trampoline;
-    NTSTATUS status = original(NotifyRoutine);
+    PFN_PsSetNotify1 original;
+    NTSTATUS status;
+
+    HookEnter();
+    original = (PFN_PsSetNotify1)g_Hooks[11].Trampoline;
+    status = original(NotifyRoutine);
 
     LogCallback("image-notify", NotifyRoutine, NULL, FALSE);
+    HookLeave();
     return status;
 }
 
@@ -1829,10 +1863,12 @@ static NTSTATUS NTAPI
 HookObRegisterCallbacks(_In_ POB_CALLBACK_REGISTRATION Registration,
                         _Out_ PVOID *RegistrationHandle)
 {
-    PFN_ObRegisterCallbacks original = (PFN_ObRegisterCallbacks)g_Hooks[12].Trampoline;
+    PFN_ObRegisterCallbacks original;
     PVOID routine = NULL;
     NTSTATUS status;
 
+    HookEnter();
+    original = (PFN_ObRegisterCallbacks)g_Hooks[12].Trampoline;
     if (Registration != NULL && Registration->OperationRegistrationCount > 0 &&
         Registration->OperationRegistration != NULL) {
         routine = (PVOID)Registration->OperationRegistration[0].PreOperation;
@@ -1841,6 +1877,7 @@ HookObRegisterCallbacks(_In_ POB_CALLBACK_REGISTRATION Registration,
     status = original(Registration, RegistrationHandle);
     LogCallback("ob-callbacks", routine,
                 (Registration != NULL) ? &Registration->Altitude : NULL, FALSE);
+    HookLeave();
     return status;
 }
 
@@ -1849,10 +1886,15 @@ HookCmRegisterCallbackEx(_In_ PVOID Function, _In_ PCUNICODE_STRING Altitude,
                          _In_ PVOID Driver, _In_opt_ PVOID Context,
                          _Out_ PVOID *Cookie, _In_opt_ PVOID Reserved)
 {
-    PFN_CmRegisterCallbackEx original = (PFN_CmRegisterCallbackEx)g_Hooks[13].Trampoline;
-    NTSTATUS status = original(Function, Altitude, Driver, Context, Cookie, Reserved);
+    PFN_CmRegisterCallbackEx original;
+    NTSTATUS status;
+
+    HookEnter();
+    original = (PFN_CmRegisterCallbackEx)g_Hooks[13].Trampoline;
+    status = original(Function, Altitude, Driver, Context, Cookie, Reserved);
 
     LogCallback("cm-callback", Function, Altitude, FALSE);
+    HookLeave();
     return status;
 }
 
@@ -1862,9 +1904,13 @@ HookIoCreateDevice(_In_ PDRIVER_OBJECT DriverObject, _In_ ULONG DeviceExtensionS
                    _In_ ULONG Characteristics, _In_ BOOLEAN Exclusive,
                    _Out_ PDEVICE_OBJECT *DeviceObject)
 {
-    PFN_IoCreateDevice original = (PFN_IoCreateDevice)g_Hooks[14].Trampoline;
-    NTSTATUS status = original(DriverObject, DeviceExtensionSize, DeviceName, DeviceType,
-                               Characteristics, Exclusive, DeviceObject);
+    PFN_IoCreateDevice original;
+    NTSTATUS status;
+
+    HookEnter();
+    original = (PFN_IoCreateDevice)g_Hooks[14].Trampoline;
+    status = original(DriverObject, DeviceExtensionSize, DeviceName, DeviceType,
+                      Characteristics, Exclusive, DeviceObject);
 
     if (MonActive() && DeviceName != NULL) {
         CHAR detail[SYSINFO_MON_MAX_DETAIL];
@@ -1877,6 +1923,7 @@ HookIoCreateDevice(_In_ PDRIVER_OBJECT DriverObject, _In_ ULONG DeviceExtensionS
         MonEvent(SYSINFO_MON_DEV, (ULONG)DeviceType, DeviceName, detail);
     }
 
+    HookLeave();
     return status;
 }
 

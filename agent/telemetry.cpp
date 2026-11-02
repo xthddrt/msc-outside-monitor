@@ -565,7 +565,8 @@ static void AppendDecodedValue(std::ostringstream& json, const TelemetryEvent& e
             std::memcpy(&value, event.payload.data(), sizeof(value));
             json << ",\"decoded_value\":" << value;
         }
-    } else if (header.PayloadKind == MsMonPayloadVolumeInformation && event.payload.size() >= 18) {
+    } else if (header.PayloadKind == MsMonPayloadVolumeInformation && header.Value0 == 1u &&
+               event.payload.size() >= 18) {
         uint64_t created;
         uint32_t serial;
         uint32_t labelBytes;

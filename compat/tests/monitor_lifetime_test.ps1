@@ -178,4 +178,30 @@ if (-not $freeHook.Contains('hook->PoolBase = NULL;') -or
     -not $freeHook.Contains('hook->PoolTramp = FALSE;')) {
     throw 'HookFree leaves a freed trampoline published for another free'
 }
+# --- #116: no detour may read its trampoline before entering accounting ---
+$detours = [regex]::Matches($trace, 'static\s+(?:NTSTATUS|VOID)\s+NTAPI\s+(\w+)\s*\(')
+for ($index = 0; $index -lt $detours.Count; $index++) {
+    $start = $detours[$index].Index
+    $end = if ($index + 1 -lt $detours.Count) { $detours[$index + 1].Index } else { $trace.Length }
+    $body = $trace.Substring($start, $end - $start)
+    if (-not $body.Contains('g_Hooks[')) { continue }
+    $entered = $body.IndexOf('HookEnter();')
+    $trampoline = $body.IndexOf('g_Hooks[')
+    if ($entered -lt 0 -or $trampoline -lt $entered) {
+        throw "$($detours[$index].Groups[1].Value) reads its trampoline before HookEnter"
+    }
+    if ([regex]::Matches($body, 'HookEnter\(\);').Count -ne 1 -or
+        [regex]::Matches($body, 'HookLeave\(\);').Count -lt 1) {
+        throw "$($detours[$index].Groups[1].Value) does not balance detour accounting"
+    }
+}
+foreach ($name in 'OpenProcessHook', 'OpenThreadHook') {
+    $end = if ($name -eq 'OpenThreadHook') { '/* Legacy routine:' } else { 'typedef NTSTATUS (NTAPI *PFN_' }
+    $body = Body $monitor "$name(" $end
+    $entered = $body.IndexOf('HookEnter();')
+    $trampoline = $body.IndexOf('.Trampoline')
+    if ($entered -lt 0 -or $trampoline -lt $entered) {
+        throw "$name reads its trampoline before HookEnter"
+    }
+}
 Write-Host 'monitor lifetime regression passed'
