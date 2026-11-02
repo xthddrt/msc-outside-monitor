@@ -14,8 +14,28 @@ function Body([string]$text, [string]$start, [string]$end) {
 }
 
 $quiesce = Body $hooks 'HookQuiesce(VOID)' 'SysinfoPatchMethod'
-if (-not $quiesce.Contains('while (g_InHook != 0)') -or $quiesce.Contains('maxMilliseconds')) {
+if ($quiesce.Contains('while (g_InHook != 0)')) {
+    throw 'detour quiesce still waits for the caller''s own detour'
+}
+if (-not ($quiesce -match 'g_InHook[\s\S]{0,40}>\s*ownDepth')) {
+    throw 'detour quiesce does not exclude the caller''s own depth'
+}
+if ($quiesce.Contains('maxMilliseconds')) {
     throw 'detour quiesce is not unbounded'
+}
+$enter = Body $hooks 'HookEnter(VOID)' 'HookLeave(VOID)'
+$leave = Body $hooks 'HookLeave(VOID)' 'HookQuiesce(VOID)'
+if (-not $enter.Contains('KeGetCurrentThread()') -or -not $enter.Contains('Depth') -or
+    -not $leave.Contains('KeGetCurrentThread()') -or -not $leave.Contains('Depth')) {
+    throw 'detour enter/leave does not maintain a per-thread depth'
+}
+if (-not $enter.Contains('InterlockedIncrement(&g_InHook)') -or
+    -not $leave.Contains('InterlockedDecrement(&g_InHook)')) {
+    throw 'detour enter/leave does not balance the global count'
+}
+if (-not $hooks.Contains('HookInitialize(VOID)') -or
+    -not $hooks.Contains('KeInitializeSpinLock(&g_HookThreadLock')) {
+    throw 'the per-thread depth lock is not initialized'
 }
 $remove = Body $hooks 'HookRemove(_Inout_ PHOOK hook)' 'HookFree(_Inout_ PHOOK hook)'
 if ($hooks -notmatch 'NTSTATUS\s+HookRemove\(_Inout_ PHOOK hook\)' -or $remove.Contains('return;')) {
@@ -28,8 +48,9 @@ $main = Get-Content (Join-Path $root 'driver\main.c') -Raw
 $stop = Body $main 'MonitorStopHooks(VOID)' 'DispatchShutdown('
 $restore = $stop.IndexOf('TraceShutdown(')
 $drain = $stop.IndexOf('HookQuiesce()')
+$drainAll = $stop.IndexOf('HookDrainAll()')
 $free = $stop.IndexOf('TraceFreeTrampolines()')
-if ($restore -lt 0 -or $drain -lt $restore -or $free -lt $drain) {
+if ($restore -lt 0 -or $drain -lt $restore -or $drainAll -lt $drain -or $free -lt $drainAll) {
     throw 'unload does not restore, drain, then free the trampolines'
 }
 $enable = Body $trace 'TraceSetUnsafeHooksEnabled(_In_ ULONG enabled)' 'TraceUnsafeHooksEnabled'
@@ -42,6 +63,10 @@ if ($restore -lt 0 -or $drain -lt $restore -or $free -lt $drain) {
 $shutdown = Body $trace 'TraceShutdown(VOID)' 'TraceHookCount'
 if (-not $shutdown.Contains('while (g_Hooks[i].Installed)')) {
     throw 'failed prologue restoration is not retried'
+}
+$moninit = Body $monitor 'MonInit(VOID)' 'MonShutdown(VOID)'
+if (-not $moninit.Contains('HookInitialize()')) {
+    throw 'MonInit does not initialize the detour depth table'
 }
 $config = Body $monitor 'MonConfigure(_In_ const SYSINFO_MON_CONFIG *config)' 'MonQuery('
 if (-not $config.Contains('KeWaitForSingleObject(&g_MonConfigMutex') -or

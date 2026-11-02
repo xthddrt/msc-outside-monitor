@@ -12,6 +12,7 @@ $ErrorActionPreference = 'Stop'
 $root = (Resolve-Path "$PSScriptRoot\..\..\..").Path
 $ctl = Join-Path $root 'build\compat\msmon-legacyctl.exe'
 $sys = Join-Path $root 'build\compat\msmon-legacy.sys'
+$hooksEnabled = (Get-Content (Join-Path $root 'compat\driver\trace.c') -Raw) -match '(?m)^#define\s+SYSINFO_ENABLE_TRACE_HOOKS\s+1'
 $service = 'SysInfoMon'
 $rounds = 20
 $work = Join-Path ([IO.Path]::GetTempPath()) 'msmon-compat-lifetime'
@@ -71,13 +72,31 @@ try {
                 if (-not $process.WaitForExit(10000)) { Stop-Process -Id $process.Id -Force }
             }
         }
-        if (Bugchecks) { throw "round $round: the machine recorded a bugcheck" }
+        if (Bugchecks) { throw "round ${round}: the machine recorded a bugcheck" }
         # A control call after the drain must fail cleanly, not crash.
         & $ctl status | Out-Null
         Start-Legacy
         & $ctl mon on | Out-Null
     }
     Write-Host "compat lifetime regression passed: $rounds stops with readers in flight, no bugcheck"
+    if ($hooksEnabled) {
+        # MON_CONFIG is delivered through the hooked NtDeviceIoControlFile: a
+        # quiesce that waits for the caller's own detour never returns and
+        # blocks the next configuration and the service stop.
+        $unsafe = Start-Process $ctl -ArgumentList @('mon', 'on', 'unsafe') -PassThru -WindowStyle Hidden
+        if (-not $unsafe.WaitForExit(30000)) { Stop-Process -Id $unsafe.Id -Force; throw 'mon on unsafe hung' }
+        foreach ($arguments in @(@('mon', 'on'), @('mon', 'off'))) {
+            $reconfigure = Start-Process $ctl -ArgumentList $arguments -PassThru -WindowStyle Hidden
+            if (-not $reconfigure.WaitForExit(30000)) {
+                Stop-Process -Id $reconfigure.Id -Force
+                throw "mon $($arguments -join ' ') hung with inline hooks enabled"
+            }
+        }
+        Stop-Legacy
+        Start-Legacy
+        if (Bugchecks) { throw 'the inline-hook configure/disable cycle produced a bugcheck' }
+        Write-Host 'inline-hook configure/disable cycle passed'
+    }
 } finally {
     New-Item -ItemType File -Path $stop -Force -ErrorAction SilentlyContinue | Out-Null
     Stop-Legacy

@@ -169,7 +169,8 @@ MonitorStopHooks(VOID)
     GuardShutdown();
     (VOID)TraceShutdown();
 
-    HookQuiesce();
+    (VOID)HookQuiesce();
+    HookDrainAll();
     TraceFreeTrampolines();
     MonShutdown();
 }

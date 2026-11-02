@@ -1230,6 +1230,8 @@ MonInit(VOID)
 {
     NTSTATUS status;
 
+    /* Before TraceInit can install a detour: HookQuiesce needs this table. */
+    HookInitialize();
     if (g_Registered) return STATUS_SUCCESS;
 
     KeInitializeSpinLock(&g_Lock);

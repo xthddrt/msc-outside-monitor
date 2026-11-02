@@ -55,6 +55,10 @@ ULONG   SysinfoCiOptions(VOID);
  * brackets its body with HookEnter()/HookLeave(); DriverUnload removes the
  * hooks first (so nothing new can enter) and then waits with HookQuiesce().
  */
+VOID    HookInitialize(VOID);
 VOID    HookEnter(VOID);
 VOID    HookLeave(VOID);
-VOID    HookQuiesce(VOID);
+/* FALSE when the caller's own depth cannot be attributed; then do not free. */
+BOOLEAN HookQuiesce(VOID);
+/* Unload-only drain of every detour; the caller must not itself be in one. */
+VOID    HookDrainAll(VOID);

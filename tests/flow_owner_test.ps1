@@ -74,6 +74,31 @@ if ($pendingBody.Contains('ExFreePoolWithTag') -or $pendingBody.Contains('MsMonL
     throw 'flow deletion frees or logs a context the associate thread still owns'
 }
 
+# The callback must unlink the matching entry before it branches: an associating
+# context is only marked, so the associate thread's free leaves no dangling node.
+$match = $delete.IndexOf('if ((UINT64)candidate == FlowContext)')
+$break = $delete.IndexOf('break;', $pending)
+$matchEnd = $delete.IndexOf('}', $break) + 1
+if ($match -lt 0 -or $break -lt $match -or $matchEnd -le $match) {
+    throw 'flow deletion match block not found'
+}
+$matchBody = $delete.Substring($match, $matchEnd - $match)
+$matchUnlink = $matchBody.IndexOf('RemoveEntryList(&candidate->Link)')
+$matchAssociating = $matchBody.IndexOf('if (candidate->Associating)')
+if ($matchUnlink -lt 0 -or $matchAssociating -lt 0 -or $matchUnlink -gt $matchAssociating) {
+    throw 'flow deletion leaves an associating context on gFlows'
+}
+
+# The association failure path must free only; the callback already unlinked.
+$failure = $associate.IndexOf('if (!NT_SUCCESS(status)) {')
+if ($failure -lt 0) { throw 'association failure path not found' }
+$failureEnd = $associate.IndexOf('}', $associate.IndexOf('return;', $failure))
+if ($failureEnd -lt $failure) { throw 'association failure block end not found' }
+$failureBody = $associate.Substring($failure, $failureEnd - $failure)
+if ($failureBody.Contains('MsMonFlowUnlink') -or $failureBody.Contains('RemoveEntryList')) {
+    throw 'association failure unlinks a context the delete callback already removed'
+}
+
 # A passive monitor must never override another filter with a permit.
 if ($source.Contains('FWP_ACTION_PERMIT')) {
     throw 'the passive monitor still issues FWP_ACTION_PERMIT'

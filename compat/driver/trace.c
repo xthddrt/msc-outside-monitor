@@ -2034,8 +2034,7 @@ TraceSetUnsafeHooksEnabled(_In_ ULONG enabled)
         TraceInit();
     } else {
         (VOID)TraceShutdown();
-        HookQuiesce();
-        TraceFreeTrampolines();
+        if (HookQuiesce()) TraceFreeTrampolines();
     }
 }
 

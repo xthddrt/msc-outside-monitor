@@ -357,27 +357,161 @@ static ULONG g_WriteMethod;
  * accounting is always available, even before the first write. */
 static volatile LONG g_InHook;
 
-VOID
-HookEnter(VOID)
-{
-    InterlockedIncrement(&g_InHook);
-}
+/*
+ * One depth record per thread inside a detour.  HookQuiesce must wait for every
+ * other thread's detours but not for the caller's own: the MON_CONFIG caller is
+ * itself inside the hooked NtDeviceIoControlFile, and its HookLeave cannot run
+ * until the control IRP that calls HookQuiesce returns.
+ */
+typedef struct _HOOK_THREAD_DEPTH {
+    LIST_ENTRY Link;
+    PKTHREAD Thread;
+    LONG Depth;
+} HOOK_THREAD_DEPTH, *PHOOK_THREAD_DEPTH;
+
+#define HOOK_DEPTH_TAG 'dTrH'
+
+static LIST_ENTRY g_HookThreads;
+static KSPIN_LOCK g_HookThreadLock;
+static BOOLEAN g_HookThreadsInitialized;
+static volatile LONG g_HookThreadsUntracked;
 
 VOID
-HookLeave(VOID)
+HookInitialize(VOID)
 {
-    InterlockedDecrement(&g_InHook);
+    if (g_HookThreadsInitialized) return;
+    InitializeListHead(&g_HookThreads);
+    KeInitializeSpinLock(&g_HookThreadLock);
+    InterlockedExchange(&g_HookThreadsUntracked, 0);
+    g_HookThreadsInitialized = TRUE;
 }
 
+/* Unload-only: the calling thread is not inside a detour, so every frame can be
+ * waited for even when a record could not be allocated. */
 VOID
-HookQuiesce(VOID)
+HookDrainAll(VOID)
 {
-    while (g_InHook != 0) {
+    while (InterlockedCompareExchange(&g_InHook, 0, 0) != 0) {
         LARGE_INTEGER interval;
 
         interval.QuadPart = -10000;
         KeDelayExecutionThread(KernelMode, FALSE, &interval);
     }
+}
+
+VOID
+HookEnter(VOID)
+{
+    PKTHREAD thread = KeGetCurrentThread();
+    PHOOK_THREAD_DEPTH record = NULL;
+    PLIST_ENTRY link;
+    KIRQL oldIrql;
+
+    if (!g_HookThreadsInitialized) {
+        InterlockedIncrement(&g_HookThreadsUntracked);
+        InterlockedIncrement(&g_InHook);
+        return;
+    }
+
+    KeAcquireSpinLock(&g_HookThreadLock, &oldIrql);
+    for (link = g_HookThreads.Flink; link != &g_HookThreads; link = link->Flink) {
+        PHOOK_THREAD_DEPTH candidate = CONTAINING_RECORD(link, HOOK_THREAD_DEPTH, Link);
+        if (candidate->Thread == thread) {
+            candidate->Depth++;
+            InterlockedIncrement(&g_InHook);
+            KeReleaseSpinLock(&g_HookThreadLock, oldIrql);
+            return;
+        }
+    }
+    KeReleaseSpinLock(&g_HookThreadLock, oldIrql);
+
+    /* Allocated outside g_HookThreadLock: this is the detour entry path. */
+    record = (PHOOK_THREAD_DEPTH)ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(*record), HOOK_DEPTH_TAG);
+    if (record == NULL) {
+        InterlockedIncrement(&g_HookThreadsUntracked);
+        InterlockedIncrement(&g_InHook);
+        return;
+    }
+    record->Thread = thread;
+    record->Depth = 1;
+    KeAcquireSpinLock(&g_HookThreadLock, &oldIrql);
+    InsertTailList(&g_HookThreads, &record->Link);
+    InterlockedIncrement(&g_InHook);
+    KeReleaseSpinLock(&g_HookThreadLock, oldIrql);
+}
+
+VOID
+HookLeave(VOID)
+{
+    PKTHREAD thread = KeGetCurrentThread();
+    PHOOK_THREAD_DEPTH record = NULL;
+    PLIST_ENTRY link;
+    KIRQL oldIrql;
+    BOOLEAN untracked = FALSE;
+
+    if (!g_HookThreadsInitialized) {
+        InterlockedDecrement(&g_HookThreadsUntracked);
+        InterlockedDecrement(&g_InHook);
+        return;
+    }
+
+    KeAcquireSpinLock(&g_HookThreadLock, &oldIrql);
+    for (link = g_HookThreads.Flink; link != &g_HookThreads; link = link->Flink) {
+        PHOOK_THREAD_DEPTH candidate = CONTAINING_RECORD(link, HOOK_THREAD_DEPTH, Link);
+        if (candidate->Thread == thread) {
+            record = candidate;
+            break;
+        }
+    }
+    if (record != NULL) {
+        record->Depth--;
+        if (record->Depth == 0) RemoveEntryList(&record->Link);
+        else record = NULL;
+    } else {
+        untracked = TRUE;
+    }
+    KeReleaseSpinLock(&g_HookThreadLock, oldIrql);
+
+    InterlockedDecrement(&g_InHook);
+    if (untracked) InterlockedDecrement(&g_HookThreadsUntracked);
+    if (record != NULL) ExFreePoolWithTag(record, HOOK_DEPTH_TAG);
+}
+
+BOOLEAN
+HookQuiesce(VOID)
+{
+    PKTHREAD thread = KeGetCurrentThread();
+    PLIST_ENTRY link;
+    LONG ownDepth = 0;
+    KIRQL oldIrql;
+
+    /*
+     * If any thread could not be given a record its own frames are invisible
+     * to the comparison below; refuse to free rather than risk a deadlock or a
+     * trampoline freed under a detour.
+     */
+    if (!g_HookThreadsInitialized ||
+        InterlockedCompareExchange(&g_HookThreadsUntracked, 0, 0) != 0) {
+        return FALSE;
+    }
+
+    KeAcquireSpinLock(&g_HookThreadLock, &oldIrql);
+    for (link = g_HookThreads.Flink; link != &g_HookThreads; link = link->Flink) {
+        PHOOK_THREAD_DEPTH candidate = CONTAINING_RECORD(link, HOOK_THREAD_DEPTH, Link);
+        if (candidate->Thread == thread) {
+            ownDepth = candidate->Depth;
+            break;
+        }
+    }
+    KeReleaseSpinLock(&g_HookThreadLock, oldIrql);
+
+    while (InterlockedCompareExchange(&g_InHook, 0, 0) > ownDepth) {
+        LARGE_INTEGER interval;
+
+        interval.QuadPart = -10000;
+        KeDelayExecutionThread(KernelMode, FALSE, &interval);
+    }
+    return TRUE;
 }
 
 ULONG
