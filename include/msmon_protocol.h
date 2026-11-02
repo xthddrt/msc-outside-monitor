@@ -232,6 +232,17 @@ static __inline int MsMonFlowRemoveComplete(long Status)
     return Status == 0 || (unsigned long)Status == 0xC0000001u;
 }
 
+/*
+ * An explicit track request names the incarnation the caller resolved.  Zero
+ * means "no expectation" (the automatic process/image callers); anything else
+ * must equal the creation time the driver just read, or the PID was reused
+ * between the caller's identity query and this IOCTL.
+ */
+static __inline int MsMonTrackAdmitsStart(unsigned __int64 Expected, unsigned __int64 Actual)
+{
+    return Expected == 0 || Expected == Actual;
+}
+
 #ifdef __cplusplus
 }
 #endif

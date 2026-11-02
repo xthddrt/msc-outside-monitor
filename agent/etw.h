@@ -8,6 +8,13 @@
 #include <mutex>
 #include <thread>
 
+struct ProcessFacts {
+    bool ok = false;
+    uint64_t created = 0;
+    DWORD parent = 0;
+    std::wstring image;
+};
+
 class EtwCollector {
 public:
     EtwCollector(ProcessScope& scope, EventQueue& queue, uint64_t sessionId, bool capturePayloads,
@@ -17,8 +24,21 @@ public:
     void Stop();
     const std::vector<std::wstring>& Warnings() const { return warnings_; }
 
-    /* Re-emit events that arrived before the driver's process-start record. */
-    void ReplayProcess(DWORD pid);
+    /* Hold an event until its process-start record arrives. created is the
+     * incarnation captured with the event (0 = identity was not established). */
+    void Defer(TelemetryEvent&& event, uint64_t created);
+    /* Re-emit events that arrived before the driver's process-start record, only
+     * for the incarnation each was captured for. Returns how many were emitted;
+     * the rest stay pending and expire as unattributed. */
+    size_t ReplayProcess(DWORD pid);
+    /* Remember a connection's owner only while it is the live tracked
+     * incarnation, and resolve a cached owner only while that same incarnation
+     * is still tracked. */
+    bool RememberTcpOwner(uint64_t tcb, DWORD pid, uint64_t created, const std::wstring& endpoints);
+    void ForgetTcpOwner(uint64_t tcb);
+    bool TcpOwner(uint64_t tcb, DWORD& pid, uint64_t& created, std::wstring& endpoints) const;
+    bool ResolveTcpOwner(uint64_t tcb, DWORD providerPid, const ProcessFacts& facts,
+                         std::wstring& endpoints, DWORD& pid, uint64_t& created);
     /* Expire unmatched events and emit an etw_unattributed coverage record. */
     void ExpirePending(uint64_t nowTick);
     uint64_t PendingCount() const;
@@ -43,15 +63,18 @@ private:
     void Emit(TelemetryEvent&& event);
     std::wstring ProviderName(unsigned long type) const;
     bool MayBelongToClient(DWORD pid, uint64_t nowFileTime);
+    ProcessFacts FactsForPid(DWORD pid);
 
     struct CandidateDecision {
-        uint64_t created = 0;
+        ProcessFacts facts;
         uint64_t checkedTick = 0;
         bool candidate = false;
+        bool classified = false;
     };
 
     struct PendingEvent {
         TelemetryEvent event;
+        uint64_t created = 0;
         uint64_t deadline = 0;
     };
 
@@ -79,6 +102,7 @@ private:
     std::atomic<uint64_t> expired_[PROVIDERS]{};
     struct TcpConnection {
         DWORD pid = 0;
+        uint64_t created = 0;
         std::wstring endpoints;
     };
     /* TCP connection (TCB) -> tracked owner and addresses; touched only on the ETW worker thread. */

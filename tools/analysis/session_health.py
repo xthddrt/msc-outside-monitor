@@ -8,6 +8,7 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from common import hhmmss, iter_events, short_image  # noqa: E402
+from session_activity import incarnation_at, incarnation_spans  # noqa: E402
 
 
 def main():
@@ -15,6 +16,7 @@ def main():
     parser.add_argument("session_dir")
     args = parser.parse_args()
 
+    spans = incarnation_spans(args.session_dir)
     starts, exits, gaps, statistics, coverage = [], [], [], [], []
     per_second = collections.Counter()
     per_process = collections.defaultdict(collections.Counter)
@@ -34,18 +36,20 @@ def main():
                 coverage.append((hhmmss(timestamp), text, (event.get("detail") or "")[:160]))
             continue
         pid = event.get("process_id") or 0
+        created = event.get("process_start_time") or incarnation_at(spans, pid, timestamp or "") or 0
+        identity = (pid, created)
         if event.get("process_path"):
-            images.setdefault(pid, short_image(event["process_path"]))
+            images.setdefault(identity, short_image(event["process_path"]))
         if kind == "process_start":
-            images[pid] = short_image(event.get("text"))
-            starts.append((hhmmss(timestamp), pid, event.get("parent_process_id"), event.get("flags_names"), images[pid]))
+            images[identity] = short_image(event.get("text"))
+            starts.append((hhmmss(timestamp), pid, event.get("parent_process_id"), event.get("flags_names"), images[identity]))
         elif kind == "process_exit":
             exits.append((hhmmss(timestamp), pid))
         if event.get("source") == "driver" and timestamp:
             per_second[timestamp[:19]] += 1
         if event.get("component"):
-            blackcat[(images.get(pid, pid), kind)] += 1
-        per_process[pid][kind] += 1
+            blackcat[(images.get(identity, pid), kind)] += 1
+        per_process[identity][kind] += 1
 
     print("== tracked process starts (UTC)")
     for row in starts:
@@ -63,8 +67,8 @@ def main():
     print("== busiest seconds (driver events/s):", per_second.most_common(6))
     print("== BlackCat-attributed events by (process, type):", blackcat.most_common(10))
     print("== events per process")
-    for pid, counter in sorted(per_process.items(), key=lambda item: -sum(item[1].values()))[:10]:
-        print(f"   {pid:>6} {images.get(pid, '?'):20} {sum(counter.values()):8}  {counter.most_common(5)}")
+    for (pid, created), counter in sorted(per_process.items(), key=lambda item: -sum(item[1].values()))[:10]:
+        print(f"   {pid:>6}@{created:<10} {images.get((pid, created), '?'):20} {sum(counter.values()):8}  {counter.most_common(5)}")
     return 0
 
 

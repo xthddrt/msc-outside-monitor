@@ -32,6 +32,7 @@ static UNICODE_STRING g_DeviceName;
 static UNICODE_STRING g_SymLink;
 static ULONG          g_FlagsAtEntry;
 static volatile LONG  g_Stopped;
+static EX_RUNDOWN_REF g_ControlRundown;
 
 /* -------------------------------------------------------------- control device */
 
@@ -67,6 +68,13 @@ DispatchControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
     ULONG    information = 0;
 
     UNREFERENCED_PARAMETER(DeviceObject);
+
+    if (!ExAcquireRundownProtection(&g_ControlRundown)) {
+        Irp->IoStatus.Status = STATUS_DELETE_PENDING;
+        Irp->IoStatus.Information = 0;
+        IoCompleteRequest(Irp, IO_NO_INCREMENT);
+        return STATUS_DELETE_PENDING;
+    }
 
     switch (code) {
     case SYSINFO_IOCTL_STATUS: {
@@ -106,12 +114,16 @@ DispatchControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
 
     case SYSINFO_IOCTL_MON_READ:
         status = MonRead(buffer, outLength);
-        if (NT_SUCCESS(status)) information = outLength;
+        if (NT_SUCCESS(status)) {
+            information = SysinfoMonReadBytes(((PSYSINFO_MON_BATCH)buffer)->Count);
+        }
         break;
 
     case SYSINFO_IOCTL_MON_SUMMARY:
         status = MonSummary(buffer, inLength, buffer, outLength);
-        if (NT_SUCCESS(status)) information = outLength;
+        if (NT_SUCCESS(status)) {
+            information = SysinfoSummaryBytes(((PSYSINFO_SUMMARY_HEAD)buffer)->Count);
+        }
         break;
 
     case SYSINFO_IOCTL_GUARD_CONFIG:
@@ -137,6 +149,7 @@ DispatchControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
 
     Irp->IoStatus.Status = status;
     Irp->IoStatus.Information = information;
+    ExReleaseRundownProtection(&g_ControlRundown);
     IoCompleteRequest(Irp, IO_NO_INCREMENT);
     return status;
 }
@@ -151,17 +164,14 @@ DispatchControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
 static VOID
 MonitorStopHooks(VOID)
 {
-    LARGE_INTEGER delay;
-
     if (InterlockedCompareExchange(&g_Stopped, 1, 0) != 0) return;
 
     GuardShutdown();
-    TraceShutdown();
+    (VOID)TraceShutdown();
 
-    HookQuiesce(15000);
-    delay.QuadPart = -5000000LL;
-    KeDelayExecutionThread(KernelMode, FALSE, &delay);
-
+    (VOID)HookQuiesce();
+    HookDrainAll();
+    TraceFreeTrampolines();
     MonShutdown();
 }
 
@@ -192,6 +202,7 @@ DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING RegistryPath)
     RtlInitUnicodeString(&g_DeviceName, SYSINFO_DEVICE_NAME);
     RtlInitUnicodeString(&g_SymLink, SYSINFO_DOS_NAME);
 
+    ExInitializeRundownProtection(&g_ControlRundown);
     DriverObject->DriverUnload = DriverUnload;
 
     g_FlagsAtEntry = DriverObject->Flags;
@@ -218,14 +229,16 @@ DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING RegistryPath)
         return status;
     }
 
+    GuardInit();
+    MonInit();
+    TraceInit();
+
+    /* Publication comes last: an IOCTL may only reach the zero-initialized
+     * guard/monitor state after the routines that own it have run. */
     g_Device->Flags &= ~DO_DEVICE_INITIALIZING;
     if (!NT_SUCCESS(IoRegisterShutdownNotification(g_Device))) {
         DbgPrint("SysInfoMon: shutdown notification failed\n");
     }
-
-    GuardInit();
-    MonInit();
-    TraceInit();
 
     DbgPrint("SysInfoMon: DriverEntry hooks=%lu\n", TraceHookCount());
     return STATUS_SUCCESS;
@@ -236,7 +249,9 @@ DriverUnload(_In_ PDRIVER_OBJECT DriverObject)
 {
     UNREFERENCED_PARAMETER(DriverObject);
 
+    ExWaitForRundownProtectionRelease(&g_ControlRundown);
     MonitorStopHooks();
+    ExRundownCompleted(&g_ControlRundown);
 
     if (g_Device != NULL) {
         IoUnregisterShutdownNotification(g_Device);

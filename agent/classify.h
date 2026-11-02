@@ -43,7 +43,10 @@ private:
         bool invalid = false;
         std::map<ULONG, bool> chunks;
     };
-    std::map<uint64_t, PayloadProgress> payloadOperations_;
+    /* Only series that have not completed yet are retained. */
+    std::map<uint64_t, PayloadProgress> payloadProgress_;
+    uint64_t payloadOperations_ = 0;
+    uint64_t completePayloads_ = 0;
     std::map<std::string, uint64_t> categories_;
     std::map<DWORD, uint64_t> processes_;
     std::map<DWORD, uint64_t> targets_;

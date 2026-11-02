@@ -12,6 +12,7 @@
  * Nothing here patches code, so it is compatible with HVCI/VBS.
  */
 #include "monitor.h"
+#include "subject.h"
 #include "util.h"
 #include "hooks.h"
 #include "syscall.h"
@@ -37,6 +38,7 @@
 #define SYSINFO_ENABLE_OB_CALLBACKS 1
 
 static KSPIN_LOCK        g_Lock;
+static KMUTEX            g_MonConfigMutex;
 static SYSINFO_MON_EVENT *g_Ring;
 static ULONG             g_Cap;
 static volatile LONG     g_Head;      /* next write */
@@ -373,43 +375,9 @@ SummaryIgnored(_In_ const WCHAR *subject)
 }
 
 /*
- * A name relative to the program's directory is the program's own file.  Keep
- * the information but collapse the tail: "Data\Packs\Skill_00001.ms" becomes
- * "Data\..." and a debug-symbol probe "ntdll.pdb" becomes "*.pdb".  Names with
- * neither a separator nor a .pdb suffix are short and unique enough to keep.
+ * The fold itself lives in subject.h so the same code the driver runs is
+ * exercised by compat/tests (see MonFoldRelative there).
  */
-static VOID
-FoldRelative(_Inout_updates_(chars) WCHAR *subject, _In_ ULONG chars)
-{
-    ULONG i, n;
-
-    if (subject[0] == L'\\') return;
-    if (subject[0] != 0 && subject[1] == L':') return;
-
-    for (i = 0; subject[i] != 0; i++) {
-        if (subject[i] == L'\\') {
-            if (i + 4 < chars) {
-                subject[i]     = L'\\';
-                subject[i + 1] = L'.';
-                subject[i + 2] = L'.';
-                subject[i + 3] = L'.';
-                subject[i + 4] = 0;
-            } else {
-                subject[i] = 0;
-            }
-            return;
-        }
-    }
-
-    if (i < 4) return;
-    if (RtlUpcaseUnicodeChar(subject[i - 4]) != L'.') return;
-    if (RtlUpcaseUnicodeChar(subject[i - 3]) != L'P') return;
-    if (RtlUpcaseUnicodeChar(subject[i - 2]) != L'D') return;
-    if (RtlUpcaseUnicodeChar(subject[i - 1]) != L'B') return;
-
-    for (n = 0; n < 5 && n + 1 < chars; n++) subject[n] = L"*.pdb"[n];
-    subject[n] = 0;
-}
 
 static ULONG
 SumHash(_In_ ULONG Type, _In_ ULONG Pid, _In_ const WCHAR *Subject)
@@ -621,10 +589,9 @@ SummaryAdd(_In_ const SYSINFO_MON_EVENT *event, _In_ const WCHAR *subject)
             return;
         }
 
-        if ((entry->Type == (event->Type & 0x0FFFFFFFu)) &&
-            entry->Pid == event->Pid &&
-            entry->Subject[0] == subject[0] &&
-            RtlEqualMemory(entry->Subject, subject, sizeof(subject))) {
+        if (MonSummaryEntryMatches(entry->Type, entry->Pid, entry->Subject,
+                                   event->Type & 0x0FFFFFFFu, event->Pid, subject,
+                                   RTL_NUMBER_OF(entry->Subject))) {
             entry->Count++;
             entry->Last = event->Stamp;
             entry->Access = event->Op;
@@ -645,6 +612,7 @@ MonSummary(_In_reads_bytes_(inLen) PVOID inBuffer, _In_ ULONG inLen,
     PSYSINFO_SUMMARY_HEAD head = (PSYSINFO_SUMMARY_HEAD)outBuffer;
     PSYSINFO_SUMMARY_ENTRY entries;
     ULONG start, max, room, i, count = 0;
+    KIRQL irql;
 
     if (inBuffer == NULL || inLen < sizeof(*req)) return STATUS_INVALID_PARAMETER;
     if (outBuffer == NULL || outLength < sizeof(*head)) return STATUS_BUFFER_TOO_SMALL;
@@ -658,6 +626,7 @@ MonSummary(_In_reads_bytes_(inLen) PVOID inBuffer, _In_ ULONG inLen,
     if (max > room) max = room;
 
     entries = (PSYSINFO_SUMMARY_ENTRY)(head + 1);
+    KeAcquireSpinLock(&g_SumLock, &irql);
     for (i = start; i < SYSINFO_SUMMARY_SLOTS && count < max; i++) {
         if (g_Sum != NULL && g_Sum[i].Count != 0) {
             entries[count++] = g_Sum[i];
@@ -670,6 +639,7 @@ MonSummary(_In_reads_bytes_(inLen) PVOID inBuffer, _In_ ULONG inLen,
     head->Suppressed = (ULONG)g_SumSuppressed;
     head->Count = count;
     head->Next = (i >= SYSINFO_SUMMARY_SLOTS) ? 0 : i;
+    KeReleaseSpinLock(&g_SumLock, irql);
     return STATUS_SUCCESS;
 }
 
@@ -712,7 +682,7 @@ PushEvent(_In_ ULONG type, _In_ ULONG op, _In_opt_ PCUNICODE_STRING path,
     SumSubject(&event, subject, RTL_NUMBER_OF(subject));
     if (g_IgnoreRelative != 0 &&
         (type == SYSINFO_MON_FILE || type == SYSINFO_MON_KEY || type == SYSINFO_MON_REG)) {
-        FoldRelative(subject, RTL_NUMBER_OF(subject));
+        MonFoldRelative(subject, RTL_NUMBER_OF(subject));
     }
     SummaryAdd(&event, subject);
 
@@ -917,7 +887,7 @@ ImageNotify(_In_opt_ PUNICODE_STRING fullImageName, _In_ HANDLE processId,
         /* Kernel images have no user process, so the image filter cannot apply:
          * a driver the target loads is exactly what we must not miss. */
         if (g_KernelImages == 0) return;
-        op |= SYSINFO_MON_KERNEL;
+        type |= SYSINFO_MON_KERNEL;
     } else if (!MonWantsPid(processId)) {
         return;
     }
@@ -1027,10 +997,11 @@ OpenProcessHook(
     _In_ POBJECT_ATTRIBUTES ObjectAttributes,
     _In_opt_ PCLIENT_ID ClientId)
 {
-    PFN_NtOpenProcess original = (PFN_NtOpenProcess)g_OpenProcessHook.Trampoline;
+    PFN_NtOpenProcess original;
     NTSTATUS status;
 
     HookEnter();
+    original = (PFN_NtOpenProcess)g_OpenProcessHook.Trampoline;
     InterlockedIncrement(&g_OpenCalls);
 
     if (ClientId != NULL && GuardProcessHandleBlocked(ClientId->UniqueProcess, DesiredAccess)) {
@@ -1065,10 +1036,11 @@ OpenThreadHook(
     _In_ POBJECT_ATTRIBUTES ObjectAttributes,
     _In_opt_ PCLIENT_ID ClientId)
 {
-    PFN_NtOpenThread original = (PFN_NtOpenThread)g_OpenThreadHook.Trampoline;
+    PFN_NtOpenThread original;
     NTSTATUS status;
 
     HookEnter();
+    original = (PFN_NtOpenThread)g_OpenThreadHook.Trampoline;
     InterlockedIncrement(&g_OpenCalls);
 
     if (ClientId != NULL && GuardProcessHandleBlocked(ClientId->UniqueProcess, DesiredAccess)) {
@@ -1260,9 +1232,12 @@ MonInit(VOID)
 {
     NTSTATUS status;
 
+    /* Before TraceInit can install a detour: HookQuiesce needs this table. */
+    HookInitialize();
     if (g_Registered) return STATUS_SUCCESS;
 
     KeInitializeSpinLock(&g_Lock);
+    KeInitializeMutex(&g_MonConfigMutex, 0);
 
     status = PsSetLoadImageNotifyRoutine(ImageNotify);
     if (!NT_SUCCESS(status)) {
@@ -1374,28 +1349,40 @@ NTSTATUS
 MonConfigure(_In_ const SYSINFO_MON_CONFIG *config)
 {
     SYSINFO_MON_EVENT *ring;
+    NTSTATUS status = STATUS_SUCCESS;
 
+    /* Exempt this frame while parked: the mutex holder must not drain for it. */
+    HookControlWaitEnter();
+    (VOID)KeWaitForSingleObject(&g_MonConfigMutex, Executive, KernelMode, FALSE, NULL);
+    HookControlWaitLeave();
+    TraceSetUnsafeHooksEnabled(0);
     if (config->Enable == 0) {
         InterlockedExchange(&g_Enabled, 0);
-        return STATUS_SUCCESS;
+        goto Done;
     }
 
     if (g_Ring == NULL) {
         ring = (SYSINFO_MON_EVENT *)ExAllocatePool2(POOL_FLAG_NON_PAGED, MON_RING_EVENTS * sizeof(SYSINFO_MON_EVENT), SYSINFO_TAG_MON);
-        if (ring == NULL) return STATUS_INSUFFICIENT_RESOURCES;
+        if (ring == NULL) {
+            status = STATUS_INSUFFICIENT_RESOURCES;
+            goto Done;
+        }
 
         RtlZeroMemory(ring, MON_RING_EVENTS * sizeof(SYSINFO_MON_EVENT));
         KeInitializeSpinLock(&g_Lock);
-        g_Ring = ring;
         g_Cap = MON_RING_EVENTS;
         g_Head = 0;
         g_Tail = 0;
+        g_Ring = ring;
         InterlockedExchange(&g_Dropped, 0);
     }
 
     if (g_Sum == NULL) {
         PSYSINFO_SUMMARY_ENTRY sum = (PSYSINFO_SUMMARY_ENTRY)ExAllocatePool2(POOL_FLAG_NON_PAGED, SYSINFO_SUMMARY_SLOTS * sizeof(SYSINFO_SUMMARY_ENTRY), SYSINFO_TAG_MON);
-        if (sum == NULL) return STATUS_INSUFFICIENT_RESOURCES;
+        if (sum == NULL) {
+            status = STATUS_INSUFFICIENT_RESOURCES;
+            goto Done;
+        }
 
         RtlZeroMemory(sum, SYSINFO_SUMMARY_SLOTS * sizeof(SYSINFO_SUMMARY_ENTRY));
         KeInitializeSpinLock(&g_SumLock);
@@ -1480,9 +1467,7 @@ MonConfigure(_In_ const SYSINFO_MON_CONFIG *config)
     g_Types = config->Types & SYSINFO_MON_BITS_ALL;
     InterlockedExchange(&g_Enabled, 1);
 
-    if (!config->Enable) {
-        TraceSetUnsafeHooksEnabled(0);
-    } else if (config->UnsafeHooksEnabled) {
+    if (config->UnsafeHooksEnabled) {
         TraceSetUnsafeHooksEnabled(1);
     }
 #if SYSINFO_ENABLE_HANDLE_HOOKS
@@ -1494,7 +1479,9 @@ MonConfigure(_In_ const SYSINFO_MON_CONFIG *config)
     /* The two memory hooks have no exported name; the CLI supplies their
      * syscall numbers so they can be installed on first enable. */
     TraceInstallMemoryHooks(config->SsnRead, config->SsnWrite);
-    return STATUS_SUCCESS;
+Done:
+    KeReleaseMutex(&g_MonConfigMutex, FALSE);
+    return status;
 }
 
 VOID

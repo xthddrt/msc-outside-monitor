@@ -19,7 +19,12 @@ PCHAR  PsGetProcessImageFileName(_In_ PEPROCESS Process);
 NTSTATUS NTAPI PsLookupProcessByProcessId(_In_ HANDLE ProcessId, _Out_ PEPROCESS *Process);
 PEPROCESS NTAPI IoThreadToProcess(_In_ PETHREAD Thread);
 
-static SYSINFO_GUARD_CONFIG g_Config;
+/* Two complete policy buffers; g_Config points at the published one.  A reload
+ * fills the inactive buffer and swaps the pointer under g_ConfigLock, so a
+ * reader never sees a zeroed or half-copied entry. */
+static SYSINFO_GUARD_CONFIG  g_ConfigStore[2];
+static SYSINFO_GUARD_CONFIG *g_Config = &g_ConfigStore[0];
+static KSPIN_LOCK            g_ConfigLock;
 static volatile LONG   g_Mode = SYSINFO_GUARD_OFF;
 static volatile LONG   g_Checks;
 static volatile LONG   g_Denied;
@@ -149,13 +154,14 @@ CurrentImage(_Out_writes_(SYSINFO_GUARD_TARGET_CHARS) CHAR *Image)
     return Image[0] != 0;
 }
 
+/* Callers hold g_ConfigLock: these run under a reader's single acquisition. */
 static BOOLEAN
 TargetByName(_In_ const CHAR *Image)
 {
     ULONG i;
 
-    for (i = 0; i < g_Config.TargetCount && i < SYSINFO_GUARD_MAX_TARGETS; i++) {
-        if (ImageMatches(Image, g_Config.Targets[i])) return TRUE;
+    for (i = 0; i < g_Config->TargetCount && i < SYSINFO_GUARD_MAX_TARGETS; i++) {
+        if (ImageMatches(Image, g_Config->Targets[i])) return TRUE;
     }
     return FALSE;
 }
@@ -165,8 +171,8 @@ ProtectedByName(_In_ const CHAR *Image)
 {
     ULONG i;
 
-    for (i = 0; i < g_Config.ProcessCount && i < SYSINFO_GUARD_MAX_PROCS; i++) {
-        if (ImageMatches(Image, g_Config.Processes[i])) return TRUE;
+    for (i = 0; i < g_Config->ProcessCount && i < SYSINFO_GUARD_MAX_PROCS; i++) {
+        if (ImageMatches(Image, g_Config->Processes[i])) return TRUE;
     }
     return FALSE;
 }
@@ -210,39 +216,42 @@ NTSTATUS
 GuardInit(VOID)
 {
     ULONG i, n;
+    SYSINFO_GUARD_CONFIG *config = &g_ConfigStore[0];
 
-    RtlZeroMemory(&g_Config, sizeof(g_Config));
-    g_Config.Mode = SYSINFO_GUARD_AUDIT;
+    KeInitializeSpinLock(&g_ConfigLock);
+    g_Config = config;
+    RtlZeroMemory(config, sizeof(*config));
+    config->Mode = SYSINFO_GUARD_AUDIT;
     g_Mode = SYSINFO_GUARD_AUDIT;
 
     for (n = 0; g_DefaultTargets[n] != NULL && n < SYSINFO_GUARD_MAX_TARGETS; n++) {
-        CopyAscii(g_Config.Targets[n], SYSINFO_GUARD_TARGET_CHARS, g_DefaultTargets[n]);
+        CopyAscii(config->Targets[n], SYSINFO_GUARD_TARGET_CHARS, g_DefaultTargets[n]);
     }
-    g_Config.TargetCount = n;
+    config->TargetCount = n;
 
     for (n = 0; g_DefaultPaths[n] != NULL && n < SYSINFO_GUARD_MAX_PATHS; n++) {
-        CopyWide(g_Config.Paths[n], SYSINFO_GUARD_PATH_CHARS, g_DefaultPaths[n]);
+        CopyWide(config->Paths[n], SYSINFO_GUARD_PATH_CHARS, g_DefaultPaths[n]);
     }
-    g_Config.PathCount = n;
+    config->PathCount = n;
 
     for (n = 0; g_DefaultProcesses[n] != NULL && n < SYSINFO_GUARD_MAX_PROCS; n++) {
-        CopyAscii(g_Config.Processes[n], SYSINFO_GUARD_TARGET_CHARS, g_DefaultProcesses[n]);
+        CopyAscii(config->Processes[n], SYSINFO_GUARD_TARGET_CHARS, g_DefaultProcesses[n]);
     }
-    g_Config.ProcessCount = n;
+    config->ProcessCount = n;
 
     /* Keep the registry patterns in the remaining path slots. */
-    for (i = 0, n = g_Config.PathCount;
+    for (i = 0, n = config->PathCount;
          g_DefaultRegistry[i] != NULL && n < SYSINFO_GUARD_MAX_PATHS; i++, n++) {
-        CopyWide(g_Config.Paths[n], SYSINFO_GUARD_PATH_CHARS, g_DefaultRegistry[i]);
+        CopyWide(config->Paths[n], SYSINFO_GUARD_PATH_CHARS, g_DefaultRegistry[i]);
     }
-    g_Config.PathCount = n;
+    config->PathCount = n;
 
     InterlockedExchange(&g_Checks, 0);
     InterlockedExchange(&g_Denied, 0);
     InterlockedExchange(&g_Audited, 0);
     DbgPrint("SysInfo guard: init targets=%lu paths=%lu procs=%lu mode=audit\n",
-             (ULONG)g_Config.TargetCount, (ULONG)g_Config.PathCount,
-             (ULONG)g_Config.ProcessCount);
+             (ULONG)config->TargetCount, (ULONG)config->PathCount,
+             (ULONG)config->ProcessCount);
     return STATUS_SUCCESS;
 }
 
@@ -256,57 +265,78 @@ NTSTATUS
 GuardConfigure(_In_ const SYSINFO_GUARD_CONFIG *Config)
 {
     ULONG i;
+    ULONG targets, paths, processes;
+    SYSINFO_GUARD_CONFIG *next;
+    KIRQL irql;
 
     if (Config == NULL || Config->Mode > SYSINFO_GUARD_ENFORCE) return STATUS_INVALID_PARAMETER;
+
+    KeAcquireSpinLock(&g_ConfigLock, &irql);
+    next = (g_Config == &g_ConfigStore[0]) ? &g_ConfigStore[1] : &g_ConfigStore[0];
+    RtlCopyMemory(next, g_Config, sizeof(*next));
 
     if (Config->TargetCount > 0) {
         ULONG count = Config->TargetCount;
         if (count > SYSINFO_GUARD_MAX_TARGETS) count = SYSINFO_GUARD_MAX_TARGETS;
         for (i = 0; i < count; i++) {
-            CopyAscii(g_Config.Targets[i], SYSINFO_GUARD_TARGET_CHARS, Config->Targets[i]);
-            g_Config.Targets[i][SYSINFO_GUARD_TARGET_CHARS - 1] = 0;
+            CopyAscii(next->Targets[i], SYSINFO_GUARD_TARGET_CHARS, Config->Targets[i]);
+            next->Targets[i][SYSINFO_GUARD_TARGET_CHARS - 1] = 0;
         }
-        g_Config.TargetCount = count;
+        next->TargetCount = count;
     }
 
     if (Config->PathCount > 0) {
         ULONG count = Config->PathCount;
         if (count > SYSINFO_GUARD_MAX_PATHS) count = SYSINFO_GUARD_MAX_PATHS;
         for (i = 0; i < count; i++) {
-            CopyWide(g_Config.Paths[i], SYSINFO_GUARD_PATH_CHARS, Config->Paths[i]);
-            g_Config.Paths[i][SYSINFO_GUARD_PATH_CHARS - 1] = 0;
+            CopyWide(next->Paths[i], SYSINFO_GUARD_PATH_CHARS, Config->Paths[i]);
+            next->Paths[i][SYSINFO_GUARD_PATH_CHARS - 1] = 0;
         }
-        g_Config.PathCount = count;
+        next->PathCount = count;
     }
 
     if (Config->ProcessCount > 0) {
         ULONG count = Config->ProcessCount;
         if (count > SYSINFO_GUARD_MAX_PROCS) count = SYSINFO_GUARD_MAX_PROCS;
         for (i = 0; i < count; i++) {
-            CopyAscii(g_Config.Processes[i], SYSINFO_GUARD_TARGET_CHARS, Config->Processes[i]);
-            g_Config.Processes[i][SYSINFO_GUARD_TARGET_CHARS - 1] = 0;
+            CopyAscii(next->Processes[i], SYSINFO_GUARD_TARGET_CHARS, Config->Processes[i]);
+            next->Processes[i][SYSINFO_GUARD_TARGET_CHARS - 1] = 0;
         }
-        g_Config.ProcessCount = count;
+        next->ProcessCount = count;
     }
 
-    g_Config.Mode = Config->Mode;
+    next->Mode = Config->Mode;
+    targets = next->TargetCount;
+    paths = next->PathCount;
+    processes = next->ProcessCount;
+    g_Config = next;
     InterlockedExchange(&g_Mode, (LONG)Config->Mode);
+    KeReleaseSpinLock(&g_ConfigLock, irql);
+
     DbgPrint("SysInfo guard: mode=%lu targets=%lu paths=%lu procs=%lu\n",
-             (ULONG)g_Config.Mode, (ULONG)g_Config.TargetCount,
-             (ULONG)g_Config.PathCount, (ULONG)g_Config.ProcessCount);
+             (ULONG)Config->Mode, (ULONG)targets, (ULONG)paths, (ULONG)processes);
     return STATUS_SUCCESS;
 }
 
 NTSTATUS
 GuardGetStatus(_Out_ PSYSINFO_GUARD_STATUS Status)
 {
+    ULONG targets, paths, processes;
+    KIRQL irql;
+
     if (Status == NULL) return STATUS_INVALID_PARAMETER;
+
+    KeAcquireSpinLock(&g_ConfigLock, &irql);
+    targets = g_Config->TargetCount;
+    paths = g_Config->PathCount;
+    processes = g_Config->ProcessCount;
+    KeReleaseSpinLock(&g_ConfigLock, irql);
 
     Status->AbiVersion = SYSINFO_ABI_VERSION;
     Status->Mode = (ULONG)g_Mode;
-    Status->Targets = g_Config.TargetCount;
-    Status->Paths = g_Config.PathCount;
-    Status->Processes = g_Config.ProcessCount;
+    Status->Targets = targets;
+    Status->Paths = paths;
+    Status->Processes = processes;
     Status->Checks = (ULONG)g_Checks;
     Status->Denied = (ULONG)g_Denied;
     Status->Audited = (ULONG)g_Audited;
@@ -319,27 +349,44 @@ BOOLEAN
 GuardIsTargetProcess(VOID)
 {
     CHAR image[SYSINFO_GUARD_TARGET_CHARS];
+    BOOLEAN targeted;
+    KIRQL irql;
+
     if (g_Mode == SYSINFO_GUARD_OFF) return FALSE;
     if (!CurrentImage(image)) return FALSE;
-    return TargetByName(image);
+    KeAcquireSpinLock(&g_ConfigLock, &irql);
+    targeted = TargetByName(image);
+    KeReleaseSpinLock(&g_ConfigLock, irql);
+    return targeted;
 }
 
 BOOLEAN
 GuardFileBlocked(_In_ PCUNICODE_STRING Path, _In_ ACCESS_MASK Access)
 {
     CHAR image[SYSINFO_GUARD_TARGET_CHARS];
+    BOOLEAN blocked = FALSE;
     ULONG i;
+    KIRQL irql;
 
     if (g_Mode == SYSINFO_GUARD_OFF || Path == NULL) return FALSE;
-    if (!CurrentImage(image) || !TargetByName(image)) return FALSE;
+    if (!CurrentImage(image)) return FALSE;
 
-    for (i = 0; i < g_Config.PathCount && i < SYSINFO_GUARD_MAX_PATHS; i++) {
-        if (ContainsWideNoCase(Path, g_Config.Paths[i])) {
-            Record(g_Mode == SYSINFO_GUARD_AUDIT);
-            LogEvent(SYSINFO_MON_FILE, Access, Path,
-                     g_Mode == SYSINFO_GUARD_ENFORCE ? "DENY file" : "AUDIT file");
-            return g_Mode == SYSINFO_GUARD_ENFORCE;
+    KeAcquireSpinLock(&g_ConfigLock, &irql);
+    if (TargetByName(image)) {
+        for (i = 0; i < g_Config->PathCount && i < SYSINFO_GUARD_MAX_PATHS; i++) {
+            if (ContainsWideNoCase(Path, g_Config->Paths[i])) {
+                blocked = TRUE;
+                break;
+            }
         }
+    }
+    KeReleaseSpinLock(&g_ConfigLock, irql);
+
+    if (blocked) {
+        Record(g_Mode == SYSINFO_GUARD_AUDIT);
+        LogEvent(SYSINFO_MON_FILE, Access, Path,
+                 g_Mode == SYSINFO_GUARD_ENFORCE ? "DENY file" : "AUDIT file");
+        return g_Mode == SYSINFO_GUARD_ENFORCE;
     }
     return FALSE;
 }
@@ -348,32 +395,31 @@ BOOLEAN
 GuardRegistryBlocked(_In_ PCUNICODE_STRING Path, _In_ ACCESS_MASK Access)
 {
     CHAR image[SYSINFO_GUARD_TARGET_CHARS];
+    BOOLEAN blocked = FALSE;
     ULONG i;
+    KIRQL irql;
 
     if (g_Mode == SYSINFO_GUARD_OFF || Path == NULL) return FALSE;
-    if (!CurrentImage(image) || !TargetByName(image)) return FALSE;
+    if (!CurrentImage(image)) return FALSE;
 
-    for (i = 0; i < g_Config.PathCount && i < SYSINFO_GUARD_MAX_PATHS; i++) {
-        if (ContainsWideNoCase(Path, g_Config.Paths[i])) {
-            Record(g_Mode == SYSINFO_GUARD_AUDIT);
-            LogEvent(SYSINFO_MON_KEY, Access, Path,
-                     g_Mode == SYSINFO_GUARD_ENFORCE ? "DENY key" : "AUDIT key");
-            return g_Mode == SYSINFO_GUARD_ENFORCE;
+    KeAcquireSpinLock(&g_ConfigLock, &irql);
+    if (TargetByName(image)) {
+        for (i = 0; i < g_Config->PathCount && i < SYSINFO_GUARD_MAX_PATHS; i++) {
+            if (ContainsWideNoCase(Path, g_Config->Paths[i])) {
+                blocked = TRUE;
+                break;
+            }
         }
     }
+    KeReleaseSpinLock(&g_ConfigLock, irql);
+
+    if (blocked) {
+        Record(g_Mode == SYSINFO_GUARD_AUDIT);
+        LogEvent(SYSINFO_MON_KEY, Access, Path,
+                 g_Mode == SYSINFO_GUARD_ENFORCE ? "DENY key" : "AUDIT key");
+        return g_Mode == SYSINFO_GUARD_ENFORCE;
+    }
     return FALSE;
-}
-
-static BOOLEAN
-ProtectedProcessImage(_In_ PEPROCESS Process)
-{
-    CHAR image[SYSINFO_GUARD_TARGET_CHARS];
-    PCHAR name;
-
-    if (Process == NULL) return FALSE;
-    name = PsGetProcessImageFileName(Process);
-    CopyAscii(image, SYSINFO_GUARD_TARGET_CHARS, name);
-    return image[0] != 0 && ProtectedByName(image);
 }
 
 /* "<action> <target image>", so the event says which browser was touched. */
@@ -407,24 +453,38 @@ GuardProcessHandleBlocked(_In_ HANDLE TargetPid, _In_ ACCESS_MASK Access)
 {
     PEPROCESS process = NULL;
     CHAR caller[SYSINFO_GUARD_TARGET_CHARS];
-    BOOLEAN blocked = FALSE;
+    CHAR targetImage[SYSINFO_GUARD_TARGET_CHARS];
+    BOOLEAN apply = FALSE;
+    BOOLEAN blocked;
+    KIRQL irql;
 
     if (g_Mode == SYSINFO_GUARD_OFF) return FALSE;
-    if (!CurrentImage(caller) || !TargetByName(caller)) return FALSE;
-    if (NT_SUCCESS(PsLookupProcessByProcessId(TargetPid, &process)) && process != NULL) {
-        if (ProtectedProcessImage(process) &&
-            (Access & (PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_CREATE_THREAD |
-                       PROCESS_DUP_HANDLE | PROCESS_SUSPEND_RESUME)) != 0) {
-            CHAR action[SYSINFO_MON_MAX_DETAIL];
+    if (!CurrentImage(caller)) return FALSE;
+    if (!NT_SUCCESS(PsLookupProcessByProcessId(TargetPid, &process)) || process == NULL) return FALSE;
 
-            HandleAction(g_Mode == SYSINFO_GUARD_ENFORCE ? "DENY handle" : "AUDIT handle",
-                         process, action);
-            Record(g_Mode == SYSINFO_GUARD_AUDIT);
-            LogEvent(SYSINFO_MON_HANDLE, Access, NULL, action);
-            blocked = (g_Mode == SYSINFO_GUARD_ENFORCE);
-        }
-        ObDereferenceObject(process);
+    /* The image lookup stays outside the configuration spin lock; only the
+     * bounded table scan runs under it. */
+    CopyAscii(targetImage, SYSINFO_GUARD_TARGET_CHARS, PsGetProcessImageFileName(process));
+
+    KeAcquireSpinLock(&g_ConfigLock, &irql);
+    if (TargetByName(caller) && ProtectedByName(targetImage) &&
+        (Access & (PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_CREATE_THREAD |
+                   PROCESS_DUP_HANDLE | PROCESS_SUSPEND_RESUME)) != 0) {
+        apply = TRUE;
     }
+    KeReleaseSpinLock(&g_ConfigLock, irql);
+
+    blocked = FALSE;
+    if (apply) {
+        CHAR action[SYSINFO_MON_MAX_DETAIL];
+
+        HandleAction(g_Mode == SYSINFO_GUARD_ENFORCE ? "DENY handle" : "AUDIT handle",
+                     process, action);
+        Record(g_Mode == SYSINFO_GUARD_AUDIT);
+        LogEvent(SYSINFO_MON_HANDLE, Access, NULL, action);
+        blocked = (g_Mode == SYSINFO_GUARD_ENFORCE);
+    }
+    ObDereferenceObject(process);
     return blocked;
 }
 
@@ -457,9 +517,12 @@ GuardPreHandle(_Inout_ POB_PRE_OPERATION_INFORMATION Info)
     ACCESS_MASK mask = 0;
     PEPROCESS target = NULL;
     CHAR caller[SYSINFO_GUARD_TARGET_CHARS];
+    CHAR targetImage[SYSINFO_GUARD_TARGET_CHARS];
+    BOOLEAN apply = FALSE;
+    KIRQL irql;
 
     if (g_Mode == SYSINFO_GUARD_OFF || Info == NULL || Info->Object == NULL) return;
-    if (!CurrentImage(caller) || !TargetByName(caller)) return;
+    if (!CurrentImage(caller)) return;
 
     if (Info->Operation == OB_OPERATION_HANDLE_CREATE) {
         access = &Info->Parameters->CreateHandleInformation.DesiredAccess;
@@ -481,8 +544,18 @@ GuardPreHandle(_Inout_ POB_PRE_OPERATION_INFORMATION Info)
     } else {
         return;
     }
-    if (target == NULL || !ProtectedProcessImage(target)) return;
-    if ((*access & mask) == 0) return;
+    if (target == NULL) return;
+
+    /* The image lookup stays outside the configuration spin lock; only the
+     * bounded table scan runs under it. */
+    CopyAscii(targetImage, SYSINFO_GUARD_TARGET_CHARS, PsGetProcessImageFileName(target));
+
+    KeAcquireSpinLock(&g_ConfigLock, &irql);
+    if (TargetByName(caller) && ProtectedByName(targetImage) && (*access & mask) != 0) {
+        apply = TRUE;
+    }
+    KeReleaseSpinLock(&g_ConfigLock, irql);
+    if (!apply) return;
 
     {
         CHAR action[SYSINFO_MON_MAX_DETAIL];

@@ -20,5 +20,8 @@ if errorlevel 1 exit /b 1
 if not exist "%OUT%" mkdir "%OUT%"
 cl /nologo /W4 /O2 /Fo"%OUT%\\" /Fe:"%OUT%\sensor_probe.exe" "%~dp0sensor_probe.c" ws2_32.lib advapi32.lib
 if errorlevel 1 exit /b 1
+cl /nologo /W4 /WX /O2 /EHsc /std:c++17 /Fo"%OUT%\\" /Fe:"%OUT%\etw_probe.exe" "%~dp0etw_probe.cpp" ws2_32.lib netapi32.lib ole32.lib oleaut32.lib wbemuuid.lib
+if errorlevel 1 exit /b 1
 echo built: %OUT%\sensor_probe.exe
+echo built: %OUT%\etw_probe.exe
 exit /b 0

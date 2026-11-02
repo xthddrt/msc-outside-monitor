@@ -54,6 +54,9 @@ sessions/
    python tools\redact_session.py <bundle> --no-compress
    ```
    The raw bundle is never modified; the redacted copy gets a new chain and manifest.
+   It drops each payload together with its `decoded_value`, the agent's plaintext
+   copy of the same bytes (registry value or volume serial and label), and replaces
+   WMI query text, DNS names, paths and command lines per the flags.
 
 ## Transfer policy
 

@@ -357,33 +357,220 @@ static ULONG g_WriteMethod;
  * accounting is always available, even before the first write. */
 static volatile LONG g_InHook;
 
+/*
+ * One depth record per thread inside a detour.  HookQuiesce must wait for every
+ * other thread's detours but not for the caller's own: the MON_CONFIG caller is
+ * itself inside the hooked NtDeviceIoControlFile, and its HookLeave cannot run
+ * until the control IRP that calls HookQuiesce returns.
+ */
+typedef struct _HOOK_THREAD_DEPTH {
+    LIST_ENTRY Link;
+    PKTHREAD Thread;
+    LONG Depth;
+    LONG ParkedFrames;
+} HOOK_THREAD_DEPTH, *PHOOK_THREAD_DEPTH;
+
+#define HOOK_DEPTH_TAG 'dTrH'
+
+static LIST_ENTRY g_HookThreads;
+static KSPIN_LOCK g_HookThreadLock;
+static BOOLEAN g_HookThreadsInitialized;
+static volatile LONG g_HookThreadsUntracked;
+
+/* Detour frames parked on g_MonConfigMutex. Callers without a depth record add zero. */
+static volatile LONG g_HookParkedFrames;
+
+VOID
+HookInitialize(VOID)
+{
+    if (g_HookThreadsInitialized) return;
+    InitializeListHead(&g_HookThreads);
+    KeInitializeSpinLock(&g_HookThreadLock);
+    InterlockedExchange(&g_HookThreadsUntracked, 0);
+    InterlockedExchange(&g_HookParkedFrames, 0);
+    g_HookThreadsInitialized = TRUE;
+}
+
+static LONG
+HookParkedFrames(_In_ BOOLEAN Enter)
+{
+    PKTHREAD thread = KeGetCurrentThread();
+    PHOOK_THREAD_DEPTH record = NULL;
+    PLIST_ENTRY link;
+    LONG frames = 0;
+    KIRQL oldIrql;
+
+    KeAcquireSpinLock(&g_HookThreadLock, &oldIrql);
+    for (link = g_HookThreads.Flink; link != &g_HookThreads; link = link->Flink) {
+        PHOOK_THREAD_DEPTH candidate = CONTAINING_RECORD(link, HOOK_THREAD_DEPTH, Link);
+        if (candidate->Thread == thread) {
+            record = candidate;
+            break;
+        }
+    }
+    if (record != NULL) {
+        if (Enter) {
+            frames = record->Depth;
+            record->ParkedFrames = frames;
+        } else {
+            frames = record->ParkedFrames;
+            record->ParkedFrames = 0;
+        }
+    }
+    KeReleaseSpinLock(&g_HookThreadLock, oldIrql);
+    return frames;
+}
+
+VOID
+HookControlWaitEnter(VOID)
+{
+    LONG frames = HookParkedFrames(TRUE);
+    if (frames != 0) InterlockedAdd(&g_HookParkedFrames, frames);
+}
+
+VOID
+HookControlWaitLeave(VOID)
+{
+    LONG frames = HookParkedFrames(FALSE);
+    if (frames != 0) InterlockedAdd(&g_HookParkedFrames, -frames);
+}
+
+/* Frames that must still be drained: every frame but the parked control ones. */
+static LONG
+HookCountedFrames(VOID)
+{
+    return InterlockedCompareExchange(&g_InHook, 0, 0) -
+           InterlockedCompareExchange(&g_HookParkedFrames, 0, 0);
+}
+
+/* Unload-only: the calling thread is not inside a detour, so every frame can be
+ * waited for even when a record could not be allocated. */
+VOID
+HookDrainAll(VOID)
+{
+    while (InterlockedCompareExchange(&g_InHook, 0, 0) != 0) {
+        LARGE_INTEGER interval;
+
+        interval.QuadPart = -10000;
+        KeDelayExecutionThread(KernelMode, FALSE, &interval);
+    }
+}
+
 VOID
 HookEnter(VOID)
 {
+    PKTHREAD thread = KeGetCurrentThread();
+    PHOOK_THREAD_DEPTH record = NULL;
+    PLIST_ENTRY link;
+    KIRQL oldIrql;
+
+    if (!g_HookThreadsInitialized) {
+        InterlockedIncrement(&g_HookThreadsUntracked);
+        InterlockedIncrement(&g_InHook);
+        return;
+    }
+
+    KeAcquireSpinLock(&g_HookThreadLock, &oldIrql);
+    for (link = g_HookThreads.Flink; link != &g_HookThreads; link = link->Flink) {
+        PHOOK_THREAD_DEPTH candidate = CONTAINING_RECORD(link, HOOK_THREAD_DEPTH, Link);
+        if (candidate->Thread == thread) {
+            candidate->Depth++;
+            InterlockedIncrement(&g_InHook);
+            KeReleaseSpinLock(&g_HookThreadLock, oldIrql);
+            return;
+        }
+    }
+    KeReleaseSpinLock(&g_HookThreadLock, oldIrql);
+
+    /* Allocated outside g_HookThreadLock: this is the detour entry path. */
+    record = (PHOOK_THREAD_DEPTH)ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(*record), HOOK_DEPTH_TAG);
+    if (record == NULL) {
+        InterlockedIncrement(&g_HookThreadsUntracked);
+        InterlockedIncrement(&g_InHook);
+        return;
+    }
+    record->Thread = thread;
+    record->Depth = 1;
+    record->ParkedFrames = 0;
+    KeAcquireSpinLock(&g_HookThreadLock, &oldIrql);
+    InsertTailList(&g_HookThreads, &record->Link);
     InterlockedIncrement(&g_InHook);
+    KeReleaseSpinLock(&g_HookThreadLock, oldIrql);
 }
 
 VOID
 HookLeave(VOID)
 {
+    PKTHREAD thread = KeGetCurrentThread();
+    PHOOK_THREAD_DEPTH record = NULL;
+    PLIST_ENTRY link;
+    KIRQL oldIrql;
+    BOOLEAN untracked = FALSE;
+
+    if (!g_HookThreadsInitialized) {
+        InterlockedDecrement(&g_HookThreadsUntracked);
+        InterlockedDecrement(&g_InHook);
+        return;
+    }
+
+    KeAcquireSpinLock(&g_HookThreadLock, &oldIrql);
+    for (link = g_HookThreads.Flink; link != &g_HookThreads; link = link->Flink) {
+        PHOOK_THREAD_DEPTH candidate = CONTAINING_RECORD(link, HOOK_THREAD_DEPTH, Link);
+        if (candidate->Thread == thread) {
+            record = candidate;
+            break;
+        }
+    }
+    if (record != NULL) {
+        record->Depth--;
+        if (record->Depth == 0) RemoveEntryList(&record->Link);
+        else record = NULL;
+    } else {
+        untracked = TRUE;
+    }
+    KeReleaseSpinLock(&g_HookThreadLock, oldIrql);
+
     InterlockedDecrement(&g_InHook);
+    if (untracked) InterlockedDecrement(&g_HookThreadsUntracked);
+    if (record != NULL) ExFreePoolWithTag(record, HOOK_DEPTH_TAG);
 }
 
-VOID
-HookQuiesce(_In_ ULONG maxMilliseconds)
+BOOLEAN
+HookQuiesce(VOID)
 {
-    ULONG waited = 0;
+    PKTHREAD thread = KeGetCurrentThread();
+    PLIST_ENTRY link;
+    LONG ownDepth = 0;
+    KIRQL oldIrql;
 
-    while (g_InHook != 0 && waited < maxMilliseconds) {
+    /*
+     * If any thread could not be given a record its own frames are invisible
+     * to the comparison below; refuse to free rather than risk a deadlock or a
+     * trampoline freed under a detour.
+     */
+    if (!g_HookThreadsInitialized ||
+        InterlockedCompareExchange(&g_HookThreadsUntracked, 0, 0) != 0) {
+        return FALSE;
+    }
+
+    KeAcquireSpinLock(&g_HookThreadLock, &oldIrql);
+    for (link = g_HookThreads.Flink; link != &g_HookThreads; link = link->Flink) {
+        PHOOK_THREAD_DEPTH candidate = CONTAINING_RECORD(link, HOOK_THREAD_DEPTH, Link);
+        if (candidate->Thread == thread) {
+            ownDepth = candidate->Depth;
+            break;
+        }
+    }
+    KeReleaseSpinLock(&g_HookThreadLock, oldIrql);
+
+    /* Parked control callers are excluded; their frames cannot run trampolines. */
+    while (HookCountedFrames() > ownDepth) {
         LARGE_INTEGER interval;
 
-        interval.QuadPart = -10000;             /* 1 ms */
+        interval.QuadPart = -10000;
         KeDelayExecutionThread(KernelMode, FALSE, &interval);
-        waited++;
     }
-    if (g_InHook != 0) {
-        DbgPrint("SysInfo: %ld detour(s) still running at unload\n", g_InHook);
-    }
+    return TRUE;
 }
 
 ULONG
@@ -509,7 +696,7 @@ HookInstall(_Inout_ PHOOK hook, _In_ PVOID target, _In_ PVOID detour, _In_ PCSTR
      */
     status = BuildTrampoline(hook, build, &built);
     if (!NT_SUCCESS(status)) {
-        if (hook->PoolTramp) ExFreePoolWithTag(hook->PoolBase, 'pTrH');
+        HookFree(hook);
         return status;
     }
 
@@ -537,22 +724,41 @@ HookInstall(_Inout_ PHOOK hook, _In_ PVOID target, _In_ PVOID detour, _In_ PCSTR
     return STATUS_SUCCESS;
 }
 
-VOID
+NTSTATUS
 HookRemove(_Inout_ PHOOK hook)
 {
-    if (hook->Installed) {
-        NTSTATUS status = WriteKernelText(hook->Target, hook->Saved, hook->Stolen);
+    NTSTATUS status = STATUS_SUCCESS;
 
+    if (hook->Installed) {
+        status = WriteKernelText(hook->Target, hook->Saved, hook->Stolen);
         if (!NT_SUCCESS(status)) {
-            /* The target still jumps to our trampoline - keep both alive. */
             DbgPrint("SysInfo: could not restore the hooked prologue (0x%08X)\n", status);
-            return;
+            return status;
         }
         hook->Installed = FALSE;
     }
-    if (hook->PoolTramp && hook->PoolBase) {
+    return status;
+}
+
+/*
+ * Free the pool trampoline of a restored hook.  The caller must have waited
+ * with HookQuiesce() first: a detour that is still executing holds the
+ * trampoline pointer in a local and would jump into freed executable pool.
+ */
+VOID
+HookFree(_Inout_ PHOOK hook)
+{
+    if (!hook->Installed && hook->PoolTramp && hook->PoolBase != NULL) {
         ExFreePoolWithTag(hook->PoolBase, 'pTrH');
         hook->PoolBase = NULL;
         hook->PoolTramp = FALSE;
     }
+}
+
+/* The in-image trampoline slots can be handed out again once every hook has
+ * been restored and drained. */
+VOID
+HookResetTrampolinePool(VOID)
+{
+    g_TrampUsed = 0;
 }

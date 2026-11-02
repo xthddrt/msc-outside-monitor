@@ -171,7 +171,7 @@ VOID MsMonProcessStopSession(VOID)
     MsMonClearProcesses();
 }
 
-NTSTATUS MsMonTrackProcess(HANDLE ProcessId, ULONG Flags)
+NTSTATUS MsMonTrackProcess(HANDLE ProcessId, ULONG Flags, LONGLONG ExpectedStartTime)
 {
     PMSMON_PROCESS_ENTRY entry;
     PMSMON_PROCESS_ENTRY existing;
@@ -199,6 +199,11 @@ NTSTATUS MsMonTrackProcess(HANDLE ProcessId, ULONG Flags)
         entry->StartTime = PsGetProcessCreateTimeQuadPart(process);
         entry->ParentProcessId = NULL;
         ObDereferenceObject(process);
+        if (!MsMonTrackAdmitsStart((ULONGLONG)ExpectedStartTime, (ULONGLONG)entry->StartTime)) {
+            ExFreePoolWithTag(entry, MSMON_POOL_TAG);
+            KeReleaseMutex(&gRootMutex, FALSE);
+            return STATUS_REVISION_MISMATCH;
+        }
     } else {
         ExFreePoolWithTag(entry, MSMON_POOL_TAG);
         KeReleaseMutex(&gRootMutex, FALSE);
@@ -299,7 +304,7 @@ static VOID MsMonProcessNotifyInner(PEPROCESS Process, HANDLE ProcessId, PPS_CRE
     if (CreateInfo == NULL) {
         BOOLEAN tracked = MsMonIsTracked(ProcessId, startTime);
         if (tracked || MsMonCurrentIsBlackCat()) {
-            (VOID)MsMonLogEvent(MsMonProcessExit, ProcessId, NULL, NULL, NULL, 0, 0,
+            (VOID)MsMonLogEvent(MsMonProcessExit, ProcessId, startTime, NULL, NULL, NULL, 0, 0,
                                 STATUS_SUCCESS, 0, MsMonCategoryExternalProcess,
                                 (ULONGLONG)startTime, 0, NULL, NULL);
             MsMonCoverageLogged(MSMON_SENSOR_PROCESS_NOTIFY);
@@ -320,13 +325,13 @@ static VOID MsMonProcessNotifyInner(PEPROCESS Process, HANDLE ProcessId, PPS_CRE
          * registry, network, and handle events are not lost.
          */
         flags = MsMonFlagExplicitTrack;
-        status = MsMonTrackProcess(ProcessId, flags);
+        status = MsMonTrackProcess(ProcessId, flags, 0);
         if (!NT_SUCCESS(status)) {
             MsMonCoverageSkip(MSMON_SKIP_TRACK);
             MsMonEventsNoteDropped();
             return;
         }
-        (VOID)MsMonLogEvent(MsMonProcessStart, ProcessId, CreateInfo->ParentProcessId, NULL, NULL, 0,
+        (VOID)MsMonLogEvent(MsMonProcessStart, ProcessId, startTime, CreateInfo->ParentProcessId, NULL, NULL, 0,
                             flags, STATUS_SUCCESS, 0, MsMonCategoryExternalProcess,
                             (ULONGLONG)startTime, 0, CreateInfo->ImageFileName, CreateInfo->CommandLine);
         MsMonCoverageLogged(MSMON_SENSOR_PROCESS_NOTIFY);
@@ -334,13 +339,13 @@ static VOID MsMonProcessNotifyInner(PEPROCESS Process, HANDLE ProcessId, PPS_CRE
     } else {
         return;
     }
-    status = MsMonTrackProcess(ProcessId, flags);
+    status = MsMonTrackProcess(ProcessId, flags, 0);
     if (!NT_SUCCESS(status)) {
         MsMonCoverageSkip(MSMON_SKIP_TRACK);
         MsMonEventsNoteDropped();
         return;
     }
-    (VOID)MsMonLogEvent(MsMonProcessStart, ProcessId, CreateInfo->ParentProcessId, NULL, NULL, 0,
+    (VOID)MsMonLogEvent(MsMonProcessStart, ProcessId, startTime, CreateInfo->ParentProcessId, NULL, NULL, 0,
                         flags, STATUS_SUCCESS, 0, MsMonCategoryExternalProcess,
                         (ULONGLONG)startTime, 0, CreateInfo->ImageFileName, CreateInfo->CommandLine);
     MsMonCoverageLogged(MSMON_SENSOR_PROCESS_NOTIFY);
@@ -355,11 +360,12 @@ static VOID MsMonProcessNotify(PEPROCESS Process, HANDLE ProcessId, PPS_CREATE_N
 
 static VOID MsMonThreadNotify(HANDLE ProcessId, HANDLE ThreadId, BOOLEAN Create)
 {
+    LONGLONG startTime = MsMonProcessStartTime(ProcessId);
     if (!ExAcquireRundownProtection(&gCallbackRundown)) return;
     MsMonCoverageEnter(MSMON_SENSOR_THREAD_NOTIFY);
     if (MsMonIsTracked(ProcessId, 0) || MsMonCurrentIsBlackCat()) {
         (VOID)MsMonLogEvent(Create ? MsMonThreadStart : MsMonThreadExit,
-                            ProcessId, NULL, ThreadId, NULL, 0, 0, STATUS_SUCCESS, 0,
+                            ProcessId, startTime, NULL, ThreadId, NULL, 0, 0, STATUS_SUCCESS, 0,
                             MsMonCategoryUnknown, 0, 0, NULL, NULL);
         MsMonCoverageLogged(MSMON_SENSOR_THREAD_NOTIFY);
     }
@@ -382,7 +388,7 @@ static VOID MsMonTrackClientAtFirstImage(PCUNICODE_STRING FullImageName, HANDLE 
     if (!MsMonImageUnderRoot(FullImageName)) return;
     if (!NT_SUCCESS(PsLookupProcessByProcessId(ProcessId, &process))) return;
     if (MsMonProcessImageUnderRoot(process, NULL) &&
-        !NT_SUCCESS(MsMonTrackProcess(ProcessId, MsMonFlagExplicitTrack))) {
+        !NT_SUCCESS(MsMonTrackProcess(ProcessId, MsMonFlagExplicitTrack, 0))) {
         MsMonCoverageSkip(MSMON_SKIP_TRACK);
         MsMonEventsNoteDropped();
     }
@@ -399,7 +405,12 @@ static VOID MsMonImageNotify(PUNICODE_STRING FullImageName, HANDLE ProcessId, PI
         MsMonTrackClientAtFirstImage(FullImageName, ProcessId, ImageInfo);
     }
     if (MsMonIsTracked(ProcessId, 0) || MsMonCurrentIsBlackCat()) {
-        (VOID)MsMonLogEvent(MsMonImageLoad, ProcessId, NULL, NULL, NULL, 0, 0,
+        /* Read the start after the admission above: MsMonProcessStartTime only
+         * knows tracked processes, so an image that arrives before the
+         * process-start record would otherwise be logged with start 0 and then
+         * discarded by the agent's early-image merge. */
+        (VOID)MsMonLogEvent(MsMonImageLoad, ProcessId, MsMonProcessStartTime(ProcessId),
+                            NULL, NULL, NULL, 0, 0,
                             STATUS_SUCCESS, 0, MsMonCategoryUnknown,
                             (ULONGLONG)ImageInfo->ImageBase, ImageInfo->ImageSize, FullImageName, NULL);
         MsMonCoverageLogged(MSMON_SENSOR_IMAGE_NOTIFY);
@@ -422,7 +433,17 @@ static VOID MsMonProcessNotifyLegacy(HANDLE ParentId, HANDLE ProcessId, BOOLEAN 
                 MsMonProcessNotifyInner(process, ProcessId, &info);
                 ExFreePool(imageName);
             } else {
-                MsMonProcessNotifyInner(process, ProcessId, NULL);
+                /*
+                 * A create whose image name cannot be resolved is still a
+                 * create: passing NULL would be read as an exit, emitting a
+                 * bogus process_exit and untracking the process. Report the
+                 * create without a path instead (the inner routine accepts a
+                 * NULL ImageFileName).
+                 */
+                PS_CREATE_NOTIFY_INFO info;
+                RtlZeroMemory(&info, sizeof(info));
+                info.ParentProcessId = ParentId;
+                MsMonProcessNotifyInner(process, ProcessId, &info);
             }
         } else {
             MsMonProcessNotifyInner(process, ProcessId, NULL);

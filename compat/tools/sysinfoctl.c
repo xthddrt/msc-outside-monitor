@@ -2862,11 +2862,15 @@ CmdMonSummary(const char *filter)
     printf("summary: %lu distinct, suppressed %lu, overflow %lu\n",
            (unsigned long)total, (unsigned long)suppressed, (unsigned long)overflow);
     for (ULONG i = 0; i < rowsUsed; i++) {
-        char subject[SYSINFO_SUMMARY_SUBJECT + 1];
+        char subject[SYSINFO_SUMMARY_SUBJECT * 3 + 1];
         char image[SYSINFO_MON_IMAGE_CHARS + 1];
         char module[SYSINFO_MON_MODULE_CHARS + 1];
 
-        WideCharToMultiByte(CP_UTF8, 0, rows[i].Subject, -1, subject, sizeof(subject), NULL, NULL);
+        subject[0] = 0;
+        if (WideCharToMultiByte(CP_UTF8, 0, rows[i].Subject, -1, subject,
+                                (int)sizeof(subject), NULL, NULL) == 0) {
+            strcpy_s(subject, sizeof(subject), "<unprintable>");
+        }
         memcpy(image, rows[i].Image, sizeof(rows[i].Image));
         image[sizeof(rows[i].Image)] = 0;
         memcpy(module, rows[i].Module, sizeof(rows[i].Module));

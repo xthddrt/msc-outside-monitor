@@ -68,14 +68,58 @@ class Process:
         self.file_buckets = collections.defaultdict(collections.Counter)
 
 
+def incarnation_spans(session_dir):
+    """Log timestamps of every incarnation a process_start/exit record proves."""
+    spans = collections.defaultdict(list)
+    for event in iter_events(session_dir):
+        kind = event.get("type")
+        pid = event.get("process_id") or 0
+        start = event.get("process_start_time") or 0
+        stamp = event.get("timestamp") or ""
+        if start == 0:
+            if kind == "process_exit":
+                ended = incarnation_at(spans, pid, stamp)
+                if ended is not None:
+                    for span in spans[pid]:
+                        if span[0] == ended and span[2] is None:
+                            span[2] = stamp
+                            break
+            continue
+        if kind == "process_start":
+            spans[pid].append([start, stamp, None])
+        elif kind == "process_exit":
+            for span in spans[pid]:
+                if span[0] == start:
+                    span[2] = stamp
+                    break
+    return spans
+
+
+def incarnation_at(spans, pid, stamp):
+    """The incarnation alive at stamp, never a later one; None if none was."""
+    best = None
+    for start, begin, end in spans.get(pid, ()):
+        if begin and stamp and begin <= stamp and (end is None or stamp <= end):
+            if best is None or start > best:
+                best = start
+    return best
+
+
 def collect(session_dir):
+    # One row per incarnation: a reused PID is a different process. A producer
+    # that omits the start (kfilter_decision) belongs to the incarnation that was
+    # alive at the event's own timestamp; it is never charged to a newer process.
+    spans = incarnation_spans(session_dir)
     processes = collections.defaultdict(Process)
     for event in iter_events(session_dir):
         kind = event.get("type")
         if kind in (None, "coverage", "coverage_usage", "observer_summary", "observer_sequence_gap", "etw_unattributed"):
             continue
         pid = event.get("process_id") or 0
-        process = processes[pid]
+        start = event.get("process_start_time") or 0
+        if start == 0:
+            start = incarnation_at(spans, pid, event.get("timestamp") or "") or 0
+        process = processes[(pid, start)]
         if event.get("process_path") and process.image == "?":
             process.image = short_image(event["process_path"])
         sections = process.sections
@@ -94,7 +138,7 @@ def collect(session_dir):
             process.flags = event.get("flags_names") or []
             process.switches = sorted(set(re.findall(r"(?:^|\s)(-{1,2}[A-Za-z][\w-]*)", detail)))[:12]
         elif kind == "process_exit":
-            process.end = event.get("timestamp")
+            process.end = max(process.end or "", event.get("timestamp") or "") or None
         elif kind == "image_load":
             path = dos_path(text)
             if not path.lower().startswith("c:\\windows"):
@@ -121,7 +165,7 @@ def collect(session_dir):
             key = registry_key(text)
             value_name = detail if "=" not in detail else ""
             writes = kind in ("registry_set_value", "registry_delete", "registry_rename") or \
-                (kind == "registry_create" and event.get("status") == 0 and event.get("value0") == 1)
+                (kind == "registry_create" and event.get("status") == 0)
             if writes:
                 sections["registry_writes"][(kind.replace("registry_", ""), key, value_name)] += 1
             else:
@@ -152,12 +196,25 @@ def report(processes, session_dir, limit):
         return [[list(key) if isinstance(key, tuple) else key, count] for key, count in counter.most_common(limit)]
 
     output = {"session": pathlib.Path(session_dir).name, "processes": []}
-    for pid, process in sorted(processes.items(), key=lambda item: -sum(item[1].sections["types"].values())):
+    unattributed = []
+    for (pid, created), process in sorted(processes.items(), key=lambda item: -sum(item[1].sections["types"].values())):
         if pid == 0:
             continue
-        parent = processes[process.parent].image if process.parent in processes else None
+        if created == 0:
+            # No incarnation was alive at these events' timestamps, so they name no
+            # process. Keep them visible instead of inventing a start-0 process row.
+            unattributed.append({
+                "pid": pid, "image": process.image,
+                "events": sum(process.sections["types"].values()),
+                "types": top(process.sections["types"]),
+            })
+            continue
+        parents = [(parent_created, parent) for (parent_pid, parent_created), parent in processes.items()
+                   if parent_pid == process.parent and parent_created != 0 and parent_created <= created]
+        parent = max(parents, key=lambda item: item[0])[1].image if parents else None
         entry = {
-            "pid": pid, "image": process.image, "parent": process.parent, "parent_image": parent,
+            "pid": pid, "process_start_time": created,
+            "image": process.image, "parent": process.parent, "parent_image": parent,
             "start": process.start, "end": process.end, "flags": process.flags, "switches": process.switches,
             "events": sum(process.sections["types"].values()),
             "file_buckets": {name: dict(counter) for name, counter in
@@ -166,17 +223,21 @@ def report(processes, session_dir, limit):
         for name, counter in process.sections.items():
             entry[name] = top(counter)
         output["processes"].append(entry)
+    if unattributed:
+        output["unattributed"] = unattributed
     return output
 
 
 def show(output, pid, sections, limit):
+    found = False
     for process in output["processes"]:
         if process["pid"] != pid:
             continue
+        found = True
         print(f"== {process['image']} pid={pid} parent={process['parent_image']}({process['parent']}) "
               f"{process['start']} -> {process['end']} flags={process['flags']} events={process['events']}")
         for key, value in process.items():
-            if key in ("pid", "image", "parent", "parent_image", "start", "end", "flags", "events") or not value:
+            if key in ("pid", "process_start_time", "image", "parent", "parent_image", "start", "end", "flags", "events") or not value:
                 continue
             if sections and key not in sections:
                 continue
@@ -184,6 +245,7 @@ def show(output, pid, sections, limit):
             items = value.items() if isinstance(value, dict) else value[:limit]
             for item in items:
                 print("  ", item)
+    if found:
         return 0
     print(f"pid {pid} not in report", file=sys.stderr)
     return 1

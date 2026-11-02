@@ -855,7 +855,7 @@ static unsigned TrackExisting(DeviceSession& device, const std::vector<std::wstr
     }
     CloseHandle(snapshot);
 
-    std::set<DWORD> tracked;
+    std::unordered_map<DWORD, uint64_t> tracked;
     unsigned count = 0;
     bool changed = true;
     while (changed) {
@@ -863,14 +863,21 @@ static unsigned TrackExisting(DeviceSession& device, const std::vector<std::wstr
         for (const auto& process : processes) {
             if (tracked.count(process.th32ProcessID) != 0) continue;
             if (process.th32ProcessID == GetCurrentProcessId()) continue;
-            bool inherited = tracked.count(process.th32ParentProcessID) != 0;
             std::wstring path;
             uint64_t startTime = 0;
             if (!ProcessIdentity(process.th32ProcessID, path, startTime)) continue;
+            bool inherited = false;
+            auto parent = tracked.find(process.th32ParentProcessID);
+            if (parent != tracked.end()) {
+                std::wstring parentPath;
+                uint64_t parentStart = 0;
+                inherited = ProcessIdentity(process.th32ParentProcessID, parentPath, parentStart) &&
+                            ProcessScope::ValidParentIncarnation(parent->second, parentStart, startTime);
+            }
             if (!inherited && !IsUnderAnyRoot(scopeRoots, path)) continue;
             ULONG flags = inherited ? MsMonFlagInheritedTrack : MsMonFlagExplicitTrack;
             if (device.Track(process.th32ProcessID, startTime, flags)) {
-                tracked.insert(process.th32ProcessID);
+                tracked[process.th32ProcessID] = startTime;
                 scope.AddProcess(process.th32ProcessID, startTime, path);
                 count++;
                 changed = true;
@@ -1443,10 +1450,7 @@ int wmain(int argc, wchar_t** argv)
             previousEtwSequence = event.header.Sequence;
         }
         if (event.processPath.empty() && event.header.ProcessId != 0) {
-            uint64_t start = scope.StartTime(event.header.ProcessId);
-            if (event.header.ProcessStartTime == 0 || start == 0 || start == event.header.ProcessStartTime) {
-                event.processPath = scope.Path(event.header.ProcessId);
-            }
+            event.processPath = scope.Path(event.header.ProcessId, event.header.ProcessStartTime);
         }
         classifier.Classify(event);
         AccountSessionEvent(summary, event, totalEvents, eventCounts);
@@ -1576,10 +1580,11 @@ int wmain(int argc, wchar_t** argv)
                     scope.AddProcess(event.header.ProcessId, start, event.text);
                     if (etw) etw->ReplayProcess(event.header.ProcessId);
                 } else if (event.header.Type == MsMonProcessExit) {
-                    event.processPath = scope.Path(event.header.ProcessId);
+                    event.processPath = scope.Path(event.header.ProcessId, event.header.ProcessStartTime);
                     scope.RemoveProcess(event.header.ProcessId, event.header.ProcessStartTime);
                 } else if (event.header.Type == MsMonImageLoad) {
-                    scope.AddImage(event.header.ProcessId, event.header.Value0, event.header.Value1, event.text);
+                    scope.AddImage(event.header.ProcessId, event.header.ProcessStartTime,
+                                   event.header.Value0, event.header.Value1, event.text);
                 }
                 if (snapshotter && event.header.Type == MsMonFileWrite) snapshotter->Note(event.text);
                 if (!event.stackAddresses.empty()) {

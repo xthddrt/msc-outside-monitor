@@ -56,6 +56,26 @@ cl /nologo /W4 /O2 /MT /Zi /D_CRT_SECURE_NO_WARNINGS ^
    /link /SUBSYSTEM:CONSOLE /DYNAMICBASE /NXCOMPAT advapi32.lib psapi.lib
 if errorlevel 1 ( echo [!] tool build failed & exit /b 1 )
 
+echo === compatibility tests ===
+cl /nologo /W4 /O2 /MT /Fe:"%OUT%\summary_subject_test.exe" "%ROOT%tests\summary_subject_test.c"
+if errorlevel 1 ( echo [!] summary subject test build failed & exit /b 1 )
+"%OUT%\summary_subject_test.exe"
+if errorlevel 1 ( echo [!] summary subject test failed & exit /b 1 )
+
+cl /nologo /W4 /WX /O2 /MT /Fe:"%OUT%\ioctl_bytes_test.exe" "%ROOT%tests\ioctl_bytes_test.c"
+if errorlevel 1 ( echo [!] ioctl byte-count test build failed & exit /b 1 )
+"%OUT%\ioctl_bytes_test.exe"
+if errorlevel 1 ( echo [!] ioctl byte-count test failed & exit /b 1 )
+
+powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%tests\guard_config_test.ps1"
+if errorlevel 1 ( echo [!] guard config source regression failed & exit /b 1 )
+powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%tests\monitor_lifetime_test.ps1"
+if errorlevel 1 ( echo [!] monitor lifetime source regression failed & exit /b 1 )
+powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%tests\init_order_test.ps1"
+if errorlevel 1 ( echo [!] init order source regression failed & exit /b 1 )
+powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%tests\summary_utf8_test.ps1"
+if errorlevel 1 ( echo [!] summary UTF-8 source regression failed & exit /b 1 )
+
 echo built:
 echo   %OUT%\%SYSN%
 echo   %OUT%\%EXEN%

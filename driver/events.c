@@ -277,7 +277,7 @@ static ULONG MsMonCaptureUserStack(ULONG Type, HANDLE ProcessId, HANDLE ThreadId
 }
 
 static NTSTATUS MsMonLogEventInternal(
-    ULONG Type, HANDLE ProcessId, HANDLE ParentProcessId, HANDLE ThreadId,
+    ULONG Type, HANDLE ProcessId, LONGLONG ProcessStartTime, HANDLE ParentProcessId, HANDLE ThreadId,
     HANDLE TargetProcessId, LONGLONG TargetProcessStartTime, ULONG Flags,
     NTSTATUS Status, ULONG DesiredAccess, ULONG Category,
     ULONGLONG Value0, ULONGLONG Value1, PCUNICODE_STRING Text,
@@ -344,7 +344,7 @@ static NTSTATUS MsMonLogEventInternal(
     block->Event.ParentProcessId = HandleToULong(ParentProcessId);
     block->Event.ThreadId = HandleToULong(ThreadId);
     block->Event.TargetProcessId = HandleToULong(TargetProcessId);
-    block->Event.ProcessStartTime = (ULONGLONG)MsMonProcessStartTime(ProcessId);
+    block->Event.ProcessStartTime = (ULONGLONG)ProcessStartTime;
     block->Event.TargetProcessStartTime = (ULONGLONG)TargetProcessStartTime;
     block->Event.Status = Status;
     block->Event.DesiredAccess = DesiredAccess;
@@ -429,31 +429,31 @@ static NTSTATUS MsMonLogEventInternal(
 }
 
 NTSTATUS MsMonLogEventWithOperation(
-    ULONG Type, HANDLE ProcessId, HANDLE ThreadId, ULONG Flags, NTSTATUS Status,
+    ULONG Type, HANDLE ProcessId, LONGLONG ProcessStartTime, HANDLE ThreadId, ULONG Flags, NTSTATUS Status,
     ULONG Category, ULONGLONG Value0, ULONGLONG Value1,
     PCUNICODE_STRING Text, PCUNICODE_STRING Detail, ULONGLONG OperationId
 )
 {
-    return MsMonLogEventInternal(Type, ProcessId, NULL, ThreadId, NULL, 0, Flags,
+    return MsMonLogEventInternal(Type, ProcessId, ProcessStartTime, NULL, ThreadId, NULL, 0, Flags,
                                  Status, 0, Category, Value0, Value1, Text, Detail,
                                  OperationId, NULL);
 }
 
 NTSTATUS MsMonLogEvent(
-    ULONG Type, HANDLE ProcessId, HANDLE ParentProcessId, HANDLE ThreadId,
+    ULONG Type, HANDLE ProcessId, LONGLONG ProcessStartTime, HANDLE ParentProcessId, HANDLE ThreadId,
     HANDLE TargetProcessId, LONGLONG TargetProcessStartTime, ULONG Flags,
     NTSTATUS Status, ULONG DesiredAccess, ULONG Category,
     ULONGLONG Value0, ULONGLONG Value1, PCUNICODE_STRING Text, PCUNICODE_STRING Detail
 )
 {
-    return MsMonLogEventInternal(Type, ProcessId, ParentProcessId, ThreadId,
+    return MsMonLogEventInternal(Type, ProcessId, ProcessStartTime, ParentProcessId, ThreadId,
                                  TargetProcessId, TargetProcessStartTime, Flags,
                                  Status, DesiredAccess, Category, Value0, Value1,
                                  Text, Detail, 0, NULL);
 }
 
 NTSTATUS MsMonLogPayloadSeries(
-    ULONG Type, HANDLE ProcessId, HANDLE ThreadId, ULONG Flags, NTSTATUS Status,
+    ULONG Type, HANDLE ProcessId, LONGLONG ProcessStartTime, HANDLE ThreadId, ULONG Flags, NTSTATUS Status,
     ULONG Category, ULONGLONG Value0, ULONGLONG Value1,
     PCUNICODE_STRING Text, PCUNICODE_STRING Detail,
     ULONG PayloadKind, ULONGLONG OperationId, ULONGLONG TotalBytes,
@@ -470,7 +470,7 @@ NTSTATUS MsMonLogPayloadSeries(
 
     if (TotalBytes == 0) {
         MSMON_PAYLOAD empty = {OperationId, 0, 0, 0, 1, PayloadKind, NULL, 0};
-        return MsMonLogEventInternal(Type, ProcessId, NULL, ThreadId, NULL, 0,
+        return MsMonLogEventInternal(Type, ProcessId, ProcessStartTime, NULL, ThreadId, NULL, 0,
                                      Flags, Status, 0, Category, Value0, Value1,
                                      Text, Detail, OperationId, &empty);
     }
@@ -486,7 +486,7 @@ NTSTATUS MsMonLogPayloadSeries(
         chunk.Kind = PayloadKind;
         chunk.Data = (const UCHAR*)Payload + offset;
         chunk.ByteCount = bytes;
-        NTSTATUS status = MsMonLogEventInternal(Type, ProcessId, NULL, ThreadId, NULL, 0,
+        NTSTATUS status = MsMonLogEventInternal(Type, ProcessId, ProcessStartTime, NULL, ThreadId, NULL, 0,
                                                 Flags | (AvailableBytes < TotalBytes ? MsMonFlagPayloadPartial : 0),
                                                 Status, 0, Category, Value0, Value1,
                                                 Text, Detail, OperationId, &chunk);

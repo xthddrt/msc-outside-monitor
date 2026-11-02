@@ -1,5 +1,6 @@
 #include "../agent/integrations.h"
 #include "../agent/classify.h"
+#include "../agent/etw.h"
 #include "../agent/rpc_names.h"
 #include <fstream>
 #include <iostream>
@@ -15,6 +16,145 @@ static bool Check(bool condition, const char* message)
 int main()
 {
     bool ok = true;
+    ProcessScope processScope;
+    processScope.AddProcess(41, 100, L"C:\\client.exe");
+    ok &= Check(processScope.IsTracked(41, 100), "tracked PID accepts its process incarnation");
+    ok &= Check(!processScope.IsTracked(41, 101), "tracked PID rejects a reused incarnation");
+    ok &= Check(!processScope.IsTracked(42, 100), "unknown PID is not tracked");
+    ok &= Check(processScope.Path(41, 100) == L"C:\\client.exe",
+                "a process path is borrowed only for the exact incarnation");
+    ok &= Check(processScope.Path(41, 0).empty() && processScope.Path(41, 101).empty(),
+                "start-less and mismatched records cannot borrow a process path");
+    processScope.AddProcess(41, 200, L"C:\\new-client.exe");
+    ok &= Check(processScope.Path(41, 100).empty() && processScope.Path(41, 200) == L"C:\\new-client.exe",
+                "a reused PID cannot lend its new path to the old incarnation");
+    /* #76: the exit record was dropped, so 42@100 is still known when Windows
+     * reuses the PID for an incarnation whose start carries no image name. */
+    {
+        ProcessScope reused;
+        reused.AddProcess(42, 100, L"C:\\old.exe");
+        reused.AddProcess(42, 200, L"");
+        ok &= Check(reused.Path(42, 200).empty() && reused.Path(42, 100).empty(),
+                    "an empty process-start text cannot inherit the old incarnation's path");
+        reused.AddProcess(42, 200, L"C:\\new.exe");
+        reused.AddProcess(42, 200, L"");
+        ok &= Check(reused.Path(42, 200) == L"C:\\new.exe",
+                    "a repeated start record keeps its own incarnation's path");
+    }
+    ok &= Check(ProcessScope::ValidParentIncarnation(100, 100, 100),
+                "snapshot inheritance accepts the exact parent incarnation");
+    ok &= Check(!ProcessScope::ValidParentIncarnation(100, 101, 100) &&
+                !ProcessScope::ValidParentIncarnation(101, 101, 100) &&
+                !ProcessScope::ValidParentIncarnation(100, 100, 99),
+                "snapshot inheritance rejects reused, later, and older-parent identities");
+
+    /* #55: an explicit track names the incarnation the caller resolved. */
+    ok &= Check(MsMonTrackAdmitsStart(0, 123456), "an unspecified start admits the live process");
+    ok &= Check(MsMonTrackAdmitsStart(100, 100), "the requested incarnation is admitted");
+    ok &= Check(!MsMonTrackAdmitsStart(100, 101), "a reused PID is refused, not tracked");
+
+    {
+        ProcessScope early;
+        const uint64_t address = 0x1000;
+        early.AddImage(42, 100, address, 0x200, L"C:\\old.dll");
+        early.AddProcess(42, 101, L"C:\\client.exe");
+        ok &= Check(early.ResolveStack(42, &address, 1).empty(),
+                    "early images do not cross into a reused process incarnation");
+        early.AddImage(42, 100, address, 0x200, L"C:\\client.dll");
+        early.AddProcess(42, 100, L"C:\\client.exe");
+        auto modules = early.ResolveStack(42, &address, 1);
+        ok &= Check(modules.size() == 1 && modules[0] == L"C:\\client.dll",
+                    "early images merge for the captured incarnation");
+        early.AddImage(43, 100, address, 0x200, L"C:\\old.dll");
+        early.RemoveProcess(43, 100);
+        early.AddProcess(43, 100, L"C:\\client.exe");
+        ok &= Check(early.ResolveStack(43, &address, 1).empty(),
+                    "process exit discards unmatched early images");
+    }
+
+    /*
+     * A deferred ETW event belongs to the incarnation it was captured for: a
+     * reused PID must not release it, and an unknown identity never does.
+     */
+    {
+        EventQueue queue;
+        ProcessScope scope;
+        EtwCollector collector(scope, queue, 1, true, {});
+        TelemetryEvent deferred;
+        deferred.source = "etw";
+        deferred.header.Size = sizeof(deferred.header);
+        deferred.header.Version = MSMON_PROTOCOL_VERSION;
+        deferred.header.Type = MsMonEtwWmi;
+        deferred.header.ProcessId = 42;
+        collector.Defer(TelemetryEvent(deferred), 100);
+        scope.AddProcess(42, 101, L"C:\\client.exe");
+        ok &= Check(collector.ReplayProcess(42) == 0,
+                    "a reused PID does not release another incarnation's deferred event");
+        ok &= Check(collector.PendingCount() == 1, "the mismatched event stays pending to expire");
+        scope.AddProcess(42, 100, L"C:\\client.exe");
+        ok &= Check(collector.ReplayProcess(42) == 1, "the deferred event is released for its incarnation");
+        ok &= Check(collector.PendingCount() == 0, "a released event leaves the pending queue");
+        std::vector<TelemetryEvent> emitted;
+        ok &= Check(queue.Drain(emitted, 1) == 1 && emitted[0].header.ProcessStartTime == 100,
+                    "a replayed event keeps its captured incarnation");
+        collector.Defer(TelemetryEvent(deferred), 0);
+        ok &= Check(collector.ReplayProcess(42) == 0, "an event with no known identity never replays");
+        ok &= Check(collector.PendingCount() == 1, "an unidentified event is left to expire");
+    }
+
+    /*
+     * TCP attribution: a connection's cached owner is only usable while that
+     * exact incarnation is tracked; a reused PID is not the old owner.
+     */
+    {
+        EventQueue queue;
+        ProcessScope scope;
+        EtwCollector collector(scope, queue, 1, true, {});
+        scope.AddProcess(42, 100, L"C:\\client.exe");
+        ok &= Check(!collector.RememberTcpOwner(9, 42, 101, L"192.0.2.1:443"),
+                    "a stale incarnation is not cached as a connection owner");
+        ok &= Check(!collector.RememberTcpOwner(9, 42, 0, L"192.0.2.1:443"),
+                    "an unknown identity is not cached as a connection owner");
+        ok &= Check(collector.RememberTcpOwner(9, 42, 100, L"192.0.2.1:443"),
+                    "the live owner is cached");
+        DWORD owner = 0;
+        uint64_t ownerStart = 0;
+        std::wstring ownerEndpoints;
+        ProcessFacts stale;
+        stale.ok = true;
+        stale.created = 101;
+        ok &= Check(!collector.ResolveTcpOwner(10, 42, stale, ownerEndpoints, owner, ownerStart),
+                    "a direct TCP owner must match the tracked incarnation");
+        ProcessFacts live;
+        live.ok = true;
+        live.created = 100;
+        ok &= Check(collector.ResolveTcpOwner(10, 42, live, ownerEndpoints, owner, ownerStart) &&
+                        owner == 42 && ownerStart == 100,
+                    "a direct TCP owner returns its validated incarnation");
+        ProcessFacts unknown;
+        ok &= Check(collector.ResolveTcpOwner(9, 0, unknown, ownerEndpoints, owner, ownerStart) &&
+                        owner == 42 && ownerStart == 100 && ownerEndpoints == L"192.0.2.1:443",
+                    "a cached TCP owner returns its captured incarnation");
+        collector.ForgetTcpOwner(9);
+        ok &= Check(!collector.ResolveTcpOwner(9, 0, unknown, ownerEndpoints, owner, ownerStart),
+                    "a closed connection cannot lend its owner to a reused TCB");
+        ok &= Check(collector.RememberTcpOwner(9, 42, 100, L"192.0.2.1:443"),
+                    "the current connection can be cached after eviction");
+        /* A record that names a live non-client process must not borrow the cache. */
+        ProcessFacts unrelated;
+        unrelated.ok = true;
+        unrelated.created = 500;
+        ok &= Check(!collector.ResolveTcpOwner(9, 43, unrelated, ownerEndpoints, owner, ownerStart),
+                    "a named non-client process does not inherit a cached TCP owner");
+        ok &= Check(!collector.ResolveTcpOwner(9, 0, unknown, ownerEndpoints, owner, ownerStart),
+                    "the stale TCB entry is dropped when a foreign process reuses it");
+        ok &= Check(collector.RememberTcpOwner(9, 42, 100, L"192.0.2.1:443"),
+                    "the client can cache the connection again after a foreign reuse");
+        scope.AddProcess(42, 101, L"C:\\client.exe");
+        ok &= Check(ownerStart == 100, "TCP attribution does not re-read a reused PID's start time");
+        ok &= Check(!collector.ResolveTcpOwner(9, 0, unknown, ownerEndpoints, owner, ownerStart),
+                    "a reused PID no longer owns the cached connection");
+    }
     const auto& opnumProperties = RpcOpnumProperties();
     ok &= Check(opnumProperties.size() == 3 && opnumProperties[0] == L"ProcNum" &&
                 opnumProperties[1] == L"OpNum" && opnumProperties[2] == L"OperationNum",
@@ -111,6 +251,36 @@ int main()
                 event.detail.find(L"action=RISK") != std::wstring::npos,
                 "risk rule use is decoded");
     source.Action = 1;
+    source.Target = 0x20;
+    source.Value = 0x006D0008;
+    event = KFilterDecisionEvent(source, 77, 6);
+    ok &= Check(event.detail.find(L"target=device") != std::wstring::npos &&
+                event.detail.find(L"ioctl=0x006D0008") != std::wstring::npos &&
+                event.detail.find(L"rights=") == std::wstring::npos,
+                "device decisions expose the IOCTL");
+    source.Target = 4;
+    source.Value = 0x81;
+
+    /* ABI 5 outside-process targets keep their names and the rights= label. */
+    {
+        struct TargetCase { unsigned long value; const wchar_t* name; };
+        const TargetCase targets[] = {
+            { 0x00000100u, L"handle" }, { 0x00000200u, L"launch" },
+            { 0x00000400u, L"open" }, { 0x00000800u, L"thread-handle" },
+            { 0x00001000u, L"thread-open" }
+        };
+        for (const auto& target : targets) {
+            source.Target = target.value;
+            event = KFilterDecisionEvent(source, 77, 6);
+            const std::wstring prefix = L"target=" + std::wstring(target.name) + L";";
+            ok &= Check(event.detail.find(prefix) != std::wstring::npos,
+                        "an ABI 5 target is decoded by name");
+            ok &= Check(event.detail.find(L"target=unknown") == std::wstring::npos &&
+                        event.detail.find(L"target_id=" + std::to_wstring(target.value)) != std::wstring::npos,
+                        "an ABI 5 target keeps its numeric id");
+        }
+        source.Target = 4;
+    }
 
     /* The decision ring survives across runs: only events from this session may be written. */
     ok &= Check(!KFilterDecisionInSession(source, source.Timestamp + 1),
@@ -190,6 +360,71 @@ int main()
     ok &= Check(summary.Json(statistics, 0, 0, 0).find("\"events\":3") != std::string::npos,
                 "observer_summary counts only identified events");
 
+    /* Payload bookkeeping is bounded, and a completed series retains no chunks. */
+    {
+        SessionSummary payloads;
+        for (unsigned index = 0; index < 5000; index++) {
+            TelemetryEvent payload;
+            payload.header.Sequence = index + 1;
+            payload.header.Type = MsMonRegistryQuery;
+            payload.header.Flags = MsMonFlagPayloadPresent;
+            payload.header.OperationId = index + 1;
+            payload.header.PayloadChunkCount = 1;
+            payload.header.PayloadChunkIndex = 0;
+            payload.header.PayloadTotalBytes = 4;
+            payload.header.PayloadBytes = 4;
+            payload.payload = { 1, 2, 3, 4 };
+            payloads.Add(payload);
+        }
+        const std::string json = payloads.Json(statistics, 0, 0, 0);
+        ok &= Check(json.find("\"payload_operations\":5000") != std::string::npos,
+                    "every payload operation is counted");
+        ok &= Check(json.find("\"complete_payload_operations\":5000") != std::string::npos,
+                    "a completed payload series counts once");
+        ok &= Check(json.find("\"incomplete_payload_operations\":0") != std::string::npos,
+                    "a completed payload series leaves no incomplete entry");
+        ok &= Check(json.find("\"payload_operations_pending\":0") != std::string::npos,
+                    "completed payload series retain no chunk bookkeeping");
+    }
+
+    /*
+     * #53/#57: a late, lower OperationId must survive the insert that evicts the
+     * oldest pending series. 4096 incomplete series fill the table; inserting id
+     * 1 raises it to 4097 and evicts one of them, and must not free the node it
+     * just inserted; finishing id 1 then removes exactly one entry.
+     */
+    {
+        SessionSummary late;
+        TelemetryEvent payload;
+        payload.source = "driver";
+        payload.header.Type = MsMonRegistryQuery;
+        payload.header.Flags = MsMonFlagPayloadPresent;
+        payload.header.PayloadChunkCount = 2;
+        payload.header.PayloadTotalBytes = 8;
+        payload.header.PayloadBytes = 4;
+        payload.payload = { 1, 2, 3, 4 };
+        for (unsigned index = 0; index < 4096; index++) {
+            payload.header.Sequence = index + 1;
+            payload.header.OperationId = 1000 + index;
+            payload.header.PayloadChunkIndex = 0;
+            late.Add(payload);
+        }
+        payload.header.OperationId = 1;
+        payload.header.PayloadChunkIndex = 0;
+        late.Add(payload);
+        payload.header.PayloadChunkIndex = 1;
+        late.Add(payload);
+        const std::string json = late.Json(statistics, 0, 0, 0);
+        ok &= Check(json.find("\"payload_operations\":4097") != std::string::npos,
+                    "the late operation survives its own eviction");
+        ok &= Check(json.find("\"complete_payload_operations\":1") != std::string::npos,
+                    "the late operation completes after eviction");
+        ok &= Check(json.find("\"incomplete_payload_operations\":4096") != std::string::npos,
+                    "the evicted series stays counted as incomplete");
+        ok &= Check(json.find("\"payload_operations_pending\":4095") != std::string::npos,
+                    "one series is evicted and the late one is released on completion");
+    }
+
     /*
      * The unit the agent uses for session_meta.json and coverage.json: the summary, the total
      * and the per-type counts must come from one decision, or the counts drift from verify_log.
@@ -208,6 +443,41 @@ int main()
                 accountedCounts.count(MsMonCoverage) == 0 &&
                 accountedCounts.count(MsMonCoverageUsage) == 0,
                 "coverage records stay out of event_counts");
+
+    {
+        auto volumeEvent = [](ULONG informationClass, const std::vector<BYTE>& bytes) {
+            TelemetryEvent volume;
+            volume.header.Size = sizeof(volume.header);
+            volume.header.Version = MSMON_PROTOCOL_VERSION;
+            volume.header.Type = MsMonFileQueryVolumeInformation;
+            volume.header.Flags = MsMonFlagPayloadPresent | MsMonFlagPayloadFinalChunk;
+            volume.header.Value0 = informationClass;
+            volume.header.PayloadKind = MsMonPayloadVolumeInformation;
+            volume.header.PayloadChunkCount = 1;
+            volume.header.PayloadTotalBytes = bytes.size();
+            volume.payload = bytes;
+            return volume;
+        };
+        std::vector<BYTE> identity(26, 0);
+        const uint32_t serial = 0x12345678;
+        const uint32_t labelBytes = 8;
+        std::memcpy(identity.data() + 8, &serial, sizeof(serial));
+        std::memcpy(identity.data() + 12, &labelBytes, sizeof(labelBytes));
+        const wchar_t label[] = L"VOL1";
+        std::memcpy(identity.data() + 18, label, labelBytes);
+        const std::string identityJson = TelemetryJson(volumeEvent(1, identity));
+        ok &= Check(identityJson.find("\"volume_serial_hex\":\"12345678\"") != std::string::npos &&
+                        identityJson.find("\"volume_label\":\"VOL1\"") != std::string::npos,
+                    "a volume-information payload keeps its real serial and label");
+
+        std::vector<BYTE> sizeInformation(24, 0);
+        const uint32_t clusters = 0x11223344;
+        std::memcpy(sizeInformation.data() + 8, &clusters, sizeof(clusters));
+        const std::string sizeJson = TelemetryJson(volumeEvent(3, sizeInformation));
+        ok &= Check(sizeJson.find("volume_serial_number") == std::string::npos &&
+                        sizeJson.find("volume_label") == std::string::npos,
+                    "a size-information payload is not decoded as a volume identity");
+    }
 
     JsonlWriter writer(L"build\\tests\\integration-events.jsonl", 0);
     ok &= Check(writer.Open(), "open JSONL output");

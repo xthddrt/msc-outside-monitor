@@ -18,7 +18,11 @@ typedef struct _HOOK {
  * `hook->Trampoline` is then callable exactly like the original function.
  */
 NTSTATUS HookInstall(_Inout_ PHOOK hook, _In_ PVOID target, _In_ PVOID detour, _In_ PCSTR name);
-VOID     HookRemove(_Inout_ PHOOK hook);
+NTSTATUS HookRemove(_Inout_ PHOOK hook);
+/* Free a pool trampoline after its hook is restored and the detours drained. */
+VOID     HookFree(_Inout_ PHOOK hook);
+/* Hand the in-image trampoline slots out again once every hook is drained. */
+VOID     HookResetTrampolinePool(VOID);
 
 /* Which mechanism actually managed to write read-only kernel text
  * (SYSINFO_WRITE_* from shared/sysinfo.h). */
@@ -51,6 +55,13 @@ ULONG   SysinfoCiOptions(VOID);
  * brackets its body with HookEnter()/HookLeave(); DriverUnload removes the
  * hooks first (so nothing new can enter) and then waits with HookQuiesce().
  */
+VOID    HookInitialize(VOID);
 VOID    HookEnter(VOID);
 VOID    HookLeave(VOID);
-VOID    HookQuiesce(_In_ ULONG maxMilliseconds);
+/* FALSE when the caller's own depth cannot be attributed; then do not free. */
+BOOLEAN HookQuiesce(VOID);
+/* Parked control callers exempt only their recorded detour depth; zero adds nothing. */
+VOID    HookControlWaitEnter(VOID);
+VOID    HookControlWaitLeave(VOID);
+/* Unload-only drain of every detour; the caller must not itself be in one. */
+VOID    HookDrainAll(VOID);

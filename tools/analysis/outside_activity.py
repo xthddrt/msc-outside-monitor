@@ -36,8 +36,6 @@ def main():
             if "maplestorycw" not in path.lower():
                 reads[image]["\\".join(path.split("\\")[:6])] += 1
         elif kind in ("registry_set_value", "registry_delete", "registry_rename", "registry_create"):
-            if kind == "registry_create" and event.get("value0") != 1:
-                continue
             key = registry_key(text)
             if args.own_settings.lower() in key.lower():
                 continue

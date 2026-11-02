@@ -18,6 +18,7 @@ CHANNELS_HEADING = "## Channels no rule can reach"
 CHANNELS = [
     ("CPUID/MSR", "CPU model, features and IDs; no OS call for kfilter to intercept"),
     ("Firmware tables", "SMBIOS/BIOS, board and system serials through system queries"),
+    ("Machine SID", "Machine and account identifiers already present in the process token"),
     ("GPU adapter APIs", "Adapter and device identifiers outside file/registry filtering"),
     ("Process/module lists", "System and window enumeration without another process handle"),
     ("Service-side RPC/WMI", "Services answer with user, computer, domain and hardware data"),
@@ -27,6 +28,8 @@ RISK_MODULES = {
     "wbemprox.dll", "fastprox.dll", "wbemcomn.dll", "wbemsvc.dll", "rpcrt4.dll",
     "iphlpapi.dll", "hid.dll", "pdh.dll", "wtsapi32.dll", "netapi32.dll", "sspicli.dll",
     "grap64.dll", "grap-core64.aes", "grap-updater.aes", "blackcat64.sys",
+    "machineidlib.dll", "tbs.dll", "nvapi64.dll", "atiadlxx.dll", "setupapi.dll",
+    "cfgmgr32.dll", "wlanapi.dll", "dhcpcsvc.dll",
 }
 IDENTITY_TEXT = re.compile(
     r"machineguid|computername|tcpip|networklist|hardware\\description|hardware\\acpi|"
@@ -63,6 +66,8 @@ def identity_event(event, deny_rules=None):
     kind = event.get("type")
     text = event.get("text") or ""
     detail = event.get("detail") or ""
+    if kind == "kfilter_decision" and detail_field(detail, "target") == "device":
+        return True
     if kind == "kfilter_decision" and detail_field(detail, "action") == "deny":
         # An explicit deny rule (the identity block list) or the network-adapter filter;
         # default-deny denials (rule 0) are not identity evidence. The rule's path must
@@ -183,6 +188,14 @@ def self_test():
              "text": "\\Device\\HarddiskVolume3\\SpentAllow.exe", "detail": "action=deny;rule_id=2"},
             {"type": "kfilter_decision", "timestamp": "t10", "process_id": 7,
              "text": "\\Device\\Nsi", "detail": "action=deny;rule_id=0;rights=0x0012001b"},
+            {"type": "kfilter_decision", "timestamp": "t12", "process_id": 7,
+             "text": "\\Device\\DeviceAllow", "detail": "target=device;action=allow;ioctl=0x006D0008"},
+            {"type": "kfilter_decision", "timestamp": "t13", "process_id": 7,
+             "text": "\\Device\\DeviceDeny", "detail": "target=device;action=deny;ioctl=0x004D100C"},
+            {"type": "kfilter_decision", "timestamp": "t14", "process_id": 7,
+             "text": "\\Device\\DeviceAudit", "detail": "target=device;action=audit;ioctl=0x00170001"},
+            {"type": "kfilter_decision", "timestamp": "t15", "process_id": 7,
+             "text": "\\Device\\DeviceRisk", "detail": "target=device;action=RISK;ioctl=0x002D1400"},
         ]
         with open(bundle / "events.jsonl", "w", encoding="utf-8") as stream:
             for record in records:
@@ -197,13 +210,14 @@ def self_test():
             encoding="utf-8")
         output = root / "identity.md"
         counts = append_identity_log(bundle, policy, output)
-        assert counts == (8, 3), counts
+        assert counts == (12, 3), counts
         text = output.read_text(encoding="utf-8")
         for expected in ("Win32_ComputerSystemProduct", "login.example", "SamrLookupNamesInDomain",
-                         "action=RISK", "Software\\Valve", "login-endpoint", "CPUID/MSR",
+                         "action=RISK", "Software\\Valve", "login-endpoint", "CPUID/MSR", "Machine SID",
                          "driver_dropped=2", "10.0.0.5:52000 -> 203.0.113.10:443",
                          "audit-reason", "deny-reason", "\\REGISTRY\\MACHINE\\AuditKey",
-                         "\\REGISTRY\\MACHINE\\DenyKey", "IdentityDenied", "\\Device\\Nsi"):
+                         "\\REGISTRY\\MACHINE\\DenyKey", "IdentityDenied", "\\Device\\Nsi",
+                         "DeviceAllow", "DeviceDeny", "DeviceAudit", "DeviceRisk", "0x006D0008"):
             assert expected in text, expected
         for unexpected in ("ordinary.txt", "DefaultDenied", "SpentAllow"):
             assert unexpected not in text, unexpected

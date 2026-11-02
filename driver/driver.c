@@ -10,6 +10,7 @@ static const GUID MSMON_DEVICE_GUID = { 0xdb6a8ad5, 0xc08e, 0x4f95, { 0x8d, 0x15
  * acquisitions, waits for the ones in flight, then marks the rundown complete.
  */
 static EX_RUNDOWN_REF gIoRundown;
+static KMUTEX gSessionMutex;
 
 static NTSTATUS MsMonCompleteIrp(PIRP Irp, NTSTATUS Status, ULONG_PTR Information)
 {
@@ -35,8 +36,14 @@ static NTSTATUS MsMonStartSession(PMSMON_SESSION_CONFIG Config, ULONG InputLengt
     ULONG rootCount = 0;
     ULONG index;
     NTSTATUS status;
-    SIZE_T length = wcsnlen(Config->ClientRoot, MSMON_CLIENT_PATH_CHARS);
-    if (length == 0 || length == MSMON_CLIENT_PATH_CHARS) return STATUS_INVALID_PARAMETER;
+    SIZE_T length;
+
+    (VOID)KeWaitForSingleObject(&gSessionMutex, Executive, KernelMode, FALSE, NULL);
+    length = wcsnlen(Config->ClientRoot, MSMON_CLIENT_PATH_CHARS);
+    if (length == 0 || length == MSMON_CLIENT_PATH_CHARS) {
+        status = STATUS_INVALID_PARAMETER;
+        goto Done;
+    }
     roots[rootCount].Buffer = Config->ClientRoot;
     roots[rootCount].Length = (USHORT)(length * sizeof(WCHAR));
     roots[rootCount].MaximumLength = roots[rootCount].Length;
@@ -45,7 +52,10 @@ static NTSTATUS MsMonStartSession(PMSMON_SESSION_CONFIG Config, ULONG InputLengt
     if (InputLength >= sizeof(MSMON_SESSION_CONFIG)) {
         for (index = 0; index < MSMON_EXTRA_ROOTS; index++) {
             length = wcsnlen(Config->ExtraRoots[index], MSMON_CLIENT_PATH_CHARS);
-            if (length == MSMON_CLIENT_PATH_CHARS) return STATUS_INVALID_PARAMETER;
+            if (length == MSMON_CLIENT_PATH_CHARS) {
+                status = STATUS_INVALID_PARAMETER;
+                goto Done;
+            }
             if (length == 0) continue;
             roots[rootCount].Buffer = Config->ExtraRoots[index];
             roots[rootCount].Length = (USHORT)(length * sizeof(WCHAR));
@@ -56,7 +66,7 @@ static NTSTATUS MsMonStartSession(PMSMON_SESSION_CONFIG Config, ULONG InputLengt
     MsMonProcessStopSession();
     MsMonEventsStop();
     status = MsMonEventsStart(Config->SessionId, Config->QueueRecords, Config->QueueBytes, Config->PayloadMode);
-    if (!NT_SUCCESS(status)) return status;
+    if (!NT_SUCCESS(status)) goto Done;
     status = MsMonProcessStartSession(roots, rootCount);
     if (NT_SUCCESS(status)) status = MsMonAttributionRefresh();
     if (NT_SUCCESS(status) && !MsMonObjectAvailable()) {
@@ -64,7 +74,7 @@ static NTSTATUS MsMonStartSession(PMSMON_SESSION_CONFIG Config, ULONG InputLengt
         UNICODE_STRING detail;
         RtlInitUnicodeString(&text, L"object_callbacks_unavailable");
         RtlInitUnicodeString(&detail, L"Process and thread handle events are disabled; status is in value0");
-        (VOID)MsMonLogEvent(MsMonCoverage, PsGetCurrentProcessId(), NULL, PsGetCurrentThreadId(),
+        (VOID)MsMonLogEvent(MsMonCoverage, PsGetCurrentProcessId(), MsMonProcessStartTime(PsGetCurrentProcessId()), NULL, PsGetCurrentThreadId(),
                             NULL, 0, MsMonFlagObserverRecord, STATUS_SUCCESS, 0,
                             MsMonCategoryUnknown, (ULONG)MsMonObjectStatus(), 0, &text, &detail);
     }
@@ -73,7 +83,7 @@ static NTSTATUS MsMonStartSession(PMSMON_SESSION_CONFIG Config, ULONG InputLengt
         UNICODE_STRING detail;
         RtlInitUnicodeString(&text, MsMonNetworkAvailable() ? L"network_callbacks_partial" : L"network_callbacks_unavailable");
         RtlInitUnicodeString(&detail, L"WFP layer availability bitmask is in value0; other monitoring remains active");
-        (VOID)MsMonLogEvent(MsMonCoverage, PsGetCurrentProcessId(), NULL, PsGetCurrentThreadId(),
+        (VOID)MsMonLogEvent(MsMonCoverage, PsGetCurrentProcessId(), MsMonProcessStartTime(PsGetCurrentProcessId()), NULL, PsGetCurrentThreadId(),
                             NULL, 0, MsMonFlagObserverRecord, STATUS_SUCCESS, 0,
                             MsMonCategoryUnknown, MsMonNetworkCoverage(), 0, &text, &detail);
     }
@@ -81,6 +91,8 @@ static NTSTATUS MsMonStartSession(PMSMON_SESSION_CONFIG Config, ULONG InputLengt
         MsMonProcessStopSession();
         MsMonEventsStop();
     }
+Done:
+    KeReleaseMutex(&gSessionMutex, FALSE);
     return status;
 }
 
@@ -107,14 +119,18 @@ static NTSTATUS MsMonDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
         status = MsMonStartSession((PMSMON_SESSION_CONFIG)Irp->AssociatedIrp.SystemBuffer, inputLength);
         break;
     case MSMON_IOCTL_STOP_SESSION:
+        (VOID)KeWaitForSingleObject(&gSessionMutex, Executive, KernelMode, FALSE, NULL);
         MsMonAttributionStop();
         MsMonProcessStopSession();
         MsMonEventsStop();
+        KeReleaseMutex(&gSessionMutex, FALSE);
         status = STATUS_SUCCESS;
         break;
     case MSMON_IOCTL_STOP_TRACKING:
+        (VOID)KeWaitForSingleObject(&gSessionMutex, Executive, KernelMode, FALSE, NULL);
         MsMonAttributionStop();
         MsMonProcessStopSession();
+        KeReleaseMutex(&gSessionMutex, FALSE);
         status = STATUS_SUCCESS;
         break;
     case MSMON_IOCTL_REFRESH_MODULES:
@@ -122,16 +138,20 @@ static NTSTATUS MsMonDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
         break;
     case MSMON_IOCTL_TRACK_PID: {
         PMSMON_TRACK_REQUEST request = (PMSMON_TRACK_REQUEST)Irp->AssociatedIrp.SystemBuffer;
+        LONGLONG validatedStart;
         if (inputLength < sizeof(*request)) {
             status = STATUS_BUFFER_TOO_SMALL;
             break;
         }
         status = MsMonTrackProcess(UlongToHandle(request->ProcessId),
-                                   request->Flags != 0 ? request->Flags : MsMonFlagExplicitTrack);
+                                   request->Flags != 0 ? request->Flags : MsMonFlagExplicitTrack,
+                                   (LONGLONG)request->ProcessStartTime);
         if (NT_SUCCESS(status)) {
-            (VOID)MsMonLogEvent(MsMonProcessStart, UlongToHandle(request->ProcessId), NULL, NULL,
+            /* Log what the driver admitted, not the caller's possibly stale value. */
+            validatedStart = MsMonProcessStartTime(UlongToHandle(request->ProcessId));
+            (VOID)MsMonLogEvent(MsMonProcessStart, UlongToHandle(request->ProcessId), validatedStart, NULL, NULL,
                                 NULL, 0, request->Flags, STATUS_SUCCESS, 0,
-                                MsMonCategoryExternalProcess, request->ProcessStartTime, 0, NULL, NULL);
+                                MsMonCategoryExternalProcess, (ULONGLONG)validatedStart, 0, NULL, NULL);
         }
         break;
     }
@@ -185,11 +205,23 @@ VOID MsMonDriverUnload(PDRIVER_OBJECT DriverObject)
     MsMonRecordStatus(L"DriverUnloadStart", STATUS_SUCCESS);
 
     /*
-     * Wake a collector that is blocked in MSMON_IOCTL_READ_EVENTS before
-     * waiting for in-flight IRPs; the read timeout alone can be one second and
-     * the session must be stopped from another thread.
+     * Wake a collector that is blocked in MSMON_IOCTL_READ_EVENTS first: it
+     * holds a rundown reference and would otherwise make the wait below sit out
+     * its read timeout, which can be one second.
      */
     MsMonEventsWakeAll();
+
+    /*
+     * Drain the control plane before any sensor is torn down. A control IRP
+     * already inside MsMonStartSession would otherwise re-arm the event queue
+     * and the process session (allocating roots in MsMonProcessStartSession)
+     * after MsMonProcessUninitialize has stopped and freed that state. Once the
+     * rundown is complete the acquire in MsMonDeviceControl fails, so a later
+     * START_SESSION, TRACK, STOP or READ gets STATUS_DELETE_PENDING instead of
+     * running against half-freed state. ExRundownCompleted must follow the wait.
+     */
+    ExWaitForRundownProtectionRelease(&gIoRundown);
+    ExRundownCompleted(&gIoRundown);
 
     MsMonNetworkUninitialize();
     MsMonRecordStatus(L"NetworkStopped", STATUS_SUCCESS);
@@ -202,15 +234,6 @@ VOID MsMonDriverUnload(PDRIVER_OBJECT DriverObject)
     MsMonProcessUninitialize();
     MsMonRecordStatus(L"ProcessStopped", STATUS_SUCCESS);
     MsMonAttributionStop();
-
-    /*
-     * ExWaitForRundownProtectionRelease refuses new acquisitions and blocks
-     * until the control IRPs already in flight (bounded by the read timeout,
-     * which the event above shortens) have finished. ExRundownCompleted marks
-     * the rundown finished and must follow the wait, per its documentation.
-     */
-    ExWaitForRundownProtectionRelease(&gIoRundown);
-    ExRundownCompleted(&gIoRundown);
 
     MsMonEventsUninitialize();
     RtlInitUnicodeString(&dosName, MSMON_DOS_DEVICE_NAME);
@@ -227,6 +250,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 
     UNREFERENCED_PARAMETER(RegistryPath);
     ExInitializeRundownProtection(&gIoRundown);
+    KeInitializeMutex(&gSessionMutex, 0);
     DriverObject->MajorFunction[IRP_MJ_CREATE] = MsMonCreateClose;
     DriverObject->MajorFunction[IRP_MJ_CLOSE] = MsMonCreateClose;
     DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = MsMonDeviceControl;

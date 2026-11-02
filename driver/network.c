@@ -19,8 +19,9 @@ VOID MsMonCoverageRegister(ULONG SensorId, NTSTATUS Status);
 #define MSMON_CALLOUT_COUNT 6
 
 BOOLEAN MsMonIsTracked(HANDLE ProcessId, LONGLONG StartTime);
+LONGLONG MsMonProcessStartTime(HANDLE ProcessId);
 BOOLEAN MsMonCurrentIsBlackCat(VOID);
-NTSTATUS MsMonLogEvent(ULONG Type, HANDLE ProcessId, HANDLE ParentProcessId, HANDLE ThreadId,
+NTSTATUS MsMonLogEvent(ULONG Type, HANDLE ProcessId, LONGLONG ProcessStartTime, HANDLE ParentProcessId, HANDLE ThreadId,
                        HANDLE TargetProcessId, LONGLONG TargetProcessStartTime, ULONG Flags,
                        NTSTATUS Status, ULONG DesiredAccess, ULONG Category,
                        ULONGLONG Value0, ULONGLONG Value1,
@@ -42,9 +43,12 @@ typedef struct _MSMON_FLOW_CONTEXT {
     UINT32 CalloutId;
     UINT16 LayerId;
     HANDLE ProcessId;
+    LONGLONG ProcessStartTime;
     UINT8 Protocol;
     UINT16 LocalPort;
     UINT16 RemotePort;
+    BOOLEAN Associating;
+    BOOLEAN Deleted;
     WCHAR Endpoints[128];
 } MSMON_FLOW_CONTEXT, *PMSMON_FLOW_CONTEXT;
 
@@ -184,6 +188,7 @@ static VOID MsMonSelectFields(
 static VOID MsMonLogNetwork(
     ULONG Type,
     HANDLE ProcessId,
+    LONGLONG ProcessStartTime,
     UINT64 FlowId,
     UINT8 Protocol,
     UINT16 LocalPort,
@@ -197,8 +202,32 @@ static VOID MsMonLogNetwork(
     ULONGLONG packed = ((ULONGLONG)Protocol << 32) | ((ULONGLONG)LocalPort << 16) | RemotePort;
     RtlInitUnicodeString(&text, Endpoints);
     RtlInitUnicodeString(&detail, Direction);
-    (VOID)MsMonLogEvent(Type, ProcessId, NULL, NULL, NULL, 0, 0, STATUS_SUCCESS, 0,
+    (VOID)MsMonLogEvent(Type, ProcessId, ProcessStartTime, NULL, NULL, NULL, 0, 0, STATUS_SUCCESS, 0,
                         MsMonCategoryNetwork, FlowId, packed, &text, &detail);
+}
+
+/* Take the entry for FlowId out of gFlows and report whether this caller owns it.
+ * Keyed on the flow id the branch captured before it linked the context, never on
+ * the context address: a context a flowDeleteFn already freed, or a new one that
+ * reused its address, must not be unlinked or freed here. */
+static BOOLEAN MsMonFlowUnlink(UINT64 FlowId)
+{
+    PLIST_ENTRY link;
+    BOOLEAN removed = FALSE;
+    KIRQL oldIrql;
+
+    if (!gFlowListInitialized || FlowId == 0) return FALSE;
+    KeAcquireSpinLock(&gFlowLock, &oldIrql);
+    for (link = gFlows.Flink; link != &gFlows; link = link->Flink) {
+        PMSMON_FLOW_CONTEXT candidate = CONTAINING_RECORD(link, MSMON_FLOW_CONTEXT, Link);
+        if (candidate->FlowId == FlowId) {
+            RemoveEntryList(&candidate->Link);
+            removed = TRUE;
+            break;
+        }
+    }
+    KeReleaseSpinLock(&gFlowLock, oldIrql);
+    return removed;
 }
 
 static VOID MsMonAssociateFlow(
@@ -215,41 +244,61 @@ static VOID MsMonAssociateFlow(
     PMSMON_FLOW_CONTEXT context;
     KIRQL oldIrql;
     NTSTATUS status;
+    UINT64 flowId = FlowId;
+    UINT16 layerId = InFixedValues->layerId;
+    UINT32 calloutId = gCalloutIds[Index];
+    BOOLEAN deleted;
+    BOOLEAN active;
     if (!gFlowListInitialized || (InMetaValues->currentMetadataValues & FWPS_METADATA_FIELD_FLOW_HANDLE) == 0 ||
         FlowId == 0) return;
     context = ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(*context), MSMON_POOL_TAG);
     if (context == NULL) return;
     RtlZeroMemory(context, sizeof(*context));
-    context->FlowId = FlowId;
-    context->CalloutId = gCalloutIds[Index];
-    context->LayerId = InFixedValues->layerId;
+    context->FlowId = flowId;
+    context->CalloutId = calloutId;
+    context->LayerId = layerId;
     context->ProcessId = UlongToHandle((ULONG)InMetaValues->processId);
+    context->ProcessStartTime = MsMonProcessStartTime(context->ProcessId);
     context->Protocol = Protocol;
     context->LocalPort = LocalPort;
     context->RemotePort = RemotePort;
     (VOID)RtlStringCchCopyW(context->Endpoints, RTL_NUMBER_OF(context->Endpoints), Endpoints);
 
-    /*
-     * WFP is called without holding gFlowLock. Holding a spinlock across
-     * FwpsFlowAssociateContext0 risks a lock-order inversion with the flow
-     * teardown path, which calls MsMonWfpFlowDelete and takes the same lock.
-     */
-    status = FwpsFlowAssociateContext0(FlowId, InFixedValues->layerId,
-                                       gCalloutIds[Index], (UINT64)context);
+    /* The delete callback can mark but never frees an associating context. */
+    KeAcquireSpinLock(&gFlowLock, &oldIrql);
+    context->Associating = TRUE;
+    InsertTailList(&gFlows, &context->Link);
+    KeReleaseSpinLock(&gFlowLock, oldIrql);
+    status = FwpsFlowAssociateContext0(flowId, layerId, calloutId, (UINT64)context);
+
+    KeAcquireSpinLock(&gFlowLock, &oldIrql);
+    context->Associating = FALSE;
+    deleted = context->Deleted;
+    active = gNetworkActive;
+    if (!NT_SUCCESS(status) && !deleted) RemoveEntryList(&context->Link);
+    KeReleaseSpinLock(&gFlowLock, oldIrql);
     if (!NT_SUCCESS(status)) {
         ExFreePoolWithTag(context, MSMON_POOL_TAG);
         return;
     }
-
-    KeAcquireSpinLock(&gFlowLock, &oldIrql);
-    if (!gNetworkActive) {
-        KeReleaseSpinLock(&gFlowLock, oldIrql);
-        (VOID)FwpsFlowRemoveContext0(context->FlowId, context->LayerId, context->CalloutId);
+    if (deleted) {
+        MsMonLogNetwork(MsMonNetworkFlowClose, context->ProcessId, context->ProcessStartTime,
+                        flowId, context->Protocol, context->LocalPort, context->RemotePort,
+                        context->Endpoints, L"flow_close");
         ExFreePoolWithTag(context, MSMON_POOL_TAG);
         return;
     }
-    InsertTailList(&gFlows, &context->Link);
-    KeReleaseSpinLock(&gFlowLock, oldIrql);
+    if (active) return;
+
+    status = FwpsFlowRemoveContext0(flowId, layerId, calloutId);
+    if ((ULONG)status == 0xC0000001u) {
+        /* No association was present, so no flowDeleteFn will come: take the
+         * entry back by flow id and free it here. */
+        if (MsMonFlowUnlink(flowId)) ExFreePoolWithTag(context, MSMON_POOL_TAG);
+    }
+    /* STATUS_SUCCESS: the synchronous flowDeleteFn found the linked entry and
+     * freed it. PENDING (or any incomplete result): the delayed flowDeleteFn
+     * or the unload drain frees it. */
 }
 
 static VOID NTAPI MsMonWfpClassifyInner(
@@ -341,7 +390,8 @@ static VOID NTAPI MsMonWfpClassifyInner(
             type = MsMonNetworkConnect;
             direction = L"connect";
         }
-        MsMonLogNetwork(type, UlongToHandle((ULONG)InMetaValues->processId), flowId,
+        MsMonLogNetwork(type, UlongToHandle((ULONG)InMetaValues->processId),
+                        MsMonProcessStartTime(UlongToHandle((ULONG)InMetaValues->processId)), flowId,
                         protocol, localPort, remotePort, endpoints, direction);
         MsMonCoverageLogged(MSMON_SENSOR_WFP_CLASSIFY);
         if (index >= 4 && FlowContext == 0) {
@@ -350,7 +400,7 @@ static VOID NTAPI MsMonWfpClassifyInner(
         }
     } while (0);
     if ((ClassifyOut->rights & FWPS_RIGHT_ACTION_WRITE) != 0) {
-        ClassifyOut->actionType = FWP_ACTION_PERMIT;
+        ClassifyOut->actionType = FWP_ACTION_CONTINUE;
     }
 }
 
@@ -366,7 +416,7 @@ static VOID NTAPI MsMonWfpClassify(
 {
     if (!gNetworkRundownInitialized || !ExAcquireRundownProtection(&gNetworkRundown)) {
         if (ClassifyOut != NULL && (ClassifyOut->rights & FWPS_RIGHT_ACTION_WRITE) != 0) {
-            ClassifyOut->actionType = FWP_ACTION_PERMIT;
+            ClassifyOut->actionType = FWP_ACTION_CONTINUE;
         }
         return;
     }
@@ -401,13 +451,17 @@ static VOID NTAPI MsMonWfpFlowDeleteInner(UINT16 LayerId, UINT32 CalloutId, UINT
         PMSMON_FLOW_CONTEXT candidate = CONTAINING_RECORD(link, MSMON_FLOW_CONTEXT, Link);
         if ((UINT64)candidate == FlowContext) {
             RemoveEntryList(&candidate->Link);
-            context = candidate;
+            if (candidate->Associating) {
+                candidate->Deleted = TRUE;
+            } else {
+                context = candidate;
+            }
             break;
         }
     }
     KeReleaseSpinLock(&gFlowLock, oldIrql);
     if (context != NULL) {
-        MsMonLogNetwork(MsMonNetworkFlowClose, context->ProcessId, context->FlowId,
+        MsMonLogNetwork(MsMonNetworkFlowClose, context->ProcessId, context->ProcessStartTime, context->FlowId,
                         context->Protocol, context->LocalPort, context->RemotePort,
                         context->Endpoints, L"flow_close");
         ExFreePoolWithTag(context, MSMON_POOL_TAG);
@@ -529,6 +583,17 @@ VOID MsMonNetworkUninitialize(VOID)
     delay.QuadPart = -10000;
     gNetworkActive = FALSE;
     /*
+     * Stop classify and flowDelete work before touching the list. The inactive
+     * association branch links a context before removing it, so a classify
+     * callback still in flight could otherwise link one after the drain. The
+     * wait refuses new acquisitions; ExRundownCompleted follows the drain.
+     * DriverEntry's failure path calls this before MsMonNetworkInitialize, so
+     * the guard stays.
+     */
+    if (gNetworkRundownInitialized) {
+        ExWaitForRundownProtectionRelease(&gNetworkRundown);
+    }
+    /*
      * A pending removal calls flowDeleteFn asynchronously. The context is already
      * out of our list, so retain ownership and do not free it until WFP confirms
      * that its association is gone.
@@ -550,7 +615,7 @@ VOID MsMonNetworkUninitialize(VOID)
                     KeDelayExecutionThread(KernelMode, FALSE, &delay);
                 }
             } while (!MsMonFlowRemoveComplete((long)status));
-            MsMonLogNetwork(MsMonNetworkFlowClose, context->ProcessId, context->FlowId,
+            MsMonLogNetwork(MsMonNetworkFlowClose, context->ProcessId, context->ProcessStartTime, context->FlowId,
                             context->Protocol, context->LocalPort, context->RemotePort,
                             context->Endpoints, L"flow_close_monitor_stop");
             ExFreePoolWithTag(context, MSMON_POOL_TAG);
@@ -578,7 +643,6 @@ VOID MsMonNetworkUninitialize(VOID)
         }
     }
     if (gNetworkRundownInitialized) {
-        ExWaitForRundownProtectionRelease(&gNetworkRundown);
         ExRundownCompleted(&gNetworkRundown);
         gNetworkRundownInitialized = FALSE;
     }

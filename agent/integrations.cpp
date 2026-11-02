@@ -22,6 +22,11 @@ static const wchar_t* KFilterTargetName(unsigned long target)
     case 0x00000020u: return L"device";
     case 0x00000040u: return L"pipe";
     case 0x00000080u: return L"network";
+    case 0x00000100u: return L"handle";
+    case 0x00000200u: return L"launch";
+    case 0x00000400u: return L"open";
+    case 0x00000800u: return L"thread-handle";
+    case 0x00001000u: return L"thread-open";
     default: return L"unknown";
     }
 }
@@ -64,7 +69,7 @@ TelemetryEvent KFilterDecisionEvent(const KFILTER_EVENT_4& source, uint64_t sess
                           L";target_id=" + std::to_wstring(source.Target) +
                           L";action_id=" + std::to_wstring(source.Action) +
                           L";flags=" + HexValue(source.Flags) +
-                          L";rights=" + HexValue(source.Value) +
+                          (source.Target == 0x00000020u ? L";ioctl=" : L";rights=") + HexValue(source.Value) +
                           L";rule_id=" + std::to_wstring(source.RuleId) +
                           L";generation=" + std::to_wstring(source.Generation);
     event.detail = std::move(detail);
