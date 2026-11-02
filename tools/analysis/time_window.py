@@ -25,11 +25,24 @@ def main():
     args = parser.parse_args()
 
     stamp = re.compile(r'"timestamp":"[^"]*T([0-9:.]+)Z"')
+
+    def clock_ms(text, end):
+        """HH:MM:SS[.fff] to milliseconds; a fractionless end covers its whole second."""
+        head, _, fraction = text.partition(".")
+        hours, minutes, seconds = (int(part) for part in head.split(":"))
+        if fraction:
+            milliseconds = int(fraction.ljust(3, "0")[:3])
+        else:
+            milliseconds = 999 if end else 0
+        return ((hours * 60 + minutes) * 60 + seconds) * 1000 + milliseconds
+
+    start_ms = clock_ms(args.start, False)
+    end_ms = clock_ms(args.end, True)
     counts = collections.Counter()
     listed = 0
     for line in iter_lines(args.session_dir):
         match = stamp.search(line)
-        if not match or not (args.start <= match.group(1) <= args.end):
+        if not match or not (start_ms <= clock_ms(match.group(1), False) <= end_ms):
             continue
         event = json.loads(line)
         kind = event.get("type")

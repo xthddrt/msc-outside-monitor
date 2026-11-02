@@ -42,7 +42,7 @@ def main():
             reason = line_event.get("status_name") or ""
             rows.append((when, pid, "TCP", f"{line_event.get('detail', '')}  {text}  {reason}"))
         else:
-            flow = line_event.get("value1")
+            flow = line_event.get("value0")
             rows.append((when, pid, kind.replace("network_", "").upper(), f"{text}  flow={flow}"))
             if kind == "network_flow_established":
                 flows[flow] = [when, None, pid, text]

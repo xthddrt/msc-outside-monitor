@@ -34,6 +34,14 @@ if not "%RESULT%"=="0" goto finished
 set "RESULT=%errorlevel%"
 if not "%RESULT%"=="0" goto finished
 
+"%PYTHON%" "%ROOT%\tests\network_timeline_test.py"
+set "RESULT=%errorlevel%"
+if not "%RESULT%"=="0" goto finished
+
+"%PYTHON%" "%ROOT%\tests\time_window_test.py"
+set "RESULT=%errorlevel%"
+if not "%RESULT%"=="0" goto finished
+
 call :gate "build\tests\integration-events.jsonl"
 set "RESULT=%errorlevel%"
 if not "%RESULT%"=="0" goto finished
