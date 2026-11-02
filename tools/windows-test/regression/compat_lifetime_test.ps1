@@ -96,22 +96,41 @@ try {
         Invoke-LegacyCtl @('mon', 'off')
         Invoke-LegacyCtl @('mon', 'collect', (Join-Path $work 'unsafe-events.json'))
         Invoke-LegacyCtl @('mon', 'on', 'unsafe')
-        # Two overlapping configurations: the mutex holder must not drain for
-        # the caller parked behind it, or both sleep forever and unload hangs.
-        foreach ($pair in @(@(@('mon', 'off'), @('mon', 'collect', (Join-Path $work 'race-events.json'))),
-                            @(@('mon', 'off'), @('mon', 'on')))) {
-            $first = Start-Process $ctl -ArgumentList $pair[0] -PassThru -WindowStyle Hidden
-            $second = Start-Process $ctl -ArgumentList $pair[1] -PassThru -WindowStyle Hidden
-            foreach ($process in $first, $second) {
-                if (-not $process.WaitForExit(10000)) {
-                    Stop-Process -Id $process.Id -Force
-                    throw "concurrent mon $($pair[0] -join ' ') / mon $($pair[1] -join ' ') hung with inline hooks enabled"
+        # Keep ordinary file detours active while overlapping configurations
+        # restore hooks and park control callers behind the config mutex.
+        $ioStop = Join-Path $work 'IO_STOP'
+        $ioWorker = Join-Path $work 'io-worker.ps1'
+        $ioInput = Join-Path $work 'io-input.txt'
+        [IO.File]::WriteAllText($ioInput, '0123456789abcdef' * 1048576)
+        @"
+while (-not (Test-Path '$ioStop')) {
+    Get-Content -Path '$ioInput' -ReadCount 1024 | Out-Null
+}
+"@ | Set-Content -Path $ioWorker -Encoding UTF8
+        Remove-Item $ioStop -ErrorAction SilentlyContinue
+        $io = Start-Process powershell -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass',
+                                                       '-File', $ioWorker) -PassThru -WindowStyle Hidden
+        try {
+            foreach ($pair in @(@(@('mon', 'off'), @('mon', 'collect', (Join-Path $work 'race-events.json'))),
+                                @(@('mon', 'off'), @('mon', 'on')))) {
+                $first = Start-Process $ctl -ArgumentList $pair[0] -PassThru -WindowStyle Hidden
+                $second = Start-Process $ctl -ArgumentList $pair[1] -PassThru -WindowStyle Hidden
+                foreach ($process in $first, $second) {
+                    if (-not $process.WaitForExit(10000)) {
+                        Stop-Process -Id $process.Id -Force
+                        throw "concurrent mon $($pair[0] -join ' ') / mon $($pair[1] -join ' ') hung with inline hooks enabled"
+                    }
                 }
+                if ($first.ExitCode -ne 0 -or $second.ExitCode -ne 0) {
+                    throw 'a concurrent configuration failed with inline hooks enabled'
+                }
+                Invoke-LegacyCtl @('mon', 'on', 'unsafe')
             }
-            if ($first.ExitCode -ne 0 -or $second.ExitCode -ne 0) {
-                throw 'a concurrent configuration failed with inline hooks enabled'
+        } finally {
+            New-Item -ItemType File -Path $ioStop -Force -ErrorAction SilentlyContinue | Out-Null
+            if ($null -ne $io -and -not $io.HasExited) {
+                if (-not $io.WaitForExit(10000)) { Stop-Process -Id $io.Id -Force }
             }
-            Invoke-LegacyCtl @('mon', 'on', 'unsafe')
         }
         Stop-Legacy
         Start-Legacy

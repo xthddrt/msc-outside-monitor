@@ -130,6 +130,9 @@ def main():
             event("kfilter_decision", 42, 0, r"\Device\Nsi", "2026-01-01T00:00:03.500Z",
                   component="kfilter.sys", detail="target=device;action=deny;ioctl=0x00000000"),
             event("process_exit", 42, 0, "", "2026-01-01T00:00:04.000Z"),
+            event("process_exit", 42, 0, "", "2026-01-01T00:00:03.500Z"),
+            event("kfilter_decision", 42, 0, r"\Device\Nsi", "2026-01-01T00:00:03.750Z",
+                  component="kfilter.sys", detail="target=device;action=deny;ioctl=0x00000000"),
             event("kfilter_decision", 42, 0, r"\Device\Nsi", "2026-01-01T00:00:04.500Z",
                   component="kfilter.sys", detail="target=device;action=deny;ioctl=0x00000000"),
         ]
@@ -139,8 +142,10 @@ def main():
         report = session_activity.report(session_activity.collect(bundle), bundle, 40)
         rows = {(row["pid"], row["process_start_time"]): row for row in report["processes"]}
         assert set(rows) == {(42, 100), (42, 200)}, rows.keys()
-        assert dict(rows[(42, 200)]["types"])["kfilter_decision"] == 1, rows[(42, 200)]
+        assert dict(rows[(42, 200)]["types"])["kfilter_decision"] == 2, rows[(42, 200)]
+        assert dict(rows[(42, 200)]["types"])["process_exit"] == 2, rows[(42, 200)]
         assert dict(rows[(42, 100)]["types"])["kfilter_decision"] == 1, rows[(42, 100)]
+        assert "process_exit" not in dict(rows[(42, 100)]["types"]), rows[(42, 100)]
         assert rows[(42, 200)]["end"] == "2026-01-01T00:00:04.000Z", rows[(42, 200)]
         assert rows[(42, 100)]["end"] is None, rows[(42, 100)]
 

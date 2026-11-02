@@ -81,7 +81,7 @@ def incarnation_spans(session_dir):
                 ended = incarnation_at(spans, pid, stamp)
                 if ended is not None:
                     for span in spans[pid]:
-                        if span[0] == ended:
+                        if span[0] == ended and span[2] is None:
                             span[2] = stamp
                             break
             continue
@@ -138,7 +138,7 @@ def collect(session_dir):
             process.flags = event.get("flags_names") or []
             process.switches = sorted(set(re.findall(r"(?:^|\s)(-{1,2}[A-Za-z][\w-]*)", detail)))[:12]
         elif kind == "process_exit":
-            process.end = event.get("timestamp")
+            process.end = max(process.end or "", event.get("timestamp") or "") or None
         elif kind == "image_load":
             path = dos_path(text)
             if not path.lower().startswith("c:\\windows"):

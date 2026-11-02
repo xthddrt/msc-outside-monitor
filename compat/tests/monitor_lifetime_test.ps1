@@ -20,10 +20,28 @@ if ($quiesce.Contains('while (g_InHook != 0)')) {
 if (-not $quiesce.Contains('while (HookCountedFrames() > ownDepth)')) {
     throw 'detour quiesce does not exclude own depth and parked control callers'
 }
-$counted = Body $hooks 'HookCountedFrames(VOID)' 'HookControlWaitEnter(VOID)'
-if (-not $counted.Contains('g_InHook') -or -not $counted.Contains('g_HookControlWaiters') -or
-    $counted.IndexOf('g_InHook') -gt $counted.IndexOf('g_HookControlWaiters')) {
-    throw 'quiesce does not subtract the parked control waiters from the drain'
+$counted = Body $hooks 'HookCountedFrames(VOID)' 'HookDrainAll(VOID)'
+if (-not $counted.Contains('g_InHook') -or -not $counted.Contains('g_HookParkedFrames') -or
+    $counted.Contains('g_HookControlWaiters') -or
+    $counted.IndexOf('g_InHook') -gt $counted.IndexOf('g_HookParkedFrames')) {
+    throw 'quiesce does not subtract actual parked detour frames from the drain'
+}
+$parked = Body $hooks 'HookParkedFrames(_In_ BOOLEAN Enter)' 'HookControlWaitEnter(VOID)'
+if (-not $parked.Contains('KeGetCurrentThread()') -or -not $parked.Contains('g_HookThreadLock') -or
+    -not $parked.Contains('record->Depth') -or -not $parked.Contains('record->ParkedFrames') -or
+    -not $parked.Contains('record->ParkedFrames = 0;')) {
+    throw 'parked accounting does not capture and clear the current thread detour depth'
+}
+$waitEnter = Body $hooks 'HookControlWaitEnter(VOID)' 'HookControlWaitLeave(VOID)'
+$waitLeave = Body $hooks 'HookControlWaitLeave(VOID)' 'HookCountedFrames(VOID)'
+if (-not $waitEnter.Contains('HookParkedFrames(TRUE)') -or
+    -not $waitEnter.Contains('InterlockedAdd(&g_HookParkedFrames, frames)') -or
+    -not $waitLeave.Contains('HookParkedFrames(FALSE)') -or
+    -not $waitLeave.Contains('InterlockedAdd(&g_HookParkedFrames, -frames)')) {
+    throw 'control waiters do not add and subtract their exact parked depth'
+}
+if ($hooks.Contains('g_HookControlWaiters')) {
+    throw 'the unconditional one-per-control-waiter accounting remains'
 }
 if ($quiesce.Contains('maxMilliseconds')) {
     throw 'detour quiesce is not unbounded'
@@ -49,6 +67,9 @@ if (-not $enter.Contains('InterlockedIncrement(&g_InHook)') -or
 # One allocation per thread, not one per detour, and a counted fallback when it fails.
 if ([regex]::Matches($enter, 'ExAllocatePool2\(').Count -ne 1) {
     throw 'detour entry allocates a depth record on every call instead of once per thread'
+}
+if (-not $enter.Contains('record->ParkedFrames = 0;')) {
+    throw 'a new detour depth record does not initialize its parked depth'
 }
 if (-not $enter.Contains('InterlockedIncrement(&g_HookThreadsUntracked)')) {
     throw 'a missing depth record is not counted as untracked'

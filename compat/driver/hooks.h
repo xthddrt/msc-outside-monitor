@@ -60,7 +60,7 @@ VOID    HookEnter(VOID);
 VOID    HookLeave(VOID);
 /* FALSE when the caller's own depth cannot be attributed; then do not free. */
 BOOLEAN HookQuiesce(VOID);
-/* A control caller parked on g_MonConfigMutex: its detour frame is not drained. */
+/* Parked control callers exempt only their recorded detour depth; zero adds nothing. */
 VOID    HookControlWaitEnter(VOID);
 VOID    HookControlWaitLeave(VOID);
 /* Unload-only drain of every detour; the caller must not itself be in one. */

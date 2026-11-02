@@ -367,6 +367,7 @@ typedef struct _HOOK_THREAD_DEPTH {
     LIST_ENTRY Link;
     PKTHREAD Thread;
     LONG Depth;
+    LONG ParkedFrames;
 } HOOK_THREAD_DEPTH, *PHOOK_THREAD_DEPTH;
 
 #define HOOK_DEPTH_TAG 'dTrH'
@@ -376,13 +377,8 @@ static KSPIN_LOCK g_HookThreadLock;
 static BOOLEAN g_HookThreadsInitialized;
 static volatile LONG g_HookThreadsUntracked;
 
-/*
- * Control callers parked on g_MonConfigMutex are still inside the hooked
- * NtDeviceIoControlFile detour, and the mutex holder is about to drain them.
- * One parked caller per entry: it has already left the trampoline and is only
- * waiting on driver state, so its frame must not be drained for.
- */
-static volatile LONG g_HookControlWaiters;
+/* Detour frames parked on g_MonConfigMutex. Callers without a depth record add zero. */
+static volatile LONG g_HookParkedFrames;
 
 VOID
 HookInitialize(VOID)
@@ -391,8 +387,52 @@ HookInitialize(VOID)
     InitializeListHead(&g_HookThreads);
     KeInitializeSpinLock(&g_HookThreadLock);
     InterlockedExchange(&g_HookThreadsUntracked, 0);
-    InterlockedExchange(&g_HookControlWaiters, 0);
+    InterlockedExchange(&g_HookParkedFrames, 0);
     g_HookThreadsInitialized = TRUE;
+}
+
+static LONG
+HookParkedFrames(_In_ BOOLEAN Enter)
+{
+    PKTHREAD thread = KeGetCurrentThread();
+    PHOOK_THREAD_DEPTH record = NULL;
+    PLIST_ENTRY link;
+    LONG frames = 0;
+    KIRQL oldIrql;
+
+    KeAcquireSpinLock(&g_HookThreadLock, &oldIrql);
+    for (link = g_HookThreads.Flink; link != &g_HookThreads; link = link->Flink) {
+        PHOOK_THREAD_DEPTH candidate = CONTAINING_RECORD(link, HOOK_THREAD_DEPTH, Link);
+        if (candidate->Thread == thread) {
+            record = candidate;
+            break;
+        }
+    }
+    if (record != NULL) {
+        if (Enter) {
+            frames = record->Depth;
+            record->ParkedFrames = frames;
+        } else {
+            frames = record->ParkedFrames;
+            record->ParkedFrames = 0;
+        }
+    }
+    KeReleaseSpinLock(&g_HookThreadLock, oldIrql);
+    return frames;
+}
+
+VOID
+HookControlWaitEnter(VOID)
+{
+    LONG frames = HookParkedFrames(TRUE);
+    if (frames != 0) InterlockedAdd(&g_HookParkedFrames, frames);
+}
+
+VOID
+HookControlWaitLeave(VOID)
+{
+    LONG frames = HookParkedFrames(FALSE);
+    if (frames != 0) InterlockedAdd(&g_HookParkedFrames, -frames);
 }
 
 /* Frames that must still be drained: every frame but the parked control ones. */
@@ -400,19 +440,7 @@ static LONG
 HookCountedFrames(VOID)
 {
     return InterlockedCompareExchange(&g_InHook, 0, 0) -
-           InterlockedCompareExchange(&g_HookControlWaiters, 0, 0);
-}
-
-VOID
-HookControlWaitEnter(VOID)
-{
-    InterlockedIncrement(&g_HookControlWaiters);
-}
-
-VOID
-HookControlWaitLeave(VOID)
-{
-    InterlockedDecrement(&g_HookControlWaiters);
+           InterlockedCompareExchange(&g_HookParkedFrames, 0, 0);
 }
 
 /* Unload-only: the calling thread is not inside a detour, so every frame can be
@@ -463,6 +491,7 @@ HookEnter(VOID)
     }
     record->Thread = thread;
     record->Depth = 1;
+    record->ParkedFrames = 0;
     KeAcquireSpinLock(&g_HookThreadLock, &oldIrql);
     InsertTailList(&g_HookThreads, &record->Link);
     InterlockedIncrement(&g_InHook);
