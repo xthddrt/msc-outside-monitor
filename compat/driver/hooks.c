@@ -696,7 +696,7 @@ HookInstall(_Inout_ PHOOK hook, _In_ PVOID target, _In_ PVOID detour, _In_ PCSTR
      */
     status = BuildTrampoline(hook, build, &built);
     if (!NT_SUCCESS(status)) {
-        if (hook->PoolTramp) ExFreePoolWithTag(hook->PoolBase, 'pTrH');
+        HookFree(hook);
         return status;
     }
 

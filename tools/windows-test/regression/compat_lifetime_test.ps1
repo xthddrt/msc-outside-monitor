@@ -96,8 +96,8 @@ try {
         Invoke-LegacyCtl @('mon', 'off')
         Invoke-LegacyCtl @('mon', 'collect', (Join-Path $work 'unsafe-events.json'))
         Invoke-LegacyCtl @('mon', 'on', 'unsafe')
-        # Keep ordinary file detours active while overlapping configurations
-        # restore hooks and park control callers behind the config mutex.
+        # Keep ordinary file and memory-protection detours active while overlapping
+        # configurations restore hooks and park control callers behind the config mutex.
         $ioStop = Join-Path $work 'IO_STOP'
         $ioWorker = Join-Path $work 'io-worker.ps1'
         $ioInput = Join-Path $work 'io-input.txt'
@@ -107,9 +107,27 @@ while (-not (Test-Path '$ioStop')) {
     Get-Content -Path '$ioInput' -ReadCount 1024 | Out-Null
 }
 "@ | Set-Content -Path $ioWorker -Encoding UTF8
-        Remove-Item $ioStop -ErrorAction SilentlyContinue
+        $vpStop = Join-Path $work 'VP_STOP'
+        $vpWorker = Join-Path $work 'vp-worker.ps1'
+        @"
+Add-Type -Namespace LegacyMemory -Name Native -MemberDefinition '[DllImport("kernel32.dll", SetLastError = true)]
+public static extern bool VirtualProtect(IntPtr address, UIntPtr size, uint newProtect, out uint oldProtect);'
+`$page = [Runtime.InteropServices.Marshal]::AllocHGlobal(4096)
+try {
+    while (-not (Test-Path '$vpStop')) {
+        `$old = 0
+        [void][LegacyMemory.Native]::VirtualProtect(`$page, [UIntPtr]4096, 1, [ref]`$old)
+        [void][LegacyMemory.Native]::VirtualProtect(`$page, [UIntPtr]4096, 4, [ref]`$old)
+    }
+} finally {
+    [Runtime.InteropServices.Marshal]::FreeHGlobal(`$page)
+}
+"@ | Set-Content -Path $vpWorker -Encoding UTF8
+        Remove-Item $ioStop, $vpStop -ErrorAction SilentlyContinue
         $io = Start-Process powershell -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass',
                                                        '-File', $ioWorker) -PassThru -WindowStyle Hidden
+        $vp = Start-Process powershell -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass',
+                                                       '-File', $vpWorker) -PassThru -WindowStyle Hidden
         try {
             foreach ($pair in @(@(@('mon', 'off'), @('mon', 'collect', (Join-Path $work 'race-events.json'))),
                                 @(@('mon', 'off'), @('mon', 'on')))) {
@@ -127,9 +145,14 @@ while (-not (Test-Path '$ioStop')) {
                 Invoke-LegacyCtl @('mon', 'on', 'unsafe')
             }
         } finally {
-            New-Item -ItemType File -Path $ioStop -Force -ErrorAction SilentlyContinue | Out-Null
-            if ($null -ne $io -and -not $io.HasExited) {
-                if (-not $io.WaitForExit(10000)) { Stop-Process -Id $io.Id -Force }
+            New-Item -ItemType File -Path $ioStop, $vpStop -Force -ErrorAction SilentlyContinue | Out-Null
+            foreach ($process in @($io, $vp)) {
+                if ($null -ne $process -and -not $process.HasExited) {
+                    if (-not $process.WaitForExit(10000)) {
+                        Stop-Process -Id $process.Id -Force
+                        throw 'a detour workload did not return within 10 seconds'
+                    }
+                }
             }
         }
         Stop-Legacy

@@ -1433,9 +1433,11 @@ HookNtProtectVirtualMemory(
     PFN_NtProtectVirtualMemory original = (PFN_NtProtectVirtualMemory)g_Hooks[6].Trampoline;
     PVOID base = NULL;
     SIZE_T size = 0;
-    KPROCESSOR_MODE mode = ExGetPreviousMode();
+    KPROCESSOR_MODE mode;
     NTSTATUS status;
 
+    HookEnter();
+    mode = ExGetPreviousMode();
     __try {
         if (BaseAddress != NULL) {
             if (mode != KernelMode) ProbeForRead(BaseAddress, sizeof(PVOID), sizeof(PVOID));
@@ -1450,7 +1452,6 @@ HookNtProtectVirtualMemory(
         size = 0;
     }
 
-    HookEnter();
     status = original(ProcessHandle, BaseAddress, NumberOfBytesToProtect,
                       NewAccessProtection, OldAccessProtection);
 

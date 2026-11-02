@@ -156,4 +156,26 @@ if ($publish -lt 0 -or $capacity -lt 0 -or $head -lt 0 -or $tail -lt 0 -or
     $capacity -gt $publish -or $head -gt $publish -or $tail -gt $publish) {
     throw 'ring is published before its capacity and cursors'
 }
+# --- #101: the installed protection detour is accounted before fallible work ---
+$protect = Body $trace 'HookNtProtectVirtualMemory(' 'HookNtMapViewOfSection('
+$entered = $protect.IndexOf('HookEnter();')
+$previousMode = $protect.IndexOf('ExGetPreviousMode()')
+$probe = $protect.IndexOf('ProbeForRead(')
+if ($entered -lt 0 -or $previousMode -lt $entered -or $probe -lt $entered) {
+    throw 'NtProtectVirtualMemory touches caller state before entering detour accounting'
+}
+if ([regex]::Matches($protect, 'HookEnter\(\);').Count -ne 1) {
+    throw 'NtProtectVirtualMemory does not have exactly one detour entry'
+}
+# --- #102: a failed build cannot leave a freed trampoline for a second cleanup ---
+$failedBuild = Body $hooks 'status = BuildTrampoline(hook, build, &built);' 'if (hook->PoolTramp) {'
+if (-not $failedBuild.Contains('HookFree(hook);') -or
+    $failedBuild.Contains('ExFreePoolWithTag(hook->PoolBase')) {
+    throw 'a failed trampoline build does not clear its pool allocation exactly once'
+}
+$freeHook = Body $hooks 'HookFree(_Inout_ PHOOK hook)' 'HookResetTrampolinePool'
+if (-not $freeHook.Contains('hook->PoolBase = NULL;') -or
+    -not $freeHook.Contains('hook->PoolTramp = FALSE;')) {
+    throw 'HookFree leaves a freed trampoline published for another free'
+}
 Write-Host 'monitor lifetime regression passed'
