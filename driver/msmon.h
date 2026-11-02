@@ -30,6 +30,7 @@ ULONGLONG MsMonNextOperationId(VOID);
 NTSTATUS MsMonLogEvent(
     ULONG Type,
     HANDLE ProcessId,
+    LONGLONG ProcessStartTime,
     HANDLE ParentProcessId,
     HANDLE ThreadId,
     HANDLE TargetProcessId,
@@ -44,12 +45,12 @@ NTSTATUS MsMonLogEvent(
     PCUNICODE_STRING Detail
 );
 NTSTATUS MsMonLogEventWithOperation(
-    ULONG Type, HANDLE ProcessId, HANDLE ThreadId, ULONG Flags, NTSTATUS Status,
+    ULONG Type, HANDLE ProcessId, LONGLONG ProcessStartTime, HANDLE ThreadId, ULONG Flags, NTSTATUS Status,
     ULONG Category, ULONGLONG Value0, ULONGLONG Value1,
     PCUNICODE_STRING Text, PCUNICODE_STRING Detail, ULONGLONG OperationId
 );
 NTSTATUS MsMonLogPayloadSeries(
-    ULONG Type, HANDLE ProcessId, HANDLE ThreadId, ULONG Flags, NTSTATUS Status,
+    ULONG Type, HANDLE ProcessId, LONGLONG ProcessStartTime, HANDLE ThreadId, ULONG Flags, NTSTATUS Status,
     ULONG Category, ULONGLONG Value0, ULONGLONG Value1,
     PCUNICODE_STRING Text, PCUNICODE_STRING Detail,
     ULONG PayloadKind, ULONGLONG OperationId, ULONGLONG TotalBytes,

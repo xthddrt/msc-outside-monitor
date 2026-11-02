@@ -69,6 +69,8 @@ if errorlevel 1 ( echo [!] ioctl byte-count test failed & exit /b 1 )
 
 powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%tests\guard_config_test.ps1"
 if errorlevel 1 ( echo [!] guard config source regression failed & exit /b 1 )
+powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%tests\monitor_lifetime_test.ps1"
+if errorlevel 1 ( echo [!] monitor lifetime source regression failed & exit /b 1 )
 
 echo built:
 echo   %OUT%\%SYSN%

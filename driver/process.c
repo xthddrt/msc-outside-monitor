@@ -299,7 +299,7 @@ static VOID MsMonProcessNotifyInner(PEPROCESS Process, HANDLE ProcessId, PPS_CRE
     if (CreateInfo == NULL) {
         BOOLEAN tracked = MsMonIsTracked(ProcessId, startTime);
         if (tracked || MsMonCurrentIsBlackCat()) {
-            (VOID)MsMonLogEvent(MsMonProcessExit, ProcessId, NULL, NULL, NULL, 0, 0,
+            (VOID)MsMonLogEvent(MsMonProcessExit, ProcessId, startTime, NULL, NULL, NULL, 0, 0,
                                 STATUS_SUCCESS, 0, MsMonCategoryExternalProcess,
                                 (ULONGLONG)startTime, 0, NULL, NULL);
             MsMonCoverageLogged(MSMON_SENSOR_PROCESS_NOTIFY);
@@ -326,7 +326,7 @@ static VOID MsMonProcessNotifyInner(PEPROCESS Process, HANDLE ProcessId, PPS_CRE
             MsMonEventsNoteDropped();
             return;
         }
-        (VOID)MsMonLogEvent(MsMonProcessStart, ProcessId, CreateInfo->ParentProcessId, NULL, NULL, 0,
+        (VOID)MsMonLogEvent(MsMonProcessStart, ProcessId, startTime, CreateInfo->ParentProcessId, NULL, NULL, 0,
                             flags, STATUS_SUCCESS, 0, MsMonCategoryExternalProcess,
                             (ULONGLONG)startTime, 0, CreateInfo->ImageFileName, CreateInfo->CommandLine);
         MsMonCoverageLogged(MSMON_SENSOR_PROCESS_NOTIFY);
@@ -340,7 +340,7 @@ static VOID MsMonProcessNotifyInner(PEPROCESS Process, HANDLE ProcessId, PPS_CRE
         MsMonEventsNoteDropped();
         return;
     }
-    (VOID)MsMonLogEvent(MsMonProcessStart, ProcessId, CreateInfo->ParentProcessId, NULL, NULL, 0,
+    (VOID)MsMonLogEvent(MsMonProcessStart, ProcessId, startTime, CreateInfo->ParentProcessId, NULL, NULL, 0,
                         flags, STATUS_SUCCESS, 0, MsMonCategoryExternalProcess,
                         (ULONGLONG)startTime, 0, CreateInfo->ImageFileName, CreateInfo->CommandLine);
     MsMonCoverageLogged(MSMON_SENSOR_PROCESS_NOTIFY);
@@ -355,11 +355,12 @@ static VOID MsMonProcessNotify(PEPROCESS Process, HANDLE ProcessId, PPS_CREATE_N
 
 static VOID MsMonThreadNotify(HANDLE ProcessId, HANDLE ThreadId, BOOLEAN Create)
 {
+    LONGLONG startTime = MsMonProcessStartTime(ProcessId);
     if (!ExAcquireRundownProtection(&gCallbackRundown)) return;
     MsMonCoverageEnter(MSMON_SENSOR_THREAD_NOTIFY);
     if (MsMonIsTracked(ProcessId, 0) || MsMonCurrentIsBlackCat()) {
         (VOID)MsMonLogEvent(Create ? MsMonThreadStart : MsMonThreadExit,
-                            ProcessId, NULL, ThreadId, NULL, 0, 0, STATUS_SUCCESS, 0,
+                            ProcessId, startTime, NULL, ThreadId, NULL, 0, 0, STATUS_SUCCESS, 0,
                             MsMonCategoryUnknown, 0, 0, NULL, NULL);
         MsMonCoverageLogged(MSMON_SENSOR_THREAD_NOTIFY);
     }
@@ -391,6 +392,7 @@ static VOID MsMonTrackClientAtFirstImage(PCUNICODE_STRING FullImageName, HANDLE 
 
 static VOID MsMonImageNotify(PUNICODE_STRING FullImageName, HANDLE ProcessId, PIMAGE_INFO ImageInfo)
 {
+    LONGLONG startTime = MsMonProcessStartTime(ProcessId);
     if (!ExAcquireRundownProtection(&gCallbackRundown)) return;
     MsMonCoverageEnter(MSMON_SENSOR_IMAGE_NOTIFY);
     if (ImageInfo->SystemModeImage) {
@@ -399,7 +401,7 @@ static VOID MsMonImageNotify(PUNICODE_STRING FullImageName, HANDLE ProcessId, PI
         MsMonTrackClientAtFirstImage(FullImageName, ProcessId, ImageInfo);
     }
     if (MsMonIsTracked(ProcessId, 0) || MsMonCurrentIsBlackCat()) {
-        (VOID)MsMonLogEvent(MsMonImageLoad, ProcessId, NULL, NULL, NULL, 0, 0,
+        (VOID)MsMonLogEvent(MsMonImageLoad, ProcessId, startTime, NULL, NULL, NULL, 0, 0,
                             STATUS_SUCCESS, 0, MsMonCategoryUnknown,
                             (ULONGLONG)ImageInfo->ImageBase, ImageInfo->ImageSize, FullImageName, NULL);
         MsMonCoverageLogged(MSMON_SENSOR_IMAGE_NOTIFY);

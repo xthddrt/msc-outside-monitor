@@ -19,6 +19,7 @@ static PFLT_FILTER gFilter;
 typedef struct _MSMON_FILE_CONTEXT {
     PFLT_FILE_NAME_INFORMATION NameInfo;
     HANDLE ProcessId;
+    LONGLONG ProcessStartTime;
     HANDLE ThreadId;
     BOOLEAN Tracked;
     ULONG DesiredAccess;
@@ -147,6 +148,7 @@ static PMSMon_FILE_CONTEXT MsMonCreateFileContext(PFLT_CALLBACK_DATA Data, ULONG
     }
     RtlZeroMemory(context, sizeof(*context));
     context->ProcessId = requestor;
+    context->ProcessStartTime = MsMonProcessStartTime(requestor);
     context->ThreadId = PsGetCurrentThreadId();
     context->Tracked = TRUE;
     context->NameInfo = MsMonAcquireName(Data, QueryFlags);
@@ -233,7 +235,7 @@ static VOID MsMonVolumeUnavailable(
     PCUNICODE_STRING path = Context->NameInfo != NULL ? &Context->NameInfo->Name : NULL;
     ULONG category = MsMonEventValue(Data, FALSE) == 1 ? MsMonCategoryHardwareIdentity : MsMonFileCategory(path);
     RtlInitUnicodeString(&detail, Reason);
-    (VOID)MsMonLogEvent(MsMonFileQueryVolumeInformation, Context->ProcessId, NULL,
+    (VOID)MsMonLogEvent(MsMonFileQueryVolumeInformation, Context->ProcessId, Context->ProcessStartTime, NULL,
                         Context->ThreadId, NULL, 0, MsMonFlagPayloadUnavailable,
                         Data->IoStatus.Status, 0, category, MsMonEventValue(Data, FALSE),
                         0, path, &detail);
@@ -259,7 +261,7 @@ static VOID MsMonCaptureVolume(PFLT_CALLBACK_DATA Data, PMSMon_FILE_CONTEXT Cont
              */
             UNICODE_STRING detail;
             RtlInitUnicodeString(&detail, L"two_pass_probe");
-            (VOID)MsMonLogEvent(MsMonFileQueryVolumeInformation, Context->ProcessId, NULL,
+            (VOID)MsMonLogEvent(MsMonFileQueryVolumeInformation, Context->ProcessId, Context->ProcessStartTime, NULL,
                                 Context->ThreadId, NULL, 0, 0, Data->IoStatus.Status, 0,
                                 category, MsMonEventValue(Data, FALSE), 0, path, &detail);
         } else {
@@ -307,7 +309,7 @@ static VOID MsMonCaptureVolume(PFLT_CALLBACK_DATA Data, PMSMon_FILE_CONTEXT Cont
         MsMonVolumeUnavailable(Data, Context, L"unsafe_result_buffer");
         return;
     }
-    (VOID)MsMonLogPayloadSeries(MsMonFileQueryVolumeInformation, Context->ProcessId,
+    (VOID)MsMonLogPayloadSeries(MsMonFileQueryVolumeInformation, Context->ProcessId, Context->ProcessStartTime,
                                 Context->ThreadId, 0, Data->IoStatus.Status, category,
                                 MsMonEventValue(Data, FALSE), 0, path, NULL,
                                 MsMonPayloadVolumeInformation, MsMonNextOperationId(),
@@ -333,7 +335,7 @@ static FLT_POSTOP_CALLBACK_STATUS MsMonPostOperation(
             MsMonCaptureVolume(Data, context);
         } else {
             (VOID)MsMonLogEvent(MsMonEventType(Data->Iopb->MajorFunction),
-                                context->ProcessId, NULL, context->ThreadId, NULL, 0,
+                                context->ProcessId, context->ProcessStartTime, NULL, context->ThreadId, NULL, 0,
                                 path == NULL ? MsMonFlagMissingPath : 0, Data->IoStatus.Status, 0,
                                 MsMonFileCategory(path), MsMonEventValue(Data, FALSE),
                                 MsMonEventValue(Data, TRUE), path, NULL);
@@ -378,7 +380,7 @@ static FLT_POSTOP_CALLBACK_STATUS MsMonPostCreate(
             }
             options = Data->Iopb->Parameters.Create.Options;
         }
-        (VOID)MsMonLogEvent(MsMonFileCreate, context->ProcessId, NULL, context->ThreadId,
+        (VOID)MsMonLogEvent(MsMonFileCreate, context->ProcessId, context->ProcessStartTime, NULL, context->ThreadId,
                             NULL, 0, path == NULL ? MsMonFlagMissingPath : 0, Data->IoStatus.Status,
                             context->DesiredAccess, MsMonFileCategory(path),
                             options, Data->IoStatus.Information, path, NULL);

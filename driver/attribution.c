@@ -120,7 +120,7 @@ VOID MsMonAttributionNoteImage(PCUNICODE_STRING FullImageName, PVOID ImageBase, 
     (VOID)RtlStringCchPrintfW(detail, RTL_NUMBER_OF(detail), L"name=%ws;base=0x%p;size=0x%lx;source=image_load",
                               wideName, ImageBase, (ULONG)ImageSize);
     RtlInitUnicodeString(&detailString, detail);
-    (VOID)MsMonLogEvent(MsMonCoverage, PsGetCurrentProcessId(), NULL, PsGetCurrentThreadId(),
+    (VOID)MsMonLogEvent(MsMonCoverage, PsGetCurrentProcessId(), MsMonProcessStartTime(PsGetCurrentProcessId()), NULL, PsGetCurrentThreadId(),
                         NULL, 0, MsMonFlagObserverRecord, STATUS_SUCCESS, 0,
                         MsMonCategoryUnknown, (ULONG_PTR)ImageBase, ImageSize, &text, &detailString);
 }
@@ -213,7 +213,7 @@ NTSTATUS MsMonAttributionRefresh(VOID)
         (VOID)RtlStringCchPrintfW(detail, RTL_NUMBER_OF(detail), L"name=%ws;base=0x%p;size=0x%lx",
                                   moduleName, (PVOID)base, imageSize);
         RtlInitUnicodeString(&detailString, detail);
-        (VOID)MsMonLogEvent(MsMonCoverage, PsGetCurrentProcessId(), NULL, PsGetCurrentThreadId(),
+        (VOID)MsMonLogEvent(MsMonCoverage, PsGetCurrentProcessId(), MsMonProcessStartTime(PsGetCurrentProcessId()), NULL, PsGetCurrentThreadId(),
                             NULL, 0, MsMonFlagObserverRecord, STATUS_SUCCESS, 0,
                             MsMonCategoryUnknown, base, imageSize, &text, &detailString);
     }

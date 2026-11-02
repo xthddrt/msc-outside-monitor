@@ -34,7 +34,11 @@ void ProcessScope::AddProcess(DWORD pid, uint64_t startTime, const std::wstring&
     if (!path.empty()) process.path = path;
     auto early = earlyImages_.find(pid);
     if (early != earlyImages_.end()) {
-        for (const auto& module : early->second) InsertModule(process.modules, module.base, module.size, module.path);
+        if (early->second.created == startTime) {
+            for (const auto& module : early->second.modules) {
+                InsertModule(process.modules, module.base, module.size, module.path);
+            }
+        }
         earlyImages_.erase(early);
     }
 }
@@ -47,24 +51,27 @@ void ProcessScope::RemoveProcess(DWORD pid, uint64_t startTime)
         (startTime == 0 || found->second.startTime == 0 || found->second.startTime == startTime)) {
         processes_.erase(found);
     }
+    auto early = earlyImages_.find(pid);
+    if (early != earlyImages_.end() && (startTime == 0 || early->second.created == startTime)) {
+        earlyImages_.erase(early);
+    }
 }
 
-void ProcessScope::AddImage(DWORD pid, uint64_t base, uint64_t size, const std::wstring& path)
+void ProcessScope::AddImage(DWORD pid, uint64_t startTime, uint64_t base, uint64_t size, const std::wstring& path)
 {
     std::lock_guard<std::mutex> lock(mutex_);
     if (base == 0 || size == 0) return;
     auto found = processes_.find(pid);
-    if (found == processes_.end()) {
-        /*
-         * An image load can reach the agent before the process-start record
-         * (the kernel callback order is not documented).  Hold it for
-         * AddProcess instead of dropping it, without marking the PID tracked
-         * before the driver says so.
-         */
+    if (found == processes_.end() || found->second.startTime != startTime) {
         if (earlyImages_.size() >= 256 && earlyImages_.find(pid) == earlyImages_.end()) {
             earlyImages_.erase(earlyImages_.begin());
         }
-        InsertModule(earlyImages_[pid], base, size, path);
+        auto& early = earlyImages_[pid];
+        if (early.created != startTime) {
+            early.created = startTime;
+            early.modules.clear();
+        }
+        InsertModule(early.modules, base, size, path);
         return;
     }
     InsertModule(found->second.modules, base, size, path);

@@ -5,6 +5,7 @@ static NTSTATUS gObjectStatus = STATUS_SUCCESS;
 
 typedef struct _MSMON_OBJECT_CONTEXT {
     HANDLE TargetProcessId;
+    LONGLONG ProcessStartTime;
     LONGLONG TargetProcessStartTime;
     ULONG Operation;
     ULONG DesiredAccess;
@@ -39,6 +40,7 @@ static OB_PREOP_CALLBACK_STATUS MsMonObjectPre(PVOID RegistrationContext, POB_PR
     }
     RtlZeroMemory(context, sizeof(*context));
     context->Operation = Information->Operation;
+    context->ProcessStartTime = MsMonProcessStartTime(source);
     context->ThreadObject = Information->ObjectType == *PsThreadType;
 
     if (Information->Operation == OB_OPERATION_HANDLE_CREATE) {
@@ -91,7 +93,7 @@ static VOID MsMonObjectPost(PVOID RegistrationContext, POB_POST_OPERATION_INFORM
         (VOID)SeLocateProcessImageName((PEPROCESS)Information->Object, &imageName);
     }
     (VOID)MsMonLogEvent(context->ThreadObject ? MsMonThreadHandle : MsMonProcessHandle,
-                        PsGetCurrentProcessId(), NULL, PsGetCurrentThreadId(),
+                        PsGetCurrentProcessId(), context->ProcessStartTime, NULL, PsGetCurrentThreadId(),
                         context->TargetProcessId, context->TargetProcessStartTime, 0,
                         Information->ReturnStatus, context->DesiredAccess,
                         MsMonCategoryExternalProcess, context->Operation, grantedAccess,

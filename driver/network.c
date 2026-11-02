@@ -19,8 +19,9 @@ VOID MsMonCoverageRegister(ULONG SensorId, NTSTATUS Status);
 #define MSMON_CALLOUT_COUNT 6
 
 BOOLEAN MsMonIsTracked(HANDLE ProcessId, LONGLONG StartTime);
+LONGLONG MsMonProcessStartTime(HANDLE ProcessId);
 BOOLEAN MsMonCurrentIsBlackCat(VOID);
-NTSTATUS MsMonLogEvent(ULONG Type, HANDLE ProcessId, HANDLE ParentProcessId, HANDLE ThreadId,
+NTSTATUS MsMonLogEvent(ULONG Type, HANDLE ProcessId, LONGLONG ProcessStartTime, HANDLE ParentProcessId, HANDLE ThreadId,
                        HANDLE TargetProcessId, LONGLONG TargetProcessStartTime, ULONG Flags,
                        NTSTATUS Status, ULONG DesiredAccess, ULONG Category,
                        ULONGLONG Value0, ULONGLONG Value1,
@@ -42,6 +43,7 @@ typedef struct _MSMON_FLOW_CONTEXT {
     UINT32 CalloutId;
     UINT16 LayerId;
     HANDLE ProcessId;
+    LONGLONG ProcessStartTime;
     UINT8 Protocol;
     UINT16 LocalPort;
     UINT16 RemotePort;
@@ -184,6 +186,7 @@ static VOID MsMonSelectFields(
 static VOID MsMonLogNetwork(
     ULONG Type,
     HANDLE ProcessId,
+    LONGLONG ProcessStartTime,
     UINT64 FlowId,
     UINT8 Protocol,
     UINT16 LocalPort,
@@ -197,7 +200,7 @@ static VOID MsMonLogNetwork(
     ULONGLONG packed = ((ULONGLONG)Protocol << 32) | ((ULONGLONG)LocalPort << 16) | RemotePort;
     RtlInitUnicodeString(&text, Endpoints);
     RtlInitUnicodeString(&detail, Direction);
-    (VOID)MsMonLogEvent(Type, ProcessId, NULL, NULL, NULL, 0, 0, STATUS_SUCCESS, 0,
+    (VOID)MsMonLogEvent(Type, ProcessId, ProcessStartTime, NULL, NULL, NULL, 0, 0, STATUS_SUCCESS, 0,
                         MsMonCategoryNetwork, FlowId, packed, &text, &detail);
 }
 
@@ -251,6 +254,7 @@ static VOID MsMonAssociateFlow(
     context->CalloutId = gCalloutIds[Index];
     context->LayerId = InFixedValues->layerId;
     context->ProcessId = UlongToHandle((ULONG)InMetaValues->processId);
+    context->ProcessStartTime = MsMonProcessStartTime(context->ProcessId);
     context->Protocol = Protocol;
     context->LocalPort = LocalPort;
     context->RemotePort = RemotePort;
@@ -380,7 +384,8 @@ static VOID NTAPI MsMonWfpClassifyInner(
             type = MsMonNetworkConnect;
             direction = L"connect";
         }
-        MsMonLogNetwork(type, UlongToHandle((ULONG)InMetaValues->processId), flowId,
+        MsMonLogNetwork(type, UlongToHandle((ULONG)InMetaValues->processId),
+                        MsMonProcessStartTime(UlongToHandle((ULONG)InMetaValues->processId)), flowId,
                         protocol, localPort, remotePort, endpoints, direction);
         MsMonCoverageLogged(MSMON_SENSOR_WFP_CLASSIFY);
         if (index >= 4 && FlowContext == 0) {
@@ -446,7 +451,7 @@ static VOID NTAPI MsMonWfpFlowDeleteInner(UINT16 LayerId, UINT32 CalloutId, UINT
     }
     KeReleaseSpinLock(&gFlowLock, oldIrql);
     if (context != NULL) {
-        MsMonLogNetwork(MsMonNetworkFlowClose, context->ProcessId, context->FlowId,
+        MsMonLogNetwork(MsMonNetworkFlowClose, context->ProcessId, context->ProcessStartTime, context->FlowId,
                         context->Protocol, context->LocalPort, context->RemotePort,
                         context->Endpoints, L"flow_close");
         ExFreePoolWithTag(context, MSMON_POOL_TAG);
@@ -600,7 +605,7 @@ VOID MsMonNetworkUninitialize(VOID)
                     KeDelayExecutionThread(KernelMode, FALSE, &delay);
                 }
             } while (!MsMonFlowRemoveComplete((long)status));
-            MsMonLogNetwork(MsMonNetworkFlowClose, context->ProcessId, context->FlowId,
+            MsMonLogNetwork(MsMonNetworkFlowClose, context->ProcessId, context->ProcessStartTime, context->FlowId,
                             context->Protocol, context->LocalPort, context->RemotePort,
                             context->Endpoints, L"flow_close_monitor_stop");
             ExFreePoolWithTag(context, MSMON_POOL_TAG);

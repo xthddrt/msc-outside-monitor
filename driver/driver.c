@@ -64,7 +64,7 @@ static NTSTATUS MsMonStartSession(PMSMON_SESSION_CONFIG Config, ULONG InputLengt
         UNICODE_STRING detail;
         RtlInitUnicodeString(&text, L"object_callbacks_unavailable");
         RtlInitUnicodeString(&detail, L"Process and thread handle events are disabled; status is in value0");
-        (VOID)MsMonLogEvent(MsMonCoverage, PsGetCurrentProcessId(), NULL, PsGetCurrentThreadId(),
+        (VOID)MsMonLogEvent(MsMonCoverage, PsGetCurrentProcessId(), MsMonProcessStartTime(PsGetCurrentProcessId()), NULL, PsGetCurrentThreadId(),
                             NULL, 0, MsMonFlagObserverRecord, STATUS_SUCCESS, 0,
                             MsMonCategoryUnknown, (ULONG)MsMonObjectStatus(), 0, &text, &detail);
     }
@@ -73,7 +73,7 @@ static NTSTATUS MsMonStartSession(PMSMON_SESSION_CONFIG Config, ULONG InputLengt
         UNICODE_STRING detail;
         RtlInitUnicodeString(&text, MsMonNetworkAvailable() ? L"network_callbacks_partial" : L"network_callbacks_unavailable");
         RtlInitUnicodeString(&detail, L"WFP layer availability bitmask is in value0; other monitoring remains active");
-        (VOID)MsMonLogEvent(MsMonCoverage, PsGetCurrentProcessId(), NULL, PsGetCurrentThreadId(),
+        (VOID)MsMonLogEvent(MsMonCoverage, PsGetCurrentProcessId(), MsMonProcessStartTime(PsGetCurrentProcessId()), NULL, PsGetCurrentThreadId(),
                             NULL, 0, MsMonFlagObserverRecord, STATUS_SUCCESS, 0,
                             MsMonCategoryUnknown, MsMonNetworkCoverage(), 0, &text, &detail);
     }
@@ -129,7 +129,7 @@ static NTSTATUS MsMonDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
         status = MsMonTrackProcess(UlongToHandle(request->ProcessId),
                                    request->Flags != 0 ? request->Flags : MsMonFlagExplicitTrack);
         if (NT_SUCCESS(status)) {
-            (VOID)MsMonLogEvent(MsMonProcessStart, UlongToHandle(request->ProcessId), NULL, NULL,
+            (VOID)MsMonLogEvent(MsMonProcessStart, UlongToHandle(request->ProcessId), request->ProcessStartTime, NULL, NULL,
                                 NULL, 0, request->Flags, STATUS_SUCCESS, 0,
                                 MsMonCategoryExternalProcess, request->ProcessStartTime, 0, NULL, NULL);
         }

@@ -38,6 +38,7 @@
 #define SYSINFO_ENABLE_OB_CALLBACKS 1
 
 static KSPIN_LOCK        g_Lock;
+static KMUTEX            g_MonConfigMutex;
 static SYSINFO_MON_EVENT *g_Ring;
 static ULONG             g_Cap;
 static volatile LONG     g_Head;      /* next write */
@@ -611,6 +612,7 @@ MonSummary(_In_reads_bytes_(inLen) PVOID inBuffer, _In_ ULONG inLen,
     PSYSINFO_SUMMARY_HEAD head = (PSYSINFO_SUMMARY_HEAD)outBuffer;
     PSYSINFO_SUMMARY_ENTRY entries;
     ULONG start, max, room, i, count = 0;
+    KIRQL irql;
 
     if (inBuffer == NULL || inLen < sizeof(*req)) return STATUS_INVALID_PARAMETER;
     if (outBuffer == NULL || outLength < sizeof(*head)) return STATUS_BUFFER_TOO_SMALL;
@@ -624,6 +626,7 @@ MonSummary(_In_reads_bytes_(inLen) PVOID inBuffer, _In_ ULONG inLen,
     if (max > room) max = room;
 
     entries = (PSYSINFO_SUMMARY_ENTRY)(head + 1);
+    KeAcquireSpinLock(&g_SumLock, &irql);
     for (i = start; i < SYSINFO_SUMMARY_SLOTS && count < max; i++) {
         if (g_Sum != NULL && g_Sum[i].Count != 0) {
             entries[count++] = g_Sum[i];
@@ -636,6 +639,7 @@ MonSummary(_In_reads_bytes_(inLen) PVOID inBuffer, _In_ ULONG inLen,
     head->Suppressed = (ULONG)g_SumSuppressed;
     head->Count = count;
     head->Next = (i >= SYSINFO_SUMMARY_SLOTS) ? 0 : i;
+    KeReleaseSpinLock(&g_SumLock, irql);
     return STATUS_SUCCESS;
 }
 
@@ -1229,6 +1233,7 @@ MonInit(VOID)
     if (g_Registered) return STATUS_SUCCESS;
 
     KeInitializeSpinLock(&g_Lock);
+    KeInitializeMutex(&g_MonConfigMutex, 0);
 
     status = PsSetLoadImageNotifyRoutine(ImageNotify);
     if (!NT_SUCCESS(status)) {
@@ -1340,15 +1345,21 @@ NTSTATUS
 MonConfigure(_In_ const SYSINFO_MON_CONFIG *config)
 {
     SYSINFO_MON_EVENT *ring;
+    NTSTATUS status = STATUS_SUCCESS;
 
+    (VOID)KeWaitForSingleObject(&g_MonConfigMutex, Executive, KernelMode, FALSE, NULL);
+    TraceSetUnsafeHooksEnabled(0);
     if (config->Enable == 0) {
         InterlockedExchange(&g_Enabled, 0);
-        return STATUS_SUCCESS;
+        goto Done;
     }
 
     if (g_Ring == NULL) {
         ring = (SYSINFO_MON_EVENT *)ExAllocatePool2(POOL_FLAG_NON_PAGED, MON_RING_EVENTS * sizeof(SYSINFO_MON_EVENT), SYSINFO_TAG_MON);
-        if (ring == NULL) return STATUS_INSUFFICIENT_RESOURCES;
+        if (ring == NULL) {
+            status = STATUS_INSUFFICIENT_RESOURCES;
+            goto Done;
+        }
 
         RtlZeroMemory(ring, MON_RING_EVENTS * sizeof(SYSINFO_MON_EVENT));
         KeInitializeSpinLock(&g_Lock);
@@ -1361,7 +1372,10 @@ MonConfigure(_In_ const SYSINFO_MON_CONFIG *config)
 
     if (g_Sum == NULL) {
         PSYSINFO_SUMMARY_ENTRY sum = (PSYSINFO_SUMMARY_ENTRY)ExAllocatePool2(POOL_FLAG_NON_PAGED, SYSINFO_SUMMARY_SLOTS * sizeof(SYSINFO_SUMMARY_ENTRY), SYSINFO_TAG_MON);
-        if (sum == NULL) return STATUS_INSUFFICIENT_RESOURCES;
+        if (sum == NULL) {
+            status = STATUS_INSUFFICIENT_RESOURCES;
+            goto Done;
+        }
 
         RtlZeroMemory(sum, SYSINFO_SUMMARY_SLOTS * sizeof(SYSINFO_SUMMARY_ENTRY));
         KeInitializeSpinLock(&g_SumLock);
@@ -1446,9 +1460,7 @@ MonConfigure(_In_ const SYSINFO_MON_CONFIG *config)
     g_Types = config->Types & SYSINFO_MON_BITS_ALL;
     InterlockedExchange(&g_Enabled, 1);
 
-    if (!config->Enable) {
-        TraceSetUnsafeHooksEnabled(0);
-    } else if (config->UnsafeHooksEnabled) {
+    if (config->UnsafeHooksEnabled) {
         TraceSetUnsafeHooksEnabled(1);
     }
 #if SYSINFO_ENABLE_HANDLE_HOOKS
@@ -1460,7 +1472,9 @@ MonConfigure(_In_ const SYSINFO_MON_CONFIG *config)
     /* The two memory hooks have no exported name; the CLI supplies their
      * syscall numbers so they can be installed on first enable. */
     TraceInstallMemoryHooks(config->SsnRead, config->SsnWrite);
-    return STATUS_SUCCESS;
+Done:
+    KeReleaseMutex(&g_MonConfigMutex, FALSE);
+    return status;
 }
 
 VOID

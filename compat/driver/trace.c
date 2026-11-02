@@ -1987,16 +1987,24 @@ TraceInstallMemoryHooks(_In_ ULONG ssnRead, _In_ ULONG ssnWrite)
 #endif
 }
 
-VOID
+NTSTATUS
 TraceShutdown(VOID)
 {
     ULONG i;
 
     for (i = 0; i < RTL_NUMBER_OF(g_Hooks); i++) {
-        if (g_Hooks[i].Installed) HookRemove(&g_Hooks[i]);
+        while (g_Hooks[i].Installed) {
+            LARGE_INTEGER delay;
+            NTSTATUS status = HookRemove(&g_Hooks[i]);
+
+            if (NT_SUCCESS(status)) break;
+            delay.QuadPart = -10000;
+            KeDelayExecutionThread(KernelMode, FALSE, &delay);
+        }
     }
     g_HookCount = 0;
     InterlockedExchange(&g_TraceHookCount, 0);
+    return STATUS_SUCCESS;
 }
 
 ULONG

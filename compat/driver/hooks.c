@@ -370,19 +370,13 @@ HookLeave(VOID)
 }
 
 VOID
-HookQuiesce(_In_ ULONG maxMilliseconds)
+HookQuiesce(VOID)
 {
-    ULONG waited = 0;
-
-    while (g_InHook != 0 && waited < maxMilliseconds) {
+    while (g_InHook != 0) {
         LARGE_INTEGER interval;
 
-        interval.QuadPart = -10000;             /* 1 ms */
+        interval.QuadPart = -10000;
         KeDelayExecutionThread(KernelMode, FALSE, &interval);
-        waited++;
-    }
-    if (g_InHook != 0) {
-        DbgPrint("SysInfo: %ld detour(s) still running at unload\n", g_InHook);
     }
 }
 
@@ -537,16 +531,16 @@ HookInstall(_Inout_ PHOOK hook, _In_ PVOID target, _In_ PVOID detour, _In_ PCSTR
     return STATUS_SUCCESS;
 }
 
-VOID
+NTSTATUS
 HookRemove(_Inout_ PHOOK hook)
 {
-    if (hook->Installed) {
-        NTSTATUS status = WriteKernelText(hook->Target, hook->Saved, hook->Stolen);
+    NTSTATUS status = STATUS_SUCCESS;
 
+    if (hook->Installed) {
+        status = WriteKernelText(hook->Target, hook->Saved, hook->Stolen);
         if (!NT_SUCCESS(status)) {
-            /* The target still jumps to our trampoline - keep both alive. */
             DbgPrint("SysInfo: could not restore the hooked prologue (0x%08X)\n", status);
-            return;
+            return status;
         }
         hook->Installed = FALSE;
     }
@@ -555,4 +549,5 @@ HookRemove(_Inout_ PHOOK hook)
         hook->PoolBase = NULL;
         hook->PoolTramp = FALSE;
     }
+    return status;
 }

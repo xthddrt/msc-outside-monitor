@@ -69,6 +69,17 @@ static const wchar_t* TcpEventName(USHORT id)
     }
 }
 
+static bool TcpTerminalEvent(USHORT id)
+{
+    switch (id) {
+    case 1034: case 1040: case 1043: case 1045: case 1046: case 1047: case 1048:
+    case 1183: case 1184: case 1201: case 1479:
+        return true;
+    default:
+        return false;
+    }
+}
+
 static const std::vector<USHORT> TCPIP_EVENT_IDS = {
     1017, 1033, 1034, 1038, 1039, 1040, 1043, 1044, 1045, 1046, 1047, 1048, 1183, 1186,
     1176, 1184, 1201, 1479
@@ -705,6 +716,7 @@ void EtwCollector::OnTcpRecord(PEVENT_RECORD record, const TRACE_EVENT_INFO* inf
     if (PropertyNumber(record, info, L"RexmitCount", number)) AppendField(event.detail, L"rexmit", std::to_wstring(number));
     if (PropertyNumber(record, info, L"Reason", number)) AppendField(event.detail, L"reason", std::to_wstring(number));
     Emit(std::move(event));
+    if (TcpTerminalEvent(id)) ForgetTcpOwner(tcb);
 }
 
 void EtwCollector::OnCodeIntegrityRecord(PEVENT_RECORD record, const TRACE_EVENT_INFO* info)
@@ -791,6 +803,11 @@ bool EtwCollector::RememberTcpOwner(uint64_t tcb, DWORD pid, uint64_t created,
     connection.created = created;
     if (!endpoints.empty()) connection.endpoints = endpoints;
     return true;
+}
+
+void EtwCollector::ForgetTcpOwner(uint64_t tcb)
+{
+    tcbConnections_.erase(tcb);
 }
 
 bool EtwCollector::TcpOwner(uint64_t tcb, DWORD& pid, uint64_t& created, std::wstring& endpoints) const

@@ -8,6 +8,7 @@ static BOOLEAN gRegistryRegistered;
 
 typedef struct _MSMON_REGISTRY_CONTEXT {
     HANDLE ProcessId;
+    LONGLONG ProcessStartTime;
     HANDLE ThreadId;
     ULONG Type;
     ULONG DesiredAccess;
@@ -45,6 +46,7 @@ static PMSMON_REGISTRY_CONTEXT MsMonCreateContext(
     if (context == NULL) return NULL;
     RtlZeroMemory(context, size);
     context->ProcessId = PsGetCurrentProcessId();
+    context->ProcessStartTime = MsMonProcessStartTime(context->ProcessId);
     context->ThreadId = PsGetCurrentThreadId();
     context->Type = Type;
     context->DesiredAccess = DesiredAccess;
@@ -93,7 +95,7 @@ static VOID MsMonRegistryUnavailable(
     (VOID)RtlStringCchPrintfW(detail, RTL_NUMBER_OF(detail), L"%ws;value=%wZ", Reason,
                               Context->Detail.Buffer != NULL ? &Context->Detail : &empty);
     RtlInitUnicodeString(&detailString, detail);
-    (VOID)MsMonLogEventWithOperation(Context->Type, Context->ProcessId, Context->ThreadId,
+    (VOID)MsMonLogEventWithOperation(Context->Type, Context->ProcessId, Context->ProcessStartTime, Context->ThreadId,
                                      MsMonFlagPayloadUnavailable | ExtraFlags, Status,
                                      MsMonCategoryRegistry, Context->Value0, Context->Value1,
                                      Context->Path.Buffer != NULL ? &Context->Path : NULL,
@@ -102,7 +104,7 @@ static VOID MsMonRegistryUnavailable(
 
 static VOID MsMonRegistryMetadata(PMSMON_REGISTRY_CONTEXT Context, NTSTATUS Status)
 {
-    (VOID)MsMonLogEventWithOperation(Context->Type, Context->ProcessId, Context->ThreadId,
+    (VOID)MsMonLogEventWithOperation(Context->Type, Context->ProcessId, Context->ProcessStartTime, Context->ThreadId,
                                      Context->Path.Buffer == NULL ? MsMonFlagMissingPath : 0,
                                      Status, MsMonCategoryRegistry, Context->Value0, Context->Value1,
                                      Context->Path.Buffer != NULL ? &Context->Path : NULL,
@@ -180,7 +182,7 @@ static VOID MsMonLogRegistryValue(
         return;
     }
     captured = min(DataBytes, MSMON_REGISTRY_CAPTURE_MAX_BYTES);
-    (VOID)MsMonLogPayloadSeries(Context->Type, Context->ProcessId, Context->ThreadId,
+    (VOID)MsMonLogPayloadSeries(Context->Type, Context->ProcessId, Context->ProcessStartTime, Context->ThreadId,
                                 0, Status, MsMonCategoryRegistry,
                                 Context->Value0, Type,
                                 Context->Path.Buffer != NULL ? &Context->Path : NULL,
@@ -503,7 +505,7 @@ static NTSTATUS MsMonRegistryCallback(PVOID CallbackContext, PVOID Argument1, PV
         } else {
             ULONG captured = min(info->DataSize, MSMON_REGISTRY_CAPTURE_MAX_BYTES);
             __try {
-                (VOID)MsMonLogPayloadSeries(MsMonRegistrySetValue, context->ProcessId, context->ThreadId,
+                (VOID)MsMonLogPayloadSeries(MsMonRegistrySetValue, context->ProcessId, context->ProcessStartTime, context->ThreadId,
                                             MsMonFlagPayloadInput, STATUS_PENDING, MsMonCategoryRegistry,
                                             context->Value0, context->Value1,
                                             context->Path.Buffer != NULL ? &context->Path : NULL,

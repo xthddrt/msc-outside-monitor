@@ -18,7 +18,7 @@ typedef struct _HOOK {
  * `hook->Trampoline` is then callable exactly like the original function.
  */
 NTSTATUS HookInstall(_Inout_ PHOOK hook, _In_ PVOID target, _In_ PVOID detour, _In_ PCSTR name);
-VOID     HookRemove(_Inout_ PHOOK hook);
+NTSTATUS HookRemove(_Inout_ PHOOK hook);
 
 /* Which mechanism actually managed to write read-only kernel text
  * (SYSINFO_WRITE_* from shared/sysinfo.h). */
@@ -53,4 +53,4 @@ ULONG   SysinfoCiOptions(VOID);
  */
 VOID    HookEnter(VOID);
 VOID    HookLeave(VOID);
-VOID    HookQuiesce(_In_ ULONG maxMilliseconds);
+VOID    HookQuiesce(VOID);

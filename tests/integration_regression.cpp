@@ -21,6 +21,31 @@ int main()
     ok &= Check(processScope.IsTracked(41, 100), "tracked PID accepts its process incarnation");
     ok &= Check(!processScope.IsTracked(41, 101), "tracked PID rejects a reused incarnation");
     ok &= Check(!processScope.IsTracked(42, 100), "unknown PID is not tracked");
+    ok &= Check(ProcessScope::ValidParentIncarnation(100, 100, 100),
+                "snapshot inheritance accepts the exact parent incarnation");
+    ok &= Check(!ProcessScope::ValidParentIncarnation(100, 101, 100) &&
+                !ProcessScope::ValidParentIncarnation(101, 101, 100) &&
+                !ProcessScope::ValidParentIncarnation(100, 100, 99),
+                "snapshot inheritance rejects reused, later, and older-parent identities");
+
+    {
+        ProcessScope early;
+        const uint64_t address = 0x1000;
+        early.AddImage(42, 100, address, 0x200, L"C:\\old.dll");
+        early.AddProcess(42, 101, L"C:\\client.exe");
+        ok &= Check(early.ResolveStack(42, &address, 1).empty(),
+                    "early images do not cross into a reused process incarnation");
+        early.AddImage(42, 100, address, 0x200, L"C:\\client.dll");
+        early.AddProcess(42, 100, L"C:\\client.exe");
+        auto modules = early.ResolveStack(42, &address, 1);
+        ok &= Check(modules.size() == 1 && modules[0] == L"C:\\client.dll",
+                    "early images merge for the captured incarnation");
+        early.AddImage(43, 100, address, 0x200, L"C:\\old.dll");
+        early.RemoveProcess(43, 100);
+        early.AddProcess(43, 100, L"C:\\client.exe");
+        ok &= Check(early.ResolveStack(43, &address, 1).empty(),
+                    "process exit discards unmatched early images");
+    }
 
     /*
      * A deferred ETW event belongs to the incarnation it was captured for: a
@@ -85,6 +110,11 @@ int main()
         ok &= Check(collector.ResolveTcpOwner(9, 0, unknown, ownerEndpoints, owner, ownerStart) &&
                         owner == 42 && ownerStart == 100 && ownerEndpoints == L"192.0.2.1:443",
                     "a cached TCP owner returns its captured incarnation");
+        collector.ForgetTcpOwner(9);
+        ok &= Check(!collector.ResolveTcpOwner(9, 0, unknown, ownerEndpoints, owner, ownerStart),
+                    "a closed connection cannot lend its owner to a reused TCB");
+        ok &= Check(collector.RememberTcpOwner(9, 42, 100, L"192.0.2.1:443"),
+                    "the current connection can be cached after eviction");
         scope.AddProcess(42, 101, L"C:\\client.exe");
         ok &= Check(ownerStart == 100, "TCP attribution does not re-read a reused PID's start time");
         ok &= Check(!collector.ResolveTcpOwner(9, 0, unknown, ownerEndpoints, owner, ownerStart),

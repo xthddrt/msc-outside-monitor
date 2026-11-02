@@ -42,11 +42,20 @@ struct ProcessInfo {
     std::vector<ModuleRange> modules;
 };
 
+struct EarlyImage {
+    uint64_t created = 0;
+    std::vector<ModuleRange> modules;
+};
+
 class ProcessScope {
 public:
+    static bool ValidParentIncarnation(uint64_t trackedStart, uint64_t currentStart, uint64_t childStart)
+    {
+        return trackedStart == currentStart && currentStart != 0 && childStart != 0 && currentStart <= childStart;
+    }
     void AddProcess(DWORD pid, uint64_t startTime, const std::wstring& path);
     void RemoveProcess(DWORD pid, uint64_t startTime);
-    void AddImage(DWORD pid, uint64_t base, uint64_t size, const std::wstring& path);
+    void AddImage(DWORD pid, uint64_t startTime, uint64_t base, uint64_t size, const std::wstring& path);
     bool IsTracked(DWORD pid, uint64_t expectedStartTime = 0) const;
     uint64_t StartTime(DWORD pid) const;
     std::wstring Path(DWORD pid) const;
@@ -57,7 +66,7 @@ private:
     mutable std::mutex mutex_;
     std::unordered_map<DWORD, ProcessInfo> processes_;
     /* Image loads the driver reported before the process-start record. */
-    std::unordered_map<DWORD, std::vector<ModuleRange>> earlyImages_;
+    std::unordered_map<DWORD, EarlyImage> earlyImages_;
 };
 
 class EventQueue {

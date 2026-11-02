@@ -5,7 +5,7 @@
 /* Installs the file / registry / memory / kernel-callback hooks.  Inert until
  * `mon on`. */
 VOID  TraceInit(VOID);
-VOID  TraceShutdown(VOID);
+NTSTATUS TraceShutdown(VOID);
 
 /* How many of them actually installed (for the status IOCTL). */
 ULONG TraceHookCount(VOID);

@@ -35,6 +35,7 @@ public:
      * incarnation, and resolve a cached owner only while that same incarnation
      * is still tracked. */
     bool RememberTcpOwner(uint64_t tcb, DWORD pid, uint64_t created, const std::wstring& endpoints);
+    void ForgetTcpOwner(uint64_t tcb);
     bool TcpOwner(uint64_t tcb, DWORD& pid, uint64_t& created, std::wstring& endpoints) const;
     bool ResolveTcpOwner(uint64_t tcb, DWORD providerPid, const ProcessFacts& facts,
                          std::wstring& endpoints, DWORD& pid, uint64_t& created);

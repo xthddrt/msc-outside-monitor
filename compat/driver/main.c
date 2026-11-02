@@ -164,17 +164,12 @@ DispatchControl(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp)
 static VOID
 MonitorStopHooks(VOID)
 {
-    LARGE_INTEGER delay;
-
     if (InterlockedCompareExchange(&g_Stopped, 1, 0) != 0) return;
 
     GuardShutdown();
-    TraceShutdown();
+    (VOID)TraceShutdown();
 
-    HookQuiesce(15000);
-    delay.QuadPart = -5000000LL;
-    KeDelayExecutionThread(KernelMode, FALSE, &delay);
-
+    HookQuiesce();
     MonShutdown();
 }
 
