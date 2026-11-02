@@ -114,12 +114,32 @@ void SessionSummary::Add(const TelemetryEvent& event)
     if ((event.header.Flags & MsMonFlagPayloadUnavailable) != 0) payloadUnavailable_++;
     if ((event.header.Flags & MsMonFlagPayloadPresent) != 0) {
         payloadBytes_ += event.header.PayloadBytes;
-        auto& operation = payloadOperations_[event.header.OperationId];
+        auto inserted = payloadProgress_.try_emplace(event.header.OperationId);
+        PayloadProgress& operation = inserted.first->second;
+        if (inserted.second) {
+            payloadOperations_++;
+            /* shortcut: the client decides how many operations exist, so keep
+             * only the newest 4096; evicted series stay counted as incomplete. */
+            while (payloadProgress_.size() > 4096) {
+                auto oldest = payloadProgress_.begin();
+                if (oldest->first == event.header.OperationId) ++oldest;
+                if (oldest == payloadProgress_.end()) break;
+                payloadProgress_.erase(oldest);
+            }
+        }
         if (operation.chunkCount == 0) operation.chunkCount = event.header.PayloadChunkCount;
         if (operation.chunkCount != event.header.PayloadChunkCount) operation.invalid = true;
         if (!operation.chunks.emplace(event.header.PayloadChunkIndex, true).second) {
             operation.invalid = true;
             payloadDuplicateChunks_++;
+        }
+        /* A completed series needs no further bookkeeping. */
+        if (!operation.invalid && operation.chunkCount != 0 &&
+            operation.chunks.size() == operation.chunkCount &&
+            operation.chunks.begin()->first == 0 &&
+            operation.chunks.rbegin()->first == operation.chunkCount - 1) {
+            completePayloads_++;
+            payloadProgress_.erase(inserted.first);
         }
     }
     categories_[CategoryName(event.header.Category)]++;
@@ -131,23 +151,16 @@ void SessionSummary::Add(const TelemetryEvent& event)
 std::string SessionSummary::Json(const MSMON_STATISTICS& statistics, uint64_t etwDropped,
                                  uint64_t driverGaps, uint64_t etwGaps) const
 {
-    uint64_t completePayloads = 0;
-    for (const auto& item : payloadOperations_) {
-        const auto& operation = item.second;
-        if (!operation.invalid && operation.chunkCount != 0 &&
-            operation.chunks.size() == operation.chunkCount &&
-            operation.chunks.begin()->first == 0 &&
-            operation.chunks.rbegin()->first == operation.chunkCount - 1) completePayloads++;
-    }
     std::ostringstream json;
     json << "{\"type\":\"observer_summary\",\"session_id\":" << statistics.SessionId
          << ",\"events\":" << events_ << ",\"outside_client_events\":" << outsideEvents_
          << ",\"hardware_identity_events\":" << hardwareEvents_
          << ",\"blackcat_events\":" << blackCatEvents_
          << ",\"payload_bytes\":" << payloadBytes_
-         << ",\"payload_operations\":" << payloadOperations_.size()
-         << ",\"complete_payload_operations\":" << completePayloads
-         << ",\"incomplete_payload_operations\":" << (payloadOperations_.size() - completePayloads)
+         << ",\"payload_operations\":" << payloadOperations_
+         << ",\"complete_payload_operations\":" << completePayloads_
+         << ",\"incomplete_payload_operations\":" << (payloadOperations_ - completePayloads_)
+         << ",\"payload_operations_pending\":" << payloadProgress_.size()
          << ",\"payload_unavailable_events\":" << payloadUnavailable_
          << ",\"payload_duplicate_chunks\":" << payloadDuplicateChunks_
          << ",\"driver_dropped_events\":" << statistics.DroppedEvents

@@ -19,6 +19,10 @@ typedef struct _HOOK {
  */
 NTSTATUS HookInstall(_Inout_ PHOOK hook, _In_ PVOID target, _In_ PVOID detour, _In_ PCSTR name);
 NTSTATUS HookRemove(_Inout_ PHOOK hook);
+/* Free a pool trampoline after its hook is restored and the detours drained. */
+VOID     HookFree(_Inout_ PHOOK hook);
+/* Hand the in-image trampoline slots out again once every hook is drained. */
+VOID     HookResetTrampolinePool(VOID);
 
 /* Which mechanism actually managed to write read-only kernel text
  * (SYSINFO_WRITE_* from shared/sysinfo.h). */

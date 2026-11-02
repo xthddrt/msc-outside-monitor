@@ -2007,6 +2007,19 @@ TraceShutdown(VOID)
     return STATUS_SUCCESS;
 }
 
+/* Every prologue is restored, so no new detour can start; wait for the ones
+ * already inside and only then release the trampolines they may still call. */
+VOID
+TraceFreeTrampolines(VOID)
+{
+    ULONG i;
+
+    for (i = 0; i < RTL_NUMBER_OF(g_Hooks); i++) {
+        HookFree(&g_Hooks[i]);
+    }
+    HookResetTrampolinePool();
+}
+
 ULONG
 TraceHookCount(VOID)
 {
@@ -2017,8 +2030,13 @@ VOID
 TraceSetUnsafeHooksEnabled(_In_ ULONG enabled)
 {
     InterlockedExchange(&g_UnsafeHooksEnabled, enabled ? 1 : 0);
-    if (enabled) TraceInit();
-    else TraceShutdown();
+    if (enabled) {
+        TraceInit();
+    } else {
+        (VOID)TraceShutdown();
+        HookQuiesce();
+        TraceFreeTrampolines();
+    }
 }
 
 BOOLEAN

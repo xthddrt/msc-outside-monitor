@@ -544,10 +544,28 @@ HookRemove(_Inout_ PHOOK hook)
         }
         hook->Installed = FALSE;
     }
-    if (hook->PoolTramp && hook->PoolBase) {
+    return status;
+}
+
+/*
+ * Free the pool trampoline of a restored hook.  The caller must have waited
+ * with HookQuiesce() first: a detour that is still executing holds the
+ * trampoline pointer in a local and would jump into freed executable pool.
+ */
+VOID
+HookFree(_Inout_ PHOOK hook)
+{
+    if (!hook->Installed && hook->PoolTramp && hook->PoolBase != NULL) {
         ExFreePoolWithTag(hook->PoolBase, 'pTrH');
         hook->PoolBase = NULL;
         hook->PoolTramp = FALSE;
     }
-    return status;
+}
+
+/* The in-image trampoline slots can be handed out again once every hook has
+ * been restored and drained. */
+VOID
+HookResetTrampolinePool(VOID)
+{
+    g_TrampUsed = 0;
 }

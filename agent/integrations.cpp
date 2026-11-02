@@ -22,6 +22,11 @@ static const wchar_t* KFilterTargetName(unsigned long target)
     case 0x00000020u: return L"device";
     case 0x00000040u: return L"pipe";
     case 0x00000080u: return L"network";
+    case 0x00000100u: return L"handle";
+    case 0x00000200u: return L"launch";
+    case 0x00000400u: return L"open";
+    case 0x00000800u: return L"thread-handle";
+    case 0x00001000u: return L"thread-open";
     default: return L"unknown";
     }
 }

@@ -115,6 +115,16 @@ int main()
                     "a closed connection cannot lend its owner to a reused TCB");
         ok &= Check(collector.RememberTcpOwner(9, 42, 100, L"192.0.2.1:443"),
                     "the current connection can be cached after eviction");
+        /* A record that names a live non-client process must not borrow the cache. */
+        ProcessFacts unrelated;
+        unrelated.ok = true;
+        unrelated.created = 500;
+        ok &= Check(!collector.ResolveTcpOwner(9, 43, unrelated, ownerEndpoints, owner, ownerStart),
+                    "a named non-client process does not inherit a cached TCP owner");
+        ok &= Check(!collector.ResolveTcpOwner(9, 0, unknown, ownerEndpoints, owner, ownerStart),
+                    "the stale TCB entry is dropped when a foreign process reuses it");
+        ok &= Check(collector.RememberTcpOwner(9, 42, 100, L"192.0.2.1:443"),
+                    "the client can cache the connection again after a foreign reuse");
         scope.AddProcess(42, 101, L"C:\\client.exe");
         ok &= Check(ownerStart == 100, "TCP attribution does not re-read a reused PID's start time");
         ok &= Check(!collector.ResolveTcpOwner(9, 0, unknown, ownerEndpoints, owner, ownerStart),
@@ -226,6 +236,27 @@ int main()
     source.Target = 4;
     source.Value = 0x81;
 
+    /* ABI 5 outside-process targets keep their names and the rights= label. */
+    {
+        struct TargetCase { unsigned long value; const wchar_t* name; };
+        const TargetCase targets[] = {
+            { 0x00000100u, L"handle" }, { 0x00000200u, L"launch" },
+            { 0x00000400u, L"open" }, { 0x00000800u, L"thread-handle" },
+            { 0x00001000u, L"thread-open" }
+        };
+        for (const auto& target : targets) {
+            source.Target = target.value;
+            event = KFilterDecisionEvent(source, 77, 6);
+            const std::wstring prefix = L"target=" + std::wstring(target.name) + L";";
+            ok &= Check(event.detail.find(prefix) != std::wstring::npos,
+                        "an ABI 5 target is decoded by name");
+            ok &= Check(event.detail.find(L"target=unknown") == std::wstring::npos &&
+                        event.detail.find(L"target_id=" + std::to_wstring(target.value)) != std::wstring::npos,
+                        "an ABI 5 target keeps its numeric id");
+        }
+        source.Target = 4;
+    }
+
     /* The decision ring survives across runs: only events from this session may be written. */
     ok &= Check(!KFilterDecisionInSession(source, source.Timestamp + 1),
                 "a decision from before the session start is excluded");
@@ -303,6 +334,33 @@ int main()
     summary.Add(integrity);
     ok &= Check(summary.Json(statistics, 0, 0, 0).find("\"events\":3") != std::string::npos,
                 "observer_summary counts only identified events");
+
+    /* Payload bookkeeping is bounded, and a completed series retains no chunks. */
+    {
+        SessionSummary payloads;
+        for (unsigned index = 0; index < 5000; index++) {
+            TelemetryEvent payload;
+            payload.header.Sequence = index + 1;
+            payload.header.Type = MsMonRegistryQuery;
+            payload.header.Flags = MsMonFlagPayloadPresent;
+            payload.header.OperationId = index + 1;
+            payload.header.PayloadChunkCount = 1;
+            payload.header.PayloadChunkIndex = 0;
+            payload.header.PayloadTotalBytes = 4;
+            payload.header.PayloadBytes = 4;
+            payload.payload = { 1, 2, 3, 4 };
+            payloads.Add(payload);
+        }
+        const std::string json = payloads.Json(statistics, 0, 0, 0);
+        ok &= Check(json.find("\"payload_operations\":5000") != std::string::npos,
+                    "every payload operation is counted");
+        ok &= Check(json.find("\"complete_payload_operations\":5000") != std::string::npos,
+                    "a completed payload series counts once");
+        ok &= Check(json.find("\"incomplete_payload_operations\":0") != std::string::npos,
+                    "a completed payload series leaves no incomplete entry");
+        ok &= Check(json.find("\"payload_operations_pending\":0") != std::string::npos,
+                    "completed payload series retain no chunk bookkeeping");
+    }
 
     /*
      * The unit the agent uses for session_meta.json and coverage.json: the summary, the total

@@ -40,7 +40,7 @@ $readers = @(
     @('GuardGetStatus(_Out_', 'GuardIsTargetProcess(', 'GuardGetStatus'),
     @('GuardIsTargetProcess(VOID)', 'GuardFileBlocked(', 'GuardIsTargetProcess'),
     @('GuardFileBlocked(_In_', 'GuardRegistryBlocked(', 'GuardFileBlocked'),
-    @('GuardRegistryBlocked(_In_', 'ProtectedProcessImage(', 'GuardRegistryBlocked'),
+    @('GuardRegistryBlocked(_In_', 'GuardProcessHandleBlocked(_In_', 'GuardRegistryBlocked'),
     @('GuardProcessHandleBlocked(_In_', 'GuardMemoryBlocked(', 'GuardProcessHandleBlocked'),
     @('GuardPreHandle(_Inout_', 'NO_SUCH_MARKER(', 'GuardPreHandle')
 )
@@ -59,6 +59,19 @@ foreach ($reader in $readers) {
     $held = $body.Substring($take, $give - $take)
     foreach ($call in $logging) {
         if ($held.Contains($call)) { throw "$($reader[2]) logs or emits inside g_ConfigLock" }
+    }
+    foreach ($call in @('PsGetProcessImageFileName(', 'ProtectedProcessImage(')) {
+        if ($held.Contains($call)) { throw "$($reader[2]) looks up a process image inside g_ConfigLock" }
+    }
+}
+
+# The handle guards resolve the target image before they take the lock.
+foreach ($name in @('GuardProcessHandleBlocked(_In_', 'GuardPreHandle(_Inout_')) {
+    $body = Body $source $name 'NO_SUCH_MARKER(' $name
+    $lookup = $body.IndexOf('PsGetProcessImageFileName(')
+    $take = $body.IndexOf('KeAcquireSpinLock(&g_ConfigLock')
+    if ($lookup -lt 0 -or $take -lt 0 -or $lookup -gt $take) {
+        throw "$name does not capture the target image before g_ConfigLock"
     }
 }
 

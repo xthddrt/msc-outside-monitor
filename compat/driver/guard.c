@@ -422,18 +422,6 @@ GuardRegistryBlocked(_In_ PCUNICODE_STRING Path, _In_ ACCESS_MASK Access)
     return FALSE;
 }
 
-static BOOLEAN
-ProtectedProcessImage(_In_ PEPROCESS Process)
-{
-    CHAR image[SYSINFO_GUARD_TARGET_CHARS];
-    PCHAR name;
-
-    if (Process == NULL) return FALSE;
-    name = PsGetProcessImageFileName(Process);
-    CopyAscii(image, SYSINFO_GUARD_TARGET_CHARS, name);
-    return image[0] != 0 && ProtectedByName(image);
-}
-
 /* "<action> <target image>", so the event says which browser was touched. */
 static VOID
 AppendPart(_Out_writes_(cap) CHAR *out, _In_ ULONG cap, _Inout_ PULONG pos, _In_opt_ const CHAR *text)
@@ -465,6 +453,7 @@ GuardProcessHandleBlocked(_In_ HANDLE TargetPid, _In_ ACCESS_MASK Access)
 {
     PEPROCESS process = NULL;
     CHAR caller[SYSINFO_GUARD_TARGET_CHARS];
+    CHAR targetImage[SYSINFO_GUARD_TARGET_CHARS];
     BOOLEAN apply = FALSE;
     BOOLEAN blocked;
     KIRQL irql;
@@ -473,8 +462,12 @@ GuardProcessHandleBlocked(_In_ HANDLE TargetPid, _In_ ACCESS_MASK Access)
     if (!CurrentImage(caller)) return FALSE;
     if (!NT_SUCCESS(PsLookupProcessByProcessId(TargetPid, &process)) || process == NULL) return FALSE;
 
+    /* The image lookup stays outside the configuration spin lock; only the
+     * bounded table scan runs under it. */
+    CopyAscii(targetImage, SYSINFO_GUARD_TARGET_CHARS, PsGetProcessImageFileName(process));
+
     KeAcquireSpinLock(&g_ConfigLock, &irql);
-    if (TargetByName(caller) && ProtectedProcessImage(process) &&
+    if (TargetByName(caller) && ProtectedByName(targetImage) &&
         (Access & (PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_CREATE_THREAD |
                    PROCESS_DUP_HANDLE | PROCESS_SUSPEND_RESUME)) != 0) {
         apply = TRUE;
@@ -524,6 +517,7 @@ GuardPreHandle(_Inout_ POB_PRE_OPERATION_INFORMATION Info)
     ACCESS_MASK mask = 0;
     PEPROCESS target = NULL;
     CHAR caller[SYSINFO_GUARD_TARGET_CHARS];
+    CHAR targetImage[SYSINFO_GUARD_TARGET_CHARS];
     BOOLEAN apply = FALSE;
     KIRQL irql;
 
@@ -552,8 +546,12 @@ GuardPreHandle(_Inout_ POB_PRE_OPERATION_INFORMATION Info)
     }
     if (target == NULL) return;
 
+    /* The image lookup stays outside the configuration spin lock; only the
+     * bounded table scan runs under it. */
+    CopyAscii(targetImage, SYSINFO_GUARD_TARGET_CHARS, PsGetProcessImageFileName(target));
+
     KeAcquireSpinLock(&g_ConfigLock, &irql);
-    if (TargetByName(caller) && ProtectedProcessImage(target) && (*access & mask) != 0) {
+    if (TargetByName(caller) && ProtectedByName(targetImage) && (*access & mask) != 0) {
         apply = TRUE;
     }
     KeReleaseSpinLock(&g_ConfigLock, irql);

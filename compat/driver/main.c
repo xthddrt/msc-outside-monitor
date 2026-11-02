@@ -170,6 +170,7 @@ MonitorStopHooks(VOID)
     (VOID)TraceShutdown();
 
     HookQuiesce();
+    TraceFreeTrampolines();
     MonShutdown();
 }
 
@@ -227,14 +228,16 @@ DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING RegistryPath)
         return status;
     }
 
+    GuardInit();
+    MonInit();
+    TraceInit();
+
+    /* Publication comes last: an IOCTL may only reach the zero-initialized
+     * guard/monitor state after the routines that own it have run. */
     g_Device->Flags &= ~DO_DEVICE_INITIALIZING;
     if (!NT_SUCCESS(IoRegisterShutdownNotification(g_Device))) {
         DbgPrint("SysInfoMon: shutdown notification failed\n");
     }
-
-    GuardInit();
-    MonInit();
-    TraceInit();
 
     DbgPrint("SysInfoMon: DriverEntry hooks=%lu\n", TraceHookCount());
     return STATUS_SUCCESS;

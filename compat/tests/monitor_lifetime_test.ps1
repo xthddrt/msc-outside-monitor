@@ -17,9 +17,27 @@ $quiesce = Body $hooks 'HookQuiesce(VOID)' 'SysinfoPatchMethod'
 if (-not $quiesce.Contains('while (g_InHook != 0)') -or $quiesce.Contains('maxMilliseconds')) {
     throw 'detour quiesce is not unbounded'
 }
-$remove = Body $hooks 'HookRemove(_Inout_ PHOOK hook)' ''
+$remove = Body $hooks 'HookRemove(_Inout_ PHOOK hook)' 'HookFree(_Inout_ PHOOK hook)'
 if ($hooks -notmatch 'NTSTATUS\s+HookRemove\(_Inout_ PHOOK hook\)' -or $remove.Contains('return;')) {
     throw 'prologue restoration failure is not propagated'
+}
+if ($remove.Contains('ExFreePoolWithTag')) {
+    throw 'HookRemove frees the trampoline before the detour drain'
+}
+$main = Get-Content (Join-Path $root 'driver\main.c') -Raw
+$stop = Body $main 'MonitorStopHooks(VOID)' 'DispatchShutdown('
+$restore = $stop.IndexOf('TraceShutdown(')
+$drain = $stop.IndexOf('HookQuiesce()')
+$free = $stop.IndexOf('TraceFreeTrampolines()')
+if ($restore -lt 0 -or $drain -lt $restore -or $free -lt $drain) {
+    throw 'unload does not restore, drain, then free the trampolines'
+}
+$enable = Body $trace 'TraceSetUnsafeHooksEnabled(_In_ ULONG enabled)' 'TraceUnsafeHooksEnabled'
+$restore = $enable.IndexOf('TraceShutdown()')
+$drain = $enable.IndexOf('HookQuiesce()')
+$free = $enable.IndexOf('TraceFreeTrampolines()')
+if ($restore -lt 0 -or $drain -lt $restore -or $free -lt $drain) {
+    throw 'mon off does not restore, drain, then free the trampolines'
 }
 $shutdown = Body $trace 'TraceShutdown(VOID)' 'TraceHookCount'
 if (-not $shutdown.Contains('while (g_Hooks[i].Installed)')) {

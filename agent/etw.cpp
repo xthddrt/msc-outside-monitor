@@ -832,10 +832,17 @@ bool EtwCollector::ResolveTcpOwner(uint64_t tcb, DWORD providerPid, const Proces
     if (providerPid != 0 && tcb != 0) {
         (void)RememberTcpOwner(tcb, providerPid, providerStart, endpoints);
     }
-    if (providerPid != 0 && providerStart != 0 && scope_.IsTracked(providerPid, providerStart)) {
-        pid = providerPid;
-        created = providerStart;
-        return true;
+    if (providerPid != 0) {
+        if (providerStart != 0 && scope_.IsTracked(providerPid, providerStart)) {
+            pid = providerPid;
+            created = providerStart;
+            return true;
+        }
+        /* The record names a process that is not the validated client.  Do not
+         * let it borrow the cached owner of another connection that happened to
+         * reuse this TCB address, and drop the stale mapping. */
+        ForgetTcpOwner(tcb);
+        return false;
     }
     DWORD cachedPid = 0;
     uint64_t cachedStart = 0;
