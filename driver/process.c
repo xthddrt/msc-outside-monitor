@@ -392,7 +392,6 @@ static VOID MsMonTrackClientAtFirstImage(PCUNICODE_STRING FullImageName, HANDLE 
 
 static VOID MsMonImageNotify(PUNICODE_STRING FullImageName, HANDLE ProcessId, PIMAGE_INFO ImageInfo)
 {
-    LONGLONG startTime = MsMonProcessStartTime(ProcessId);
     if (!ExAcquireRundownProtection(&gCallbackRundown)) return;
     MsMonCoverageEnter(MSMON_SENSOR_IMAGE_NOTIFY);
     if (ImageInfo->SystemModeImage) {
@@ -401,7 +400,12 @@ static VOID MsMonImageNotify(PUNICODE_STRING FullImageName, HANDLE ProcessId, PI
         MsMonTrackClientAtFirstImage(FullImageName, ProcessId, ImageInfo);
     }
     if (MsMonIsTracked(ProcessId, 0) || MsMonCurrentIsBlackCat()) {
-        (VOID)MsMonLogEvent(MsMonImageLoad, ProcessId, startTime, NULL, NULL, NULL, 0, 0,
+        /* Read the start after the admission above: MsMonProcessStartTime only
+         * knows tracked processes, so an image that arrives before the
+         * process-start record would otherwise be logged with start 0 and then
+         * discarded by the agent's early-image merge. */
+        (VOID)MsMonLogEvent(MsMonImageLoad, ProcessId, MsMonProcessStartTime(ProcessId),
+                            NULL, NULL, NULL, 0, 0,
                             STATUS_SUCCESS, 0, MsMonCategoryUnknown,
                             (ULONGLONG)ImageInfo->ImageBase, ImageInfo->ImageSize, FullImageName, NULL);
         MsMonCoverageLogged(MSMON_SENSOR_IMAGE_NOTIFY);
