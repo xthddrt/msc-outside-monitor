@@ -40,6 +40,25 @@ def main():
         event("process_start", 300, 70, r"C:\child.exe", "2026-01-01T00:00:03.000Z", parent_process_id=9),
         event("registry_create", 42, 200, new_key, "2026-01-01T00:00:03.500Z", value0=0),
         event("registry_create", 42, 200, failed_key, "2026-01-01T00:00:04.000Z", value0=0, status=-1),
+        # The producer of kfilter_decision omits process_start_time, so these are
+        # placed by their own timestamps. Both are written after new.exe started:
+        # the first belongs to old.exe, the second to new.exe.
+        event("kfilter_decision", 42, 0, r"\Device\MountPointManager", "2026-01-01T00:00:00.500Z",
+              component="kfilter.sys", detail="target=device;action=deny;ioctl=0x006D0008",
+              process_path=r"C:\old.exe"),
+        event("kfilter_decision", 42, 0, r"\Device\Nsi", "2026-01-01T00:00:02.500Z",
+              component="kfilter.sys", detail="target=device;action=deny;ioctl=0x00000000",
+              process_path=r"C:\new.exe"),
+        # No incarnation was alive at this decision's timestamp, so it names no process.
+        event("kfilter_decision", 77, 0, r"\Device\Nsi", "2026-01-01T00:00:00.000Z",
+              component="kfilter.sys", detail="target=device;action=deny;ioctl=0x00000000",
+              process_path=r"C:\late.exe"),
+        event("process_start", 77, 900, r"C:\late.exe", "2026-01-01T00:00:00.900Z"),
+        # Incarnation 300 started after child 200, so it cannot be its parent even
+        # though both formatted starts share the same millisecond.
+        event("process_start", 500, 300, r"C:\impossible-parent.exe", "2026-01-01T00:00:05.000Z"),
+        event("process_start", 501, 200, r"C:\impossible-child.exe", "2026-01-01T00:00:05.000Z",
+              parent_process_id=500),
     ]
     with tempfile.TemporaryDirectory() as temporary:
         bundle = pathlib.Path(temporary)
@@ -49,17 +68,29 @@ def main():
 
         report = session_activity.report(session_activity.collect(bundle), bundle, 40)
         rows = {(row["pid"], row["process_start_time"]): row for row in report["processes"]}
-        assert set(rows) == {(42, 100), (42, 200), (9, 50), (9, 60), (300, 70)}, rows.keys()
+        assert set(rows) == {(42, 100), (42, 200), (9, 50), (9, 60), (300, 70), (77, 900),
+                             (500, 300), (501, 200)}, rows.keys()
+        assert all(row["process_start_time"] != 0 for row in report["processes"]), report["processes"]
         old, new = rows[(42, 100)], rows[(42, 200)]
         assert old["image"] == "old.exe" and new["image"] == "new.exe"
         assert old["start"] == "2026-01-01T00:00:00.000Z"
         assert old["end"] == "2026-01-01T00:00:01.000Z"
         assert new["start"] == "2026-01-01T00:00:02.000Z" and new["end"] is None
         assert old["start"] <= old["end"]
-        assert old["events"] == 3 and new["events"] == 4
+        assert old["events"] == 4 and new["events"] == 5
         assert "old.dat" not in str(new["reads_outside_client"])
         assert "new.dat" not in str(old["reads_outside_client"])
+        # Each delayed decision lands on the incarnation that was alive for it.
+        assert "MountPointManager" in str(old["blackcat"]) and "MountPointManager" not in str(new["blackcat"])
+        assert "Nsi" in str(new["blackcat"]) and "Nsi" not in str(old["blackcat"])
         assert rows[(300, 70)]["parent_image"] == "parent-new.exe", rows[(300, 70)]
+        assert rows[(501, 200)]["parent_image"] is None, rows[(501, 200)]
+        # An event with no incarnation alive at its timestamp is reported apart
+        # from the process rows rather than as a synthetic start-0 process.
+        assert rows[(77, 900)]["events"] == 1, rows[(77, 900)]
+        unattributed = report.get("unattributed", [])
+        assert any(item["pid"] == 77 and item["types"] == [["kfilter_decision", 1]]
+                   for item in unattributed), unattributed
 
         writes = new["registry_writes"]
         assert any(item[0][0] == "create" and "NewKey" in item[0][1] for item in writes), writes

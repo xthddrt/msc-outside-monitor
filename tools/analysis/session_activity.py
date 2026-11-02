@@ -61,7 +61,6 @@ class Process:
     def __init__(self):
         self.image = "?"
         self.parent = None
-        self.created = 0
         self.start = self.end = None
         self.flags = []
         self.switches = []
@@ -69,15 +68,55 @@ class Process:
         self.file_buckets = collections.defaultdict(collections.Counter)
 
 
+def incarnation_spans(session_dir):
+    """Log timestamps of every incarnation a process_start/exit record proves."""
+    spans = collections.defaultdict(list)
+    latest = {}
+    for event in iter_events(session_dir):
+        kind = event.get("type")
+        pid = event.get("process_id") or 0
+        start = event.get("process_start_time") or 0
+        stamp = event.get("timestamp") or ""
+        if start == 0:
+            if kind == "process_exit" and pid in latest:
+                spans[pid][latest[pid]][2] = stamp
+            continue
+        if kind == "process_start":
+            latest[pid] = len(spans[pid])
+            spans[pid].append([start, stamp, None])
+        elif kind == "process_exit":
+            for span in spans[pid]:
+                if span[0] == start:
+                    span[2] = stamp
+                    break
+    return spans
+
+
+def incarnation_at(spans, pid, stamp):
+    """The incarnation alive at stamp, never a later one; None if none was."""
+    best = None
+    for start, begin, end in spans.get(pid, ()):
+        if begin and stamp and begin <= stamp and (end is None or stamp <= end):
+            if best is None or start > best:
+                best = start
+    return best
+
+
 def collect(session_dir):
+    # One row per incarnation: a reused PID is a different process. A producer
+    # that omits the start (kfilter_decision) belongs to the incarnation that was
+    # alive at the event's own timestamp; it is never charged to a newer process.
+    spans = incarnation_spans(session_dir)
     processes = collections.defaultdict(Process)
     for event in iter_events(session_dir):
         kind = event.get("type")
         if kind in (None, "coverage", "coverage_usage", "observer_summary", "observer_sequence_gap", "etw_unattributed"):
             continue
         pid = event.get("process_id") or 0
-        process = processes[(pid, event.get("process_start_time") or 0)]
-        process.created = event.get("process_start_time") or 0
+        start = event.get("process_start_time") or 0
+        if start == 0:
+            start = incarnation_at(spans, pid, event.get("timestamp") or "") or 0
+        process = processes[(pid, start)]
         if event.get("process_path") and process.image == "?":
             process.image = short_image(event["process_path"])
         sections = process.sections
@@ -154,8 +193,18 @@ def report(processes, session_dir, limit):
         return [[list(key) if isinstance(key, tuple) else key, count] for key, count in counter.most_common(limit)]
 
     output = {"session": pathlib.Path(session_dir).name, "processes": []}
+    unattributed = []
     for (pid, created), process in sorted(processes.items(), key=lambda item: -sum(item[1].sections["types"].values())):
         if pid == 0:
+            continue
+        if created == 0:
+            # No incarnation was alive at these events' timestamps, so they name no
+            # process. Keep them visible instead of inventing a start-0 process row.
+            unattributed.append({
+                "pid": pid, "image": process.image,
+                "events": sum(process.sections["types"].values()),
+                "types": top(process.sections["types"]),
+            })
             continue
         parents = [(parent_created, parent) for (parent_pid, parent_created), parent in processes.items()
                    if parent_pid == process.parent and parent_created != 0 and parent_created <= created]
@@ -171,6 +220,8 @@ def report(processes, session_dir, limit):
         for name, counter in process.sections.items():
             entry[name] = top(counter)
         output["processes"].append(entry)
+    if unattributed:
+        output["unattributed"] = unattributed
     return output
 
 
