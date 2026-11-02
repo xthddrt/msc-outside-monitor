@@ -168,6 +168,155 @@ def main():
             capture_output=True, text=True)
         check(validation.returncode == 0,
               "the redacted events fail schema validation: " + validation.stdout + validation.stderr)
+    with tempfile.TemporaryDirectory() as temporary:
+        root = pathlib.Path(temporary)
+        source = root / "session"
+        source.mkdir()
+        destination = root / "redacted"
+        destination.mkdir()
+        endpoints = ("2001:0db8:0000:0000:0000:0000:0000:0001:443 -> "
+                     "fe80:0000:0000:0000:0202:b3ff:fe1e:8329:52000")
+        with open(source / "events.jsonl", "w", encoding="utf-8") as stream:
+            stream.write(json.dumps({"type": "network_connect", "timestamp": "t1",
+                                     "process_id": 7, "text": endpoints,
+                                     "detail": "tcp"}) + "\n")
+
+        redact_session.rewrite([source / "events.jsonl"], destination, False, False)
+        text = (destination / "events.jsonl").read_text(encoding="utf-8")
+        for secret in ("2001", "0db8", "fe80", "8329"):
+            check(secret not in text, f"the redacted bundle still contains {secret}")
+        redacted = [json.loads(line) for line in text.splitlines() if line.strip()]
+        check(redacted[0]["text"] == "<redacted-ip> -> <redacted-ip>",
+              "uncompressed IPv6 endpoints are replaced")
+        check(redact_session.redact_identifying("10:00:21 -> 10:00:22") == "10:00:21 -> 10:00:22",
+              "clock-like strings are not over-matched")
+
+    with tempfile.TemporaryDirectory() as temporary:
+        root = pathlib.Path(temporary)
+        source = root / "session"
+        source.mkdir()
+        destination = root / "redacted"
+        destination.mkdir()
+        modules = [r"\Device\HarddiskVolume3\Users\alice\AppData\Local\evil.dll",
+                   r"\Device\HarddiskVolume3\Windows\System32\ntdll.dll"]
+        with open(source / "events.jsonl", "w", encoding="utf-8") as stream:
+            stream.write(json.dumps({"type": "file_read", "timestamp": "t1",
+                                     "process_id": 7, "text": r"C:\client.exe",
+                                     "detail": "read", "modules": modules}) + "\n")
+
+        redact_session.rewrite([source / "events.jsonl"], destination, False, False)
+        text = (destination / "events.jsonl").read_text(encoding="utf-8")
+        check("Users" not in text and "alice" not in text,
+              "the redacted event still contains a profile-path module")
+        redacted = [json.loads(line) for line in text.splitlines() if line.strip()]
+        check(redacted[0]["modules"][1] == modules[1],
+              "a module outside the profile keeps its path")
+
+        kept = root / "kept"
+        kept.mkdir()
+        redact_session.rewrite([source / "events.jsonl"], kept, True, False)
+        check("alice" in (kept / "events.jsonl").read_text(encoding="utf-8"),
+              "--keep-paths preserves module paths")
+
+    with tempfile.TemporaryDirectory() as temporary:
+        root = pathlib.Path(temporary)
+        source = root / "session"
+        source.mkdir()
+        destination = root / "redacted"
+        destination.mkdir()
+        (source / "session_meta.json").write_text(json.dumps({
+            "client_root": r"C:\Users\alice\Nexon",
+            "scope_root": r"C:\Users\alice\Nexon\appdata"}), encoding="utf-8")
+        (source / "summary.json").write_text(json.dumps({
+            "events": 3,
+            "by_module": {r"C:\Users\alice\Nexon\evil.dll": 3,
+                          r"C:\Windows\System32\ntdll.dll": 2}}), encoding="utf-8")
+
+        redact_session.copy_metadata(source, destination, False)
+        meta = (destination / "session_meta.json").read_text(encoding="utf-8")
+        summary = (destination / "summary.json").read_text(encoding="utf-8")
+        check("Users" not in meta and "alice" not in meta,
+              "redacted session metadata still contains a profile path")
+        check("Users" not in summary and "alice" not in summary,
+              "redacted summary still contains a profile path")
+        data = json.loads(summary)
+        check(data["by_module"]["<redacted-path>"] == 3 and
+              data["by_module"][r"C:\Windows\System32\ntdll.dll"] == 2,
+              "redacted by_module keys keep their counts")
+
+        kept = root / "kept"
+        kept.mkdir()
+        redact_session.copy_metadata(source, kept, True)
+        check("alice" in (kept / "session_meta.json").read_text(encoding="utf-8") and
+              "alice" in (kept / "summary.json").read_text(encoding="utf-8"),
+              "--keep-paths preserves metadata paths")
+
+    with tempfile.TemporaryDirectory() as temporary:
+        root = pathlib.Path(temporary)
+        source = root / "session"
+        source.mkdir()
+        destination = root / "redacted"
+        meta = {
+            "session_uuid": "00000000-0000-0000-0000-000000000001",
+            "session_id": 1,
+            "test_id": "c39",
+            "scenario": "test",
+            "phase": "steady",
+            "machine_label": "vm",
+            "started_utc": "2026-11-02T10:00:00Z",
+            "ended_utc": "2026-11-02T10:00:01Z",
+            "outcome": "completed",
+            "client_version": "1",
+            "agent_sha256": "",
+            "driver_sha256": "",
+            "build_commit": "",
+            "config": {"payload_mode": "metadata", "etw": False,
+                       "queue_records": 1, "queue_bytes": 1},
+            "client_root": r"C:\Users\alice\Nexon",
+            "scope_root": r"C:\Users\alice\Nexon\appdata",
+        }
+        event = {
+            "protocol": 1, "schema_version": 1, "source": "driver", "sequence": 1,
+            "timestamp": "2026-11-02T10:00:00.000Z", "session_id": 1, "type_id": 1,
+            "type": "file_read", "process_id": 7, "flags": 0, "status": 0,
+            "category": "client_data", "outside_client": False,
+            "attribution": "process_only", "value0": 0, "value1": 0,
+            "operation_id": 0, "text": r"C:\client.exe", "detail": "read",
+            "component": "",
+            "modules": [r"\Device\HarddiskVolume3\Users\alice\AppData\Local\evil.dll"],
+        }
+        (source / "session_meta.json").write_text(json.dumps(meta), encoding="utf-8")
+        (source / "summary.json").write_text(json.dumps({
+            "events": 1,
+            "by_module": {r"C:\Users\alice\Nexon\evil.dll": 1}}), encoding="utf-8")
+        (source / "events.jsonl").write_text(json.dumps(event) + "\n", encoding="utf-8")
+
+        old_argv = sys.argv
+        sys.argv = ["redact_session.py", str(source), "--output", str(destination),
+                    "--no-compress"]
+        try:
+            result = redact_session.main()
+        finally:
+            sys.argv = old_argv
+        check(result == 0, f"redacted bundle main succeeds ({result})")
+        for name in ("events.jsonl", "session_meta.json", "summary.json"):
+            text = (destination / name).read_text(encoding="utf-8")
+            check("Users" not in text and "alice" not in text,
+                  f"{name} in the redacted bundle still contains a profile path")
+
+        kept = root / "kept"
+        sys.argv = ["redact_session.py", str(source), "--output", str(kept),
+                    "--no-compress", "--keep-paths"]
+        try:
+            result = redact_session.main()
+        finally:
+            sys.argv = old_argv
+        check(result == 0, f"redacted bundle main with --keep-paths succeeds ({result})")
+        check("alice" in (kept / "events.jsonl").read_text(encoding="utf-8") and
+              "alice" in (kept / "session_meta.json").read_text(encoding="utf-8") and
+              "alice" in (kept / "summary.json").read_text(encoding="utf-8"),
+              "--keep-paths preserves the full bundle")
+
     print("redact_session regression passed")
 
 

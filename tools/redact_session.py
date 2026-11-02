@@ -17,6 +17,12 @@ PACK = ROOT / "tools" / "session_pack.py"
 # survive into a bundle that is handed to someone else. IPv6 needs at least
 # four groups (or a "::") so clock times such as 10:00:21 are left alone.
 IDENTIFYING = re.compile(r"\\Users\\[^\\]+|S-1-5-21(?:-\d+){3,}", re.I)
+# The WFP formatter writes IPv6 as exactly eight uncompressed groups followed
+# directly by ":port" (driver/network.c), which the general expression below
+# cannot match: the port's ':' also looks like a group separator.
+IPV6_UNCOMPRESSED = re.compile(
+    r"(?<![0-9A-Fa-f:])\[?(?:[0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}\]?(?::\d{1,5})?(?![0-9A-Fa-f:])"
+)
 IP_LITERAL = re.compile(
     r"\b(?:\d{1,3}\.){3}\d{1,3}\b"
     r"|(?<![0-9A-Fa-f:])(?:(?:[0-9A-Fa-f]{1,4}:){3,7}[0-9A-Fa-f]{1,4}|[0-9A-Fa-f:]*::[0-9A-Fa-f:]*)"
@@ -29,7 +35,33 @@ def redact_identifying(text):
         return text
     if IDENTIFYING.search(text):
         return "<redacted-path>"
+    text = IPV6_UNCOMPRESSED.sub("<redacted-ip>", text)
     return IP_LITERAL.sub("<redacted-ip>", text)
+
+
+def redact_value(value, keep_paths):
+    """Apply redact_identifying to every string in a JSON-shaped value.
+
+    Dictionary keys are transformed too (summary.by_module is keyed by full
+    module paths); numeric collisions are summed so two profile-path modules
+    keep their combined count.
+    """
+    if isinstance(value, str):
+        return value if keep_paths else redact_identifying(value)
+    if isinstance(value, list):
+        return [redact_value(item, keep_paths) for item in value]
+    if isinstance(value, dict):
+        redacted = {}
+        for key, item in value.items():
+            new_key = redact_value(key, keep_paths) if isinstance(key, str) else key
+            new_item = redact_value(item, keep_paths)
+            if (new_key in redacted and isinstance(redacted[new_key], (int, float))
+                    and isinstance(new_item, (int, float))):
+                redacted[new_key] += new_item
+            else:
+                redacted[new_key] = new_item
+        return redacted
+    return value
 
 
 
@@ -64,9 +96,30 @@ def redact_record(record, keep_paths, keep_commands):
         for field in ("text", "detail"):
             if field in record:
                 record[field] = redact_identifying(record[field])
+        if isinstance(record.get("modules"), list):
+            record["modules"] = [redact_value(module, False) for module in record["modules"]]
     if not keep_commands and record.get("type") == "process_start":
         record["detail"] = "<redacted-command-line>"
     return record
+
+
+METADATA_FILES = ("session_meta.json", "summary.json", "coverage.json",
+                  "sensor-usage.json", "scenario_results.json")
+
+
+def copy_metadata(source, destination, keep_paths):
+    """Copy the sidecar JSON, redacting every string when paths are not kept."""
+    for name in METADATA_FILES:
+        path = source / name
+        if not path.exists():
+            continue
+        output = destination / name
+        if keep_paths:
+            shutil.copy2(path, output)
+            continue
+        metadata = json.loads(path.read_text(encoding="utf-8"))
+        output.write_text(json.dumps(redact_value(metadata, False), indent=2) + "\n",
+                          encoding="utf-8")
 
 
 def rewrite(parts, destination, keep_paths, keep_commands):
@@ -113,10 +166,7 @@ def main():
     parts = [path for _, path in sorted(parts)]
 
     chain, count = rewrite(parts, destination, args.keep_paths, args.keep_commands)
-    for name in ("session_meta.json", "summary.json", "coverage.json", "sensor-usage.json", "scenario_results.json"):
-        path = source / name
-        if path.exists():
-            shutil.copy2(path, destination / name)
+    copy_metadata(source, destination, args.keep_paths)
     meta_path = destination / "session_meta.json"
     meta = json.loads(meta_path.read_text(encoding="utf-8"))
     meta["redacted"] = True
