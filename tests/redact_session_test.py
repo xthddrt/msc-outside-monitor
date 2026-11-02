@@ -10,6 +10,7 @@ bundle, so this drives the production redact_record through rewrite().
 import json
 import pathlib
 import re
+import subprocess
 import sys
 import tempfile
 
@@ -106,6 +107,9 @@ def main():
             {"type": "network_connect", "timestamp": "t3", "process_id": 7,
              "text": "10.0.0.5:52000 -> 1.2.3.4:443",
              "detail": "tcp"},
+            {"type": "file_read", "timestamp": "t4", "process_id": 7,
+             "text": "C:\\client.exe",
+             "detail": "\\Device\\HarddiskVolume3\\Users\\alice\\Documents\\notes.txt"},
         ]
         with open(source / "events.jsonl", "w", encoding="utf-8") as stream:
             for record in identifying:
@@ -120,6 +124,9 @@ def main():
         check(redacted[1]["text"] == "<redacted-path>", "a user SID path is replaced")
         check(redacted[2]["text"] == "<redacted-ip>:52000 -> <redacted-ip>:443",
               "network endpoints are replaced")
+        check(redacted[3]["text"] == "C:\\client.exe" and
+              redacted[3]["detail"] == "<redacted-path>",
+              "a profile path in detail replaces the whole field")
 
         kept = root / "kept"
         kept.mkdir()
@@ -128,8 +135,39 @@ def main():
         kept_records = [json.loads(line) for line in kept_text.splitlines() if line.strip()]
         check(kept_records[0]["text"] == identifying[0]["text"] and
               kept_records[1]["text"] == identifying[1]["text"] and
-              kept_records[2]["text"] == identifying[2]["text"],
+              kept_records[2]["text"] == identifying[2]["text"] and
+              kept_records[3]["detail"] == identifying[3]["detail"],
               "--keep-paths leaves paths and endpoints intact")
+    with tempfile.TemporaryDirectory() as temporary:
+        root = pathlib.Path(temporary)
+        source = root / "session"
+        source.mkdir()
+        destination = root / "redacted"
+        destination.mkdir()
+        # Both record types legitimately omit text/detail; redaction must not add
+        # null values, which the event schema (string) and session_pack reject.
+        observers = [
+            {"type": "observer_sequence_gap", "source": "etw", "after_sequence": 10,
+             "before_sequence": 13, "missing_events": 2},
+            {"type": "observer_summary", "session_id": 1, "events": 2},
+        ]
+        with open(source / "events.jsonl", "w", encoding="utf-8") as stream:
+            for record in observers:
+                stream.write(json.dumps(record) + "\n")
+
+        redact_session.rewrite([source / "events.jsonl"], destination, False, False)
+        output = destination / "events.jsonl"
+        text = output.read_text(encoding="utf-8")
+        redacted = [json.loads(line) for line in text.splitlines() if line.strip()]
+        check(all("text" not in record and "detail" not in record for record in redacted),
+              "redaction must not add null text/detail to a record that omits them")
+        validation = subprocess.run(
+            [sys.executable,
+             str(pathlib.Path(__file__).resolve().parents[1] / "tools" / "validate_schema.py"),
+             str(output)],
+            capture_output=True, text=True)
+        check(validation.returncode == 0,
+              "the redacted events fail schema validation: " + validation.stdout + validation.stderr)
     print("redact_session regression passed")
 
 
