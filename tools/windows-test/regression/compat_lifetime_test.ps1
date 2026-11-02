@@ -49,6 +49,15 @@ function Stop-Legacy {
     Start-Sleep -Milliseconds 300
 }
 
+function Invoke-LegacyCtl([string[]]$Arguments) {
+    $process = Start-Process $ctl -ArgumentList $Arguments -PassThru -WindowStyle Hidden
+    if (-not $process.WaitForExit(10000)) {
+        Stop-Process -Id $process.Id -Force
+        throw "sysinfoctl $($Arguments -join ' ') did not return within 10 seconds"
+    }
+    if ($process.ExitCode -ne 0) { throw "sysinfoctl $($Arguments -join ' ') failed with $($process.ExitCode)" }
+}
+
 function Bugchecks {
     Get-WinEvent -FilterHashtable @{ LogName = 'System'; Id = 1001;
                                     StartTime = (Get-Date).AddSeconds(-30) } -ErrorAction SilentlyContinue
@@ -83,14 +92,26 @@ try {
         # MON_CONFIG is delivered through the hooked NtDeviceIoControlFile: a
         # quiesce that waits for the caller's own detour never returns and
         # blocks the next configuration and the service stop.
-        $unsafe = Start-Process $ctl -ArgumentList @('mon', 'on', 'unsafe') -PassThru -WindowStyle Hidden
-        if (-not $unsafe.WaitForExit(30000)) { Stop-Process -Id $unsafe.Id -Force; throw 'mon on unsafe hung' }
-        foreach ($arguments in @(@('mon', 'on'), @('mon', 'off'))) {
-            $reconfigure = Start-Process $ctl -ArgumentList $arguments -PassThru -WindowStyle Hidden
-            if (-not $reconfigure.WaitForExit(30000)) {
-                Stop-Process -Id $reconfigure.Id -Force
-                throw "mon $($arguments -join ' ') hung with inline hooks enabled"
+        Invoke-LegacyCtl @('mon', 'on', 'unsafe')
+        Invoke-LegacyCtl @('mon', 'off')
+        Invoke-LegacyCtl @('mon', 'collect', (Join-Path $work 'unsafe-events.json'))
+        Invoke-LegacyCtl @('mon', 'on', 'unsafe')
+        # Two overlapping configurations: the mutex holder must not drain for
+        # the caller parked behind it, or both sleep forever and unload hangs.
+        foreach ($pair in @(@(@('mon', 'off'), @('mon', 'collect', (Join-Path $work 'race-events.json'))),
+                            @(@('mon', 'off'), @('mon', 'on')))) {
+            $first = Start-Process $ctl -ArgumentList $pair[0] -PassThru -WindowStyle Hidden
+            $second = Start-Process $ctl -ArgumentList $pair[1] -PassThru -WindowStyle Hidden
+            foreach ($process in $first, $second) {
+                if (-not $process.WaitForExit(10000)) {
+                    Stop-Process -Id $process.Id -Force
+                    throw "concurrent mon $($pair[0] -join ' ') / mon $($pair[1] -join ' ') hung with inline hooks enabled"
+                }
             }
+            if ($first.ExitCode -ne 0 -or $second.ExitCode -ne 0) {
+                throw 'a concurrent configuration failed with inline hooks enabled'
+            }
+            Invoke-LegacyCtl @('mon', 'on', 'unsafe')
         }
         Stop-Legacy
         Start-Legacy

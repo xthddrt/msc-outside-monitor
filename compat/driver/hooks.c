@@ -376,6 +376,14 @@ static KSPIN_LOCK g_HookThreadLock;
 static BOOLEAN g_HookThreadsInitialized;
 static volatile LONG g_HookThreadsUntracked;
 
+/*
+ * Control callers parked on g_MonConfigMutex are still inside the hooked
+ * NtDeviceIoControlFile detour, and the mutex holder is about to drain them.
+ * One parked caller per entry: it has already left the trampoline and is only
+ * waiting on driver state, so its frame must not be drained for.
+ */
+static volatile LONG g_HookControlWaiters;
+
 VOID
 HookInitialize(VOID)
 {
@@ -383,7 +391,28 @@ HookInitialize(VOID)
     InitializeListHead(&g_HookThreads);
     KeInitializeSpinLock(&g_HookThreadLock);
     InterlockedExchange(&g_HookThreadsUntracked, 0);
+    InterlockedExchange(&g_HookControlWaiters, 0);
     g_HookThreadsInitialized = TRUE;
+}
+
+/* Frames that must still be drained: every frame but the parked control ones. */
+static LONG
+HookCountedFrames(VOID)
+{
+    return InterlockedCompareExchange(&g_InHook, 0, 0) -
+           InterlockedCompareExchange(&g_HookControlWaiters, 0, 0);
+}
+
+VOID
+HookControlWaitEnter(VOID)
+{
+    InterlockedIncrement(&g_HookControlWaiters);
+}
+
+VOID
+HookControlWaitLeave(VOID)
+{
+    InterlockedDecrement(&g_HookControlWaiters);
 }
 
 /* Unload-only: the calling thread is not inside a detour, so every frame can be
@@ -505,7 +534,8 @@ HookQuiesce(VOID)
     }
     KeReleaseSpinLock(&g_HookThreadLock, oldIrql);
 
-    while (InterlockedCompareExchange(&g_InHook, 0, 0) > ownDepth) {
+    /* Parked control callers are excluded; their frames cannot run trampolines. */
+    while (HookCountedFrames() > ownDepth) {
         LARGE_INTEGER interval;
 
         interval.QuadPart = -10000;

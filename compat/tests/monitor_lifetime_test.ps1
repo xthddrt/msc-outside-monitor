@@ -17,11 +17,24 @@ $quiesce = Body $hooks 'HookQuiesce(VOID)' 'SysinfoPatchMethod'
 if ($quiesce.Contains('while (g_InHook != 0)')) {
     throw 'detour quiesce still waits for the caller''s own detour'
 }
-if (-not ($quiesce -match 'g_InHook[\s\S]{0,40}>\s*ownDepth')) {
-    throw 'detour quiesce does not exclude the caller''s own depth'
+if (-not $quiesce.Contains('while (HookCountedFrames() > ownDepth)')) {
+    throw 'detour quiesce does not exclude own depth and parked control callers'
+}
+$counted = Body $hooks 'HookCountedFrames(VOID)' 'HookControlWaitEnter(VOID)'
+if (-not $counted.Contains('g_InHook') -or -not $counted.Contains('g_HookControlWaiters') -or
+    $counted.IndexOf('g_InHook') -gt $counted.IndexOf('g_HookControlWaiters')) {
+    throw 'quiesce does not subtract the parked control waiters from the drain'
 }
 if ($quiesce.Contains('maxMilliseconds')) {
     throw 'detour quiesce is not unbounded'
+}
+$config = Body $monitor 'MonConfigure(_In_ const SYSINFO_MON_CONFIG *config)' 'MonQuery('
+$park = $config.IndexOf('HookControlWaitEnter()')
+$mutex = $config.IndexOf('KeWaitForSingleObject(&g_MonConfigMutex')
+$unpark = $config.IndexOf('HookControlWaitLeave()')
+$disable = $config.IndexOf('TraceSetUnsafeHooksEnabled(0)')
+if ($park -lt 0 -or $mutex -lt $park -or $unpark -lt $mutex -or $disable -lt $unpark) {
+    throw 'MON_CONFIG does not exempt itself only while parked on the config mutex'
 }
 $enter = Body $hooks 'HookEnter(VOID)' 'HookLeave(VOID)'
 $leave = Body $hooks 'HookLeave(VOID)' 'HookQuiesce(VOID)'
@@ -32,6 +45,17 @@ if (-not $enter.Contains('KeGetCurrentThread()') -or -not $enter.Contains('Depth
 if (-not $enter.Contains('InterlockedIncrement(&g_InHook)') -or
     -not $leave.Contains('InterlockedDecrement(&g_InHook)')) {
     throw 'detour enter/leave does not balance the global count'
+}
+# One allocation per thread, not one per detour, and a counted fallback when it fails.
+if ([regex]::Matches($enter, 'ExAllocatePool2\(').Count -ne 1) {
+    throw 'detour entry allocates a depth record on every call instead of once per thread'
+}
+if (-not $enter.Contains('InterlockedIncrement(&g_HookThreadsUntracked)')) {
+    throw 'a missing depth record is not counted as untracked'
+}
+if (-not $quiesce.Contains('g_HookThreadsUntracked, 0, 0) != 0') -or
+    -not $quiesce.Contains('return FALSE;')) {
+    throw 'quiesce waits or frees when the caller''s depth is unknown'
 }
 if (-not $hooks.Contains('HookInitialize(VOID)') -or
     -not $hooks.Contains('KeInitializeSpinLock(&g_HookThreadLock')) {

@@ -1349,7 +1349,10 @@ MonConfigure(_In_ const SYSINFO_MON_CONFIG *config)
     SYSINFO_MON_EVENT *ring;
     NTSTATUS status = STATUS_SUCCESS;
 
+    /* Exempt this frame while parked: the mutex holder must not drain for it. */
+    HookControlWaitEnter();
     (VOID)KeWaitForSingleObject(&g_MonConfigMutex, Executive, KernelMode, FALSE, NULL);
+    HookControlWaitLeave();
     TraceSetUnsafeHooksEnabled(0);
     if (config->Enable == 0) {
         InterlockedExchange(&g_Enabled, 0);
