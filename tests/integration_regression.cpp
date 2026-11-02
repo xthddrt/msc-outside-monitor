@@ -28,6 +28,19 @@ int main()
     processScope.AddProcess(41, 200, L"C:\\new-client.exe");
     ok &= Check(processScope.Path(41, 100).empty() && processScope.Path(41, 200) == L"C:\\new-client.exe",
                 "a reused PID cannot lend its new path to the old incarnation");
+    /* #76: the exit record was dropped, so 42@100 is still known when Windows
+     * reuses the PID for an incarnation whose start carries no image name. */
+    {
+        ProcessScope reused;
+        reused.AddProcess(42, 100, L"C:\\old.exe");
+        reused.AddProcess(42, 200, L"");
+        ok &= Check(reused.Path(42, 200).empty() && reused.Path(42, 100).empty(),
+                    "an empty process-start text cannot inherit the old incarnation's path");
+        reused.AddProcess(42, 200, L"C:\\new.exe");
+        reused.AddProcess(42, 200, L"");
+        ok &= Check(reused.Path(42, 200) == L"C:\\new.exe",
+                    "a repeated start record keeps its own incarnation's path");
+    }
     ok &= Check(ProcessScope::ValidParentIncarnation(100, 100, 100),
                 "snapshot inheritance accepts the exact parent incarnation");
     ok &= Check(!ProcessScope::ValidParentIncarnation(100, 101, 100) &&

@@ -29,7 +29,12 @@ void ProcessScope::AddProcess(DWORD pid, uint64_t startTime, const std::wstring&
 {
     std::lock_guard<std::mutex> lock(mutex_);
     auto& process = processes_[pid];
-    if (process.startTime != startTime) process.modules.clear();
+    /* A new incarnation owns nothing of the old one, including its image: an
+     * empty process-start text must not inherit the dead process's path. */
+    if (process.startTime != startTime) {
+        process.modules.clear();
+        process.path.clear();
+    }
     process.startTime = startTime;
     if (!path.empty()) process.path = path;
     auto early = earlyImages_.find(pid);

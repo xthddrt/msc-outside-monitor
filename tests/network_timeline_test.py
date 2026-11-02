@@ -58,6 +58,42 @@ def main():
         assert "old.exe" in old_flow and "new.exe" not in old_flow, output
         assert "new.exe" in new_start and "old.exe" not in new_start, output
         assert "10:00:05.000 -> 10:00:08.000" in output, output
+
+    # #75: the flow is logged before its process_start arrives. The row and the
+    # flow entry must keep the incarnation and be labelled old.exe once the
+    # delayed start has been read, and a later reuse of PID 42 must not relabel it.
+    with tempfile.TemporaryDirectory() as temporary:
+        bundle = pathlib.Path(temporary)
+        delayed = [
+            {"type": "network_flow_established", "process_id": 42, "process_start_time": 100,
+             "text": "10.0.0.5:52001 -> 203.0.113.13:443", "value0": 900,
+             "timestamp": "2026-11-01T10:00:00.000Z"},
+            {"type": "process_start", "process_id": 42, "process_start_time": 100,
+             "process_path": r"C:\old.exe", "text": r"C:\old.exe",
+             "timestamp": "2026-11-01T10:00:01.000Z"},
+            {"type": "process_start", "process_id": 42, "process_start_time": 200,
+             "process_path": r"C:\new.exe", "text": r"C:\new.exe",
+             "timestamp": "2026-11-01T10:00:02.000Z"},
+        ]
+        with open(bundle / "events.jsonl", "w", encoding="utf-8", newline="\n") as stream:
+            for event in delayed:
+                stream.write(json.dumps(event, separators=(",", ":")) + "\n")
+        result = subprocess.run([sys.executable, str(TOOL), str(bundle)],
+                                capture_output=True, text=True)
+        if result.returncode != 0:
+            raise SystemExit(f"network_timeline failed: {result.stderr}")
+        output = result.stdout
+        rows, _, flows = output.partition("== flows (established -> closed, UTC)")
+        named = {}
+        for line in rows.splitlines():
+            parts = line.split()
+            if len(parts) >= 2:
+                named[parts[0]] = parts[1]
+        assert named.get("10:00:00.000") == "old.exe", (named, output)
+        assert named.get("10:00:01.000") == "old.exe", (named, output)
+        assert named.get("10:00:02.000") == "new.exe", (named, output)
+        assert "10:00:00.000 -> open at stop  old.exe" in flows, flows
+        assert "-> open at stop  42" not in flows, flows
     print("network timeline regression passed")
     return 0
 
