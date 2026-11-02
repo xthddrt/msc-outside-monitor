@@ -10,6 +10,7 @@ static const GUID MSMON_DEVICE_GUID = { 0xdb6a8ad5, 0xc08e, 0x4f95, { 0x8d, 0x15
  * acquisitions, waits for the ones in flight, then marks the rundown complete.
  */
 static EX_RUNDOWN_REF gIoRundown;
+static KMUTEX gSessionMutex;
 
 static NTSTATUS MsMonCompleteIrp(PIRP Irp, NTSTATUS Status, ULONG_PTR Information)
 {
@@ -35,8 +36,14 @@ static NTSTATUS MsMonStartSession(PMSMON_SESSION_CONFIG Config, ULONG InputLengt
     ULONG rootCount = 0;
     ULONG index;
     NTSTATUS status;
-    SIZE_T length = wcsnlen(Config->ClientRoot, MSMON_CLIENT_PATH_CHARS);
-    if (length == 0 || length == MSMON_CLIENT_PATH_CHARS) return STATUS_INVALID_PARAMETER;
+    SIZE_T length;
+
+    (VOID)KeWaitForSingleObject(&gSessionMutex, Executive, KernelMode, FALSE, NULL);
+    length = wcsnlen(Config->ClientRoot, MSMON_CLIENT_PATH_CHARS);
+    if (length == 0 || length == MSMON_CLIENT_PATH_CHARS) {
+        status = STATUS_INVALID_PARAMETER;
+        goto Done;
+    }
     roots[rootCount].Buffer = Config->ClientRoot;
     roots[rootCount].Length = (USHORT)(length * sizeof(WCHAR));
     roots[rootCount].MaximumLength = roots[rootCount].Length;
@@ -45,7 +52,10 @@ static NTSTATUS MsMonStartSession(PMSMON_SESSION_CONFIG Config, ULONG InputLengt
     if (InputLength >= sizeof(MSMON_SESSION_CONFIG)) {
         for (index = 0; index < MSMON_EXTRA_ROOTS; index++) {
             length = wcsnlen(Config->ExtraRoots[index], MSMON_CLIENT_PATH_CHARS);
-            if (length == MSMON_CLIENT_PATH_CHARS) return STATUS_INVALID_PARAMETER;
+            if (length == MSMON_CLIENT_PATH_CHARS) {
+                status = STATUS_INVALID_PARAMETER;
+                goto Done;
+            }
             if (length == 0) continue;
             roots[rootCount].Buffer = Config->ExtraRoots[index];
             roots[rootCount].Length = (USHORT)(length * sizeof(WCHAR));
@@ -56,7 +66,7 @@ static NTSTATUS MsMonStartSession(PMSMON_SESSION_CONFIG Config, ULONG InputLengt
     MsMonProcessStopSession();
     MsMonEventsStop();
     status = MsMonEventsStart(Config->SessionId, Config->QueueRecords, Config->QueueBytes, Config->PayloadMode);
-    if (!NT_SUCCESS(status)) return status;
+    if (!NT_SUCCESS(status)) goto Done;
     status = MsMonProcessStartSession(roots, rootCount);
     if (NT_SUCCESS(status)) status = MsMonAttributionRefresh();
     if (NT_SUCCESS(status) && !MsMonObjectAvailable()) {
@@ -81,6 +91,8 @@ static NTSTATUS MsMonStartSession(PMSMON_SESSION_CONFIG Config, ULONG InputLengt
         MsMonProcessStopSession();
         MsMonEventsStop();
     }
+Done:
+    KeReleaseMutex(&gSessionMutex, FALSE);
     return status;
 }
 
@@ -107,14 +119,18 @@ static NTSTATUS MsMonDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
         status = MsMonStartSession((PMSMON_SESSION_CONFIG)Irp->AssociatedIrp.SystemBuffer, inputLength);
         break;
     case MSMON_IOCTL_STOP_SESSION:
+        (VOID)KeWaitForSingleObject(&gSessionMutex, Executive, KernelMode, FALSE, NULL);
         MsMonAttributionStop();
         MsMonProcessStopSession();
         MsMonEventsStop();
+        KeReleaseMutex(&gSessionMutex, FALSE);
         status = STATUS_SUCCESS;
         break;
     case MSMON_IOCTL_STOP_TRACKING:
+        (VOID)KeWaitForSingleObject(&gSessionMutex, Executive, KernelMode, FALSE, NULL);
         MsMonAttributionStop();
         MsMonProcessStopSession();
+        KeReleaseMutex(&gSessionMutex, FALSE);
         status = STATUS_SUCCESS;
         break;
     case MSMON_IOCTL_REFRESH_MODULES:
@@ -234,6 +250,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 
     UNREFERENCED_PARAMETER(RegistryPath);
     ExInitializeRundownProtection(&gIoRundown);
+    KeInitializeMutex(&gSessionMutex, 0);
     DriverObject->MajorFunction[IRP_MJ_CREATE] = MsMonCreateClose;
     DriverObject->MajorFunction[IRP_MJ_CLOSE] = MsMonCreateClose;
     DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = MsMonDeviceControl;

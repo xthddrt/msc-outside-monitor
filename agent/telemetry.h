@@ -59,6 +59,7 @@ public:
     bool IsTracked(DWORD pid, uint64_t expectedStartTime = 0) const;
     uint64_t StartTime(DWORD pid) const;
     std::wstring Path(DWORD pid) const;
+    std::wstring Path(DWORD pid, uint64_t expectedStartTime) const;
     std::vector<std::wstring> ResolveStack(DWORD pid, const uint64_t* addresses, size_t count,
                                            size_t* unresolved = nullptr) const;
 

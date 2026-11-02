@@ -1363,10 +1363,10 @@ MonConfigure(_In_ const SYSINFO_MON_CONFIG *config)
 
         RtlZeroMemory(ring, MON_RING_EVENTS * sizeof(SYSINFO_MON_EVENT));
         KeInitializeSpinLock(&g_Lock);
-        g_Ring = ring;
         g_Cap = MON_RING_EVENTS;
         g_Head = 0;
         g_Tail = 0;
+        g_Ring = ring;
         InterlockedExchange(&g_Dropped, 0);
     }
 

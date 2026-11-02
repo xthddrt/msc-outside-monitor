@@ -112,6 +112,33 @@ def main():
         assert outside.returncode == 0, outside.stderr
         assert "NewKey" in outside.stdout and "create" in outside.stdout, outside.stdout
 
+        health = subprocess.run(
+            [sys.executable, str(ANALYSIS / "session_health.py"), str(bundle)],
+            capture_output=True, text=True, check=False,
+        )
+        assert health.returncode == 0, health.stderr
+        health_rows = [line for line in health.stdout.splitlines()
+                       if "old.exe" in line or "new.exe" in line]
+        assert any("42@100" in line and "old.exe" in line for line in health_rows), health.stdout
+        assert any("42@200" in line and "new.exe" in line for line in health_rows), health.stdout
+
+    with tempfile.TemporaryDirectory() as temporary:
+        bundle = pathlib.Path(temporary)
+        out_of_order = [
+            event("process_start", 42, 200, r"C:\new.exe", "2026-01-01T00:00:02.000Z"),
+            event("process_start", 42, 100, r"C:\old.exe", "2026-01-01T00:00:03.000Z"),
+            event("kfilter_decision", 42, 0, r"\Device\Nsi", "2026-01-01T00:00:03.500Z",
+                  component="kfilter.sys", detail="target=device;action=deny;ioctl=0x00000000"),
+        ]
+        with open(bundle / "events.jsonl", "w", encoding="utf-8", newline="\n") as stream:
+            for record in out_of_order:
+                stream.write(json.dumps(record, separators=(",", ":")) + "\n")
+        report = session_activity.report(session_activity.collect(bundle), bundle, 40)
+        rows = {(row["pid"], row["process_start_time"]): row for row in report["processes"]}
+        assert set(rows) == {(42, 100), (42, 200)}, rows.keys()
+        assert dict(rows[(42, 200)]["types"])["kfilter_decision"] == 1, rows[(42, 200)]
+        assert "kfilter_decision" not in dict(rows[(42, 100)]["types"]), rows[(42, 100)]
+
     print("activity analysis regression passed")
     return 0
 

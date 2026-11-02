@@ -1450,10 +1450,7 @@ int wmain(int argc, wchar_t** argv)
             previousEtwSequence = event.header.Sequence;
         }
         if (event.processPath.empty() && event.header.ProcessId != 0) {
-            uint64_t start = scope.StartTime(event.header.ProcessId);
-            if (event.header.ProcessStartTime == 0 || start == 0 || start == event.header.ProcessStartTime) {
-                event.processPath = scope.Path(event.header.ProcessId);
-            }
+            event.processPath = scope.Path(event.header.ProcessId, event.header.ProcessStartTime);
         }
         classifier.Classify(event);
         AccountSessionEvent(summary, event, totalEvents, eventCounts);
@@ -1583,7 +1580,7 @@ int wmain(int argc, wchar_t** argv)
                     scope.AddProcess(event.header.ProcessId, start, event.text);
                     if (etw) etw->ReplayProcess(event.header.ProcessId);
                 } else if (event.header.Type == MsMonProcessExit) {
-                    event.processPath = scope.Path(event.header.ProcessId);
+                    event.processPath = scope.Path(event.header.ProcessId, event.header.ProcessStartTime);
                     scope.RemoveProcess(event.header.ProcessId, event.header.ProcessStartTime);
                 } else if (event.header.Type == MsMonImageLoad) {
                     scope.AddImage(event.header.ProcessId, event.header.ProcessStartTime,

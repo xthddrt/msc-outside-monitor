@@ -99,6 +99,14 @@ std::wstring ProcessScope::Path(DWORD pid) const
     return found == processes_.end() ? std::wstring() : found->second.path;
 }
 
+std::wstring ProcessScope::Path(DWORD pid, uint64_t expectedStartTime) const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto found = processes_.find(pid);
+    return expectedStartTime != 0 && found != processes_.end() &&
+           found->second.startTime == expectedStartTime ? found->second.path : std::wstring();
+}
+
 std::vector<std::wstring> ProcessScope::ResolveStack(DWORD pid, const uint64_t* addresses, size_t count,
                                                      size_t* unresolved) const
 {

@@ -21,6 +21,13 @@ int main()
     ok &= Check(processScope.IsTracked(41, 100), "tracked PID accepts its process incarnation");
     ok &= Check(!processScope.IsTracked(41, 101), "tracked PID rejects a reused incarnation");
     ok &= Check(!processScope.IsTracked(42, 100), "unknown PID is not tracked");
+    ok &= Check(processScope.Path(41, 100) == L"C:\\client.exe",
+                "a process path is borrowed only for the exact incarnation");
+    ok &= Check(processScope.Path(41, 0).empty() && processScope.Path(41, 101).empty(),
+                "start-less and mismatched records cannot borrow a process path");
+    processScope.AddProcess(41, 200, L"C:\\new-client.exe");
+    ok &= Check(processScope.Path(41, 100).empty() && processScope.Path(41, 200) == L"C:\\new-client.exe",
+                "a reused PID cannot lend its new path to the old incarnation");
     ok &= Check(ProcessScope::ValidParentIncarnation(100, 100, 100),
                 "snapshot inheritance accepts the exact parent incarnation");
     ok &= Check(!ProcessScope::ValidParentIncarnation(100, 101, 100) &&

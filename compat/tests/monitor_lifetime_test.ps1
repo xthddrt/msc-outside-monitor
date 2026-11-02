@@ -60,4 +60,12 @@ $give = $summary.IndexOf('KeReleaseSpinLock(&g_SumLock')
 if ($take -lt 0 -or $copy -lt $take -or $give -lt $copy) {
     throw 'summary is not copied under g_SumLock'
 }
+$publish = $config.IndexOf('g_Ring = ring;')
+$capacity = $config.IndexOf('g_Cap = MON_RING_EVENTS;')
+$head = $config.IndexOf('g_Head = 0;')
+$tail = $config.IndexOf('g_Tail = 0;')
+if ($publish -lt 0 -or $capacity -lt 0 -or $head -lt 0 -or $tail -lt 0 -or
+    $capacity -gt $publish -or $head -gt $publish -or $tail -gt $publish) {
+    throw 'ring is published before its capacity and cursors'
+}
 Write-Host 'monitor lifetime regression passed'

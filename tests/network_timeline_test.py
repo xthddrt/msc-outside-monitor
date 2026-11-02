@@ -25,6 +25,18 @@ def main():
             {"type": "network_flow_established", "timestamp": "2026-11-01T10:00:03.000Z",
              "process_id": 7, "text": "10.0.0.5:52000 -> 203.0.113.11:443",
              "detail": "protocol/local/remote", "value0": 102, "value1": PACKED_PORTS},
+            {"type": "process_start", "process_id": 42, "process_start_time": 100,
+             "process_path": r"C:\old.exe", "text": r"C:\old.exe", "timestamp": "2026-11-01T10:00:04.000Z"},
+            {"type": "network_flow_established", "process_id": 42, "process_start_time": 100,
+             "process_path": r"C:\old.exe", "text": "10.0.0.5:52000 -> 203.0.113.12:443",
+             "value0": 103, "timestamp": "2026-11-01T10:00:05.000Z"},
+            {"type": "process_exit", "process_id": 42, "process_start_time": 100,
+             "text": "", "timestamp": "2026-11-01T10:00:06.000Z"},
+            {"type": "process_start", "process_id": 42, "process_start_time": 200,
+             "process_path": r"C:\new.exe", "text": r"C:\new.exe", "timestamp": "2026-11-01T10:00:07.000Z"},
+            {"type": "network_flow_close", "process_id": 42, "process_start_time": 200,
+             "process_path": r"C:\new.exe", "text": "10.0.0.5:52000 -> 203.0.113.12:443",
+             "value0": 103, "timestamp": "2026-11-01T10:00:08.000Z"},
         ]
         with open(bundle / "events.jsonl", "w", encoding="utf-8", newline="\n") as stream:
             for event in events:
@@ -38,6 +50,14 @@ def main():
         assert "flow=102" in output, "the second flow id is not shown"
         assert "10:00:01.000 -> 10:00:02.000" in output, "the first flow lost its close time"
         assert "10:00:03.000 -> open at stop" in output, "the second flow is missing"
+        assert "old.exe" in output, "PID reuse relabeled the old process and its flow"
+        old_start = next(line for line in output.splitlines() if "START" in line and r"C:\old.exe" in line)
+        old_flow = next(line for line in output.splitlines() if "flow=103" in line and "->" in line)
+        new_start = next(line for line in output.splitlines() if "START" in line and r"C:\new.exe" in line)
+        assert "old.exe" in old_start and "new.exe" not in old_start, output
+        assert "old.exe" in old_flow and "new.exe" not in old_flow, output
+        assert "new.exe" in new_start and "old.exe" not in new_start, output
+        assert "10:00:05.000 -> 10:00:08.000" in output, output
     print("network timeline regression passed")
     return 0
 
