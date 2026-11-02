@@ -71,7 +71,7 @@ NTSTATUS MsMonImageInitialize(VOID);
 VOID MsMonProcessUninitialize(VOID);
 NTSTATUS MsMonProcessStartSession(PCUNICODE_STRING Roots, ULONG RootCount);
 VOID MsMonProcessStopSession(VOID);
-NTSTATUS MsMonTrackProcess(HANDLE ProcessId, ULONG Flags);
+NTSTATUS MsMonTrackProcess(HANDLE ProcessId, ULONG Flags, LONGLONG ExpectedStartTime);
 BOOLEAN MsMonIsTracked(HANDLE ProcessId, LONGLONG StartTime);
 LONGLONG MsMonProcessStartTime(HANDLE ProcessId);
 ULONG MsMonTrackedProcessCount(VOID);

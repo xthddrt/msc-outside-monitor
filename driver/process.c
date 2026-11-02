@@ -171,7 +171,7 @@ VOID MsMonProcessStopSession(VOID)
     MsMonClearProcesses();
 }
 
-NTSTATUS MsMonTrackProcess(HANDLE ProcessId, ULONG Flags)
+NTSTATUS MsMonTrackProcess(HANDLE ProcessId, ULONG Flags, LONGLONG ExpectedStartTime)
 {
     PMSMON_PROCESS_ENTRY entry;
     PMSMON_PROCESS_ENTRY existing;
@@ -199,6 +199,11 @@ NTSTATUS MsMonTrackProcess(HANDLE ProcessId, ULONG Flags)
         entry->StartTime = PsGetProcessCreateTimeQuadPart(process);
         entry->ParentProcessId = NULL;
         ObDereferenceObject(process);
+        if (!MsMonTrackAdmitsStart((ULONGLONG)ExpectedStartTime, (ULONGLONG)entry->StartTime)) {
+            ExFreePoolWithTag(entry, MSMON_POOL_TAG);
+            KeReleaseMutex(&gRootMutex, FALSE);
+            return STATUS_REVISION_MISMATCH;
+        }
     } else {
         ExFreePoolWithTag(entry, MSMON_POOL_TAG);
         KeReleaseMutex(&gRootMutex, FALSE);
@@ -320,7 +325,7 @@ static VOID MsMonProcessNotifyInner(PEPROCESS Process, HANDLE ProcessId, PPS_CRE
          * registry, network, and handle events are not lost.
          */
         flags = MsMonFlagExplicitTrack;
-        status = MsMonTrackProcess(ProcessId, flags);
+        status = MsMonTrackProcess(ProcessId, flags, 0);
         if (!NT_SUCCESS(status)) {
             MsMonCoverageSkip(MSMON_SKIP_TRACK);
             MsMonEventsNoteDropped();
@@ -334,7 +339,7 @@ static VOID MsMonProcessNotifyInner(PEPROCESS Process, HANDLE ProcessId, PPS_CRE
     } else {
         return;
     }
-    status = MsMonTrackProcess(ProcessId, flags);
+    status = MsMonTrackProcess(ProcessId, flags, 0);
     if (!NT_SUCCESS(status)) {
         MsMonCoverageSkip(MSMON_SKIP_TRACK);
         MsMonEventsNoteDropped();
@@ -383,7 +388,7 @@ static VOID MsMonTrackClientAtFirstImage(PCUNICODE_STRING FullImageName, HANDLE 
     if (!MsMonImageUnderRoot(FullImageName)) return;
     if (!NT_SUCCESS(PsLookupProcessByProcessId(ProcessId, &process))) return;
     if (MsMonProcessImageUnderRoot(process, NULL) &&
-        !NT_SUCCESS(MsMonTrackProcess(ProcessId, MsMonFlagExplicitTrack))) {
+        !NT_SUCCESS(MsMonTrackProcess(ProcessId, MsMonFlagExplicitTrack, 0))) {
         MsMonCoverageSkip(MSMON_SKIP_TRACK);
         MsMonEventsNoteDropped();
     }

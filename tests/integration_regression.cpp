@@ -28,6 +28,11 @@ int main()
                 !ProcessScope::ValidParentIncarnation(100, 100, 99),
                 "snapshot inheritance rejects reused, later, and older-parent identities");
 
+    /* #55: an explicit track names the incarnation the caller resolved. */
+    ok &= Check(MsMonTrackAdmitsStart(0, 123456), "an unspecified start admits the live process");
+    ok &= Check(MsMonTrackAdmitsStart(100, 100), "the requested incarnation is admitted");
+    ok &= Check(!MsMonTrackAdmitsStart(100, 101), "a reused PID is refused, not tracked");
+
     {
         ProcessScope early;
         const uint64_t address = 0x1000;
@@ -360,6 +365,44 @@ int main()
                     "a completed payload series leaves no incomplete entry");
         ok &= Check(json.find("\"payload_operations_pending\":0") != std::string::npos,
                     "completed payload series retain no chunk bookkeeping");
+    }
+
+    /*
+     * #53/#57: a late, lower OperationId must survive the insert that evicts the
+     * oldest pending series. 4096 incomplete series fill the table; inserting id
+     * 1 raises it to 4097 and evicts one of them, and must not free the node it
+     * just inserted; finishing id 1 then removes exactly one entry.
+     */
+    {
+        SessionSummary late;
+        TelemetryEvent payload;
+        payload.source = "driver";
+        payload.header.Type = MsMonRegistryQuery;
+        payload.header.Flags = MsMonFlagPayloadPresent;
+        payload.header.PayloadChunkCount = 2;
+        payload.header.PayloadTotalBytes = 8;
+        payload.header.PayloadBytes = 4;
+        payload.payload = { 1, 2, 3, 4 };
+        for (unsigned index = 0; index < 4096; index++) {
+            payload.header.Sequence = index + 1;
+            payload.header.OperationId = 1000 + index;
+            payload.header.PayloadChunkIndex = 0;
+            late.Add(payload);
+        }
+        payload.header.OperationId = 1;
+        payload.header.PayloadChunkIndex = 0;
+        late.Add(payload);
+        payload.header.PayloadChunkIndex = 1;
+        late.Add(payload);
+        const std::string json = late.Json(statistics, 0, 0, 0);
+        ok &= Check(json.find("\"payload_operations\":4097") != std::string::npos,
+                    "the late operation survives its own eviction");
+        ok &= Check(json.find("\"complete_payload_operations\":1") != std::string::npos,
+                    "the late operation completes after eviction");
+        ok &= Check(json.find("\"incomplete_payload_operations\":4096") != std::string::npos,
+                    "the evicted series stays counted as incomplete");
+        ok &= Check(json.find("\"payload_operations_pending\":4095") != std::string::npos,
+                    "one series is evicted and the late one is released on completion");
     }
 
     /*

@@ -122,16 +122,20 @@ static NTSTATUS MsMonDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
         break;
     case MSMON_IOCTL_TRACK_PID: {
         PMSMON_TRACK_REQUEST request = (PMSMON_TRACK_REQUEST)Irp->AssociatedIrp.SystemBuffer;
+        LONGLONG validatedStart;
         if (inputLength < sizeof(*request)) {
             status = STATUS_BUFFER_TOO_SMALL;
             break;
         }
         status = MsMonTrackProcess(UlongToHandle(request->ProcessId),
-                                   request->Flags != 0 ? request->Flags : MsMonFlagExplicitTrack);
+                                   request->Flags != 0 ? request->Flags : MsMonFlagExplicitTrack,
+                                   (LONGLONG)request->ProcessStartTime);
         if (NT_SUCCESS(status)) {
-            (VOID)MsMonLogEvent(MsMonProcessStart, UlongToHandle(request->ProcessId), request->ProcessStartTime, NULL, NULL,
+            /* Log what the driver admitted, not the caller's possibly stale value. */
+            validatedStart = MsMonProcessStartTime(UlongToHandle(request->ProcessId));
+            (VOID)MsMonLogEvent(MsMonProcessStart, UlongToHandle(request->ProcessId), validatedStart, NULL, NULL,
                                 NULL, 0, request->Flags, STATUS_SUCCESS, 0,
-                                MsMonCategoryExternalProcess, request->ProcessStartTime, 0, NULL, NULL);
+                                MsMonCategoryExternalProcess, (ULONGLONG)validatedStart, 0, NULL, NULL);
         }
         break;
     }

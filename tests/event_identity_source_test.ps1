@@ -36,4 +36,26 @@ $readStart = $notify.IndexOf('MsMonProcessStartTime(')
 if ($admit -lt 0 -or $readStart -lt 0 -or $readStart -lt $admit) {
     throw 'the image-load start time is read before the first-image admission'
 }
+# --- #55: TRACK_PID must admit only the incarnation the caller resolved ------
+$driver = Get-Content (Join-Path $root 'driver\driver.c') -Raw
+$from = $driver.IndexOf('case MSMON_IOCTL_TRACK_PID:')
+$to = if ($from -ge 0) { $driver.IndexOf('case MSMON_IOCTL_READ_EVENTS:', $from) } else { -1 }
+if ($from -lt 0 -or $to -le $from) { throw 'MSMON_IOCTL_TRACK_PID not found' }
+$track = $driver.Substring($from, $to - $from)
+if (-not $track.Contains('(LONGLONG)request->ProcessStartTime')) {
+    throw 'TRACK_PID does not pass the expected incarnation into MsMonTrackProcess'
+}
+if (-not $track.Contains('MsMonProcessStartTime(') -or
+    $track.Contains('MsMonCategoryExternalProcess, request->ProcessStartTime')) {
+    throw 'TRACK_PID logs the caller start instead of the validated stored start'
+}
+if (-not $process.Contains('NTSTATUS MsMonTrackProcess(HANDLE ProcessId, ULONG Flags, LONGLONG ExpectedStartTime)') -or
+    -not $process.Contains('MsMonTrackAdmitsStart(')) {
+    throw 'MsMonTrackProcess does not validate the expected incarnation'
+}
+$check = $process.IndexOf('MsMonTrackAdmitsStart(')
+$insert = $process.IndexOf('InsertTailList(&gProcesses', $check)
+if ($check -lt 0 -or $insert -lt 0) {
+    throw 'the incarnation check does not precede the tracked-list insertion'
+}
 Write-Host 'event identity regression passed'

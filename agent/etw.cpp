@@ -622,7 +622,10 @@ void EtwCollector::OnRecord(PEVENT_RECORD record)
         }
     }
 
-    const ProcessFacts current = FactsForPid(attributedPid);
+    /* An immediate emit is proof of identity, so it must not use the one-second
+     * candidate cache: a PID reused inside that window would be attributed to
+     * the old client. FactsForPid stays for MayBelongToClient only. */
+    const ProcessFacts current = QueryProcessFacts(attributedPid);
     if (!current.ok || !scope_.IsTracked(attributedPid, current.created)) {
         FILETIME nowFileTime;
         ULARGE_INTEGER now;
@@ -694,7 +697,7 @@ void EtwCollector::OnTcpRecord(PEVENT_RECORD record, const TRACE_EVENT_INFO* inf
      */
     DWORD ownerPid = 0;
     uint64_t ownerStart = 0;
-    if (!ResolveTcpOwner(tcb, pid, FactsForPid(pid), endpoints, ownerPid, ownerStart)) return;
+    if (!ResolveTcpOwner(tcb, pid, QueryProcessFacts(pid), endpoints, ownerPid, ownerStart)) return;
 
     TelemetryEvent event;
     event.source = "etw";
