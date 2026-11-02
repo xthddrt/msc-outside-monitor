@@ -61,6 +61,7 @@ class Process:
     def __init__(self):
         self.image = "?"
         self.parent = None
+        self.created = 0
         self.start = self.end = None
         self.flags = []
         self.switches = []
@@ -75,7 +76,8 @@ def collect(session_dir):
         if kind in (None, "coverage", "coverage_usage", "observer_summary", "observer_sequence_gap", "etw_unattributed"):
             continue
         pid = event.get("process_id") or 0
-        process = processes[pid]
+        process = processes[(pid, event.get("process_start_time") or 0)]
+        process.created = event.get("process_start_time") or 0
         if event.get("process_path") and process.image == "?":
             process.image = short_image(event["process_path"])
         sections = process.sections
@@ -121,7 +123,7 @@ def collect(session_dir):
             key = registry_key(text)
             value_name = detail if "=" not in detail else ""
             writes = kind in ("registry_set_value", "registry_delete", "registry_rename") or \
-                (kind == "registry_create" and event.get("status") == 0 and event.get("value0") == 1)
+                (kind == "registry_create" and event.get("status") == 0)
             if writes:
                 sections["registry_writes"][(kind.replace("registry_", ""), key, value_name)] += 1
             else:
@@ -152,12 +154,15 @@ def report(processes, session_dir, limit):
         return [[list(key) if isinstance(key, tuple) else key, count] for key, count in counter.most_common(limit)]
 
     output = {"session": pathlib.Path(session_dir).name, "processes": []}
-    for pid, process in sorted(processes.items(), key=lambda item: -sum(item[1].sections["types"].values())):
+    for (pid, created), process in sorted(processes.items(), key=lambda item: -sum(item[1].sections["types"].values())):
         if pid == 0:
             continue
-        parent = processes[process.parent].image if process.parent in processes else None
+        parents = [(parent_created, parent) for (parent_pid, parent_created), parent in processes.items()
+                   if parent_pid == process.parent and parent_created != 0 and parent_created <= created]
+        parent = max(parents, key=lambda item: item[0])[1].image if parents else None
         entry = {
-            "pid": pid, "image": process.image, "parent": process.parent, "parent_image": parent,
+            "pid": pid, "process_start_time": created,
+            "image": process.image, "parent": process.parent, "parent_image": parent,
             "start": process.start, "end": process.end, "flags": process.flags, "switches": process.switches,
             "events": sum(process.sections["types"].values()),
             "file_buckets": {name: dict(counter) for name, counter in
@@ -170,13 +175,15 @@ def report(processes, session_dir, limit):
 
 
 def show(output, pid, sections, limit):
+    found = False
     for process in output["processes"]:
         if process["pid"] != pid:
             continue
+        found = True
         print(f"== {process['image']} pid={pid} parent={process['parent_image']}({process['parent']}) "
               f"{process['start']} -> {process['end']} flags={process['flags']} events={process['events']}")
         for key, value in process.items():
-            if key in ("pid", "image", "parent", "parent_image", "start", "end", "flags", "events") or not value:
+            if key in ("pid", "process_start_time", "image", "parent", "parent_image", "start", "end", "flags", "events") or not value:
                 continue
             if sections and key not in sections:
                 continue
@@ -184,6 +191,7 @@ def show(output, pid, sections, limit):
             items = value.items() if isinstance(value, dict) else value[:limit]
             for item in items:
                 print("  ", item)
+    if found:
         return 0
     print(f"pid {pid} not in report", file=sys.stderr)
     return 1

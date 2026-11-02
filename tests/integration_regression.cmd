@@ -42,6 +42,10 @@ if not "%RESULT%"=="0" goto finished
 set "RESULT=%errorlevel%"
 if not "%RESULT%"=="0" goto finished
 
+"%PYTHON%" "%ROOT%\tests\activity_analysis_test.py"
+set "RESULT=%errorlevel%"
+if not "%RESULT%"=="0" goto finished
+
 call :gate "build\tests\integration-events.jsonl"
 set "RESULT=%errorlevel%"
 if not "%RESULT%"=="0" goto finished
