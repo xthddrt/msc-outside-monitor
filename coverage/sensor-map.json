@@ -491,15 +491,6 @@
       "status": "active"
     },
     {
-      "sensor_id": "event.kfilter_decision",
-      "kind": "event",
-      "event_type": "kfilter_decision",
-      "type_id": 120,
-      "implementation": "agent/integrations.cpp::KFilterDecisionEvent",
-      "expected_in": [],
-      "status": "active"
-    },
-    {
       "sensor_id": "event.coverage",
       "kind": "event",
       "event_type": "coverage",
@@ -521,6 +512,15 @@
         "startup",
         "shutdown"
       ],
+      "status": "active"
+    },
+    {
+      "sensor_id": "event.kfilter_decision",
+      "kind": "event",
+      "event_type": "kfilter_decision",
+      "type_id": 120,
+      "implementation": "agent/integrations.cpp::KFilterDecisionEvent",
+      "expected_in": [],
       "status": "active"
     },
     {
@@ -780,6 +780,107 @@
       "status": "active"
     },
     {
+      "sensor_id": "linux.ebpf_process",
+      "kind": "callback",
+      "slot": 48,
+      "implementation": "agent/linux/bpf/monitor.bpf.c::mm_fork,mm_exec,mm_exit,mm_mmap_file",
+      "event_types": [
+        "process_start",
+        "process_exit",
+        "thread_start",
+        "thread_exit"
+      ],
+      "expected_in": [
+        "startup",
+        "gameplay"
+      ],
+      "status": "active"
+    },
+    {
+      "sensor_id": "linux.ebpf_file",
+      "kind": "callback",
+      "slot": 49,
+      "implementation": "agent/linux/bpf/monitor.bpf.c::mm_sys_enter,mm_sys_exit",
+      "event_types": [
+        "file_create",
+        "file_read",
+        "file_write",
+        "file_close",
+        "file_set_information",
+        "file_set_security",
+        "file_query_information",
+        "file_directory_control",
+        "file_set_ea",
+        "file_query_ea"
+      ],
+      "expected_in": [
+        "file_io",
+        "gameplay"
+      ],
+      "status": "active"
+    },
+    {
+      "sensor_id": "linux.ebpf_net",
+      "kind": "callback",
+      "slot": 50,
+      "implementation": "agent/linux/bpf/monitor.bpf.c::mm_sys_enter,mm_sys_exit",
+      "event_types": [
+        "network_connect",
+        "network_accept",
+        "network_flow_close"
+      ],
+      "expected_in": [
+        "network",
+        "gameplay"
+      ],
+      "status": "active"
+    },
+    {
+      "sensor_id": "linux.ebpf_ipc",
+      "kind": "callback",
+      "slot": 51,
+      "implementation": "agent/linux/bpf/monitor.bpf.c::mm_sys_enter,mm_sys_exit",
+      "event_types": [
+        "network_connect",
+        "network_accept",
+        "process_handle"
+      ],
+      "expected_in": [
+        "ipc",
+        "gameplay"
+      ],
+      "status": "active"
+    },
+    {
+      "sensor_id": "linux.ebpf_device",
+      "kind": "callback",
+      "slot": 52,
+      "implementation": "agent/linux/bpf/monitor.bpf.c::mm_sys_enter,mm_sys_exit",
+      "event_types": [
+        "file_device_control"
+      ],
+      "expected_in": [
+        "file_io",
+        "gameplay"
+      ],
+      "status": "active"
+    },
+    {
+      "sensor_id": "linux.ebpf_memory",
+      "kind": "callback",
+      "slot": 53,
+      "implementation": "agent/linux/bpf/monitor.bpf.c::mm_sys_exit,mm_ptrace,mm_bpf,mm_perf",
+      "event_types": [
+        "file_section",
+        "image_load",
+        "process_handle"
+      ],
+      "expected_in": [
+        "gameplay"
+      ],
+      "status": "active"
+    },
+    {
       "sensor_id": "registration.process.notify",
       "kind": "registration",
       "slot": 20,
@@ -973,6 +1074,66 @@
       "sensor_id": "registration.linux.net_poll",
       "kind": "registration",
       "slot": 47,
+      "implementation": "agent/linux/session.cpp::LinuxSession::Start",
+      "expected_in": [
+        "startup"
+      ],
+      "status": "active"
+    },
+    {
+      "sensor_id": "registration.linux.ebpf_process",
+      "kind": "registration",
+      "slot": 54,
+      "implementation": "agent/linux/session.cpp::LinuxSession::Start",
+      "expected_in": [
+        "startup"
+      ],
+      "status": "active"
+    },
+    {
+      "sensor_id": "registration.linux.ebpf_file",
+      "kind": "registration",
+      "slot": 55,
+      "implementation": "agent/linux/session.cpp::LinuxSession::Start",
+      "expected_in": [
+        "startup"
+      ],
+      "status": "active"
+    },
+    {
+      "sensor_id": "registration.linux.ebpf_net",
+      "kind": "registration",
+      "slot": 56,
+      "implementation": "agent/linux/session.cpp::LinuxSession::Start",
+      "expected_in": [
+        "startup"
+      ],
+      "status": "active"
+    },
+    {
+      "sensor_id": "registration.linux.ebpf_ipc",
+      "kind": "registration",
+      "slot": 57,
+      "implementation": "agent/linux/session.cpp::LinuxSession::Start",
+      "expected_in": [
+        "startup"
+      ],
+      "status": "active"
+    },
+    {
+      "sensor_id": "registration.linux.ebpf_device",
+      "kind": "registration",
+      "slot": 58,
+      "implementation": "agent/linux/session.cpp::LinuxSession::Start",
+      "expected_in": [
+        "startup"
+      ],
+      "status": "active"
+    },
+    {
+      "sensor_id": "registration.linux.ebpf_memory",
+      "kind": "registration",
+      "slot": 59,
       "implementation": "agent/linux/session.cpp::LinuxSession::Start",
       "expected_in": [
         "startup"

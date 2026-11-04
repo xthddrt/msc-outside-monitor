@@ -11,9 +11,38 @@ flags=(-std=c++17 -O2 -Wall -Wextra -pthread)
 shared=(agent/telemetry.cpp agent/classify.cpp agent/integrations.cpp agent/rpc_names.cpp agent/etw.cpp
         agent/linux/etw_stub.cpp agent/linux/platform.cpp)
 sensors=(agent/linux/session.cpp agent/linux/fanotify.cpp agent/linux/proc_connector.cpp
-         agent/linux/images.cpp agent/linux/net.cpp)
+         agent/linux/images.cpp agent/linux/net.cpp agent/linux/bpf.cpp)
 
-"$cxx" "${flags[@]}" -o "$out/msmon-agent" agent/agent.cpp "${shared[@]}" "${sensors[@]}"
+# eBPF preflight: clang (CLANG=), bpftool (BPFTOOL=), libbpf headers (LIBBPF_INCLUDE=) and the
+# running kernel's BTF. Without them the agent is built without its kernel sensors and falls back
+# to fanotify, the proc connector and /proc polling.
+clang="${CLANG:-$(command -v clang-18 || command -v clang || true)}"
+bpftool="${BPFTOOL:-$(command -v bpftool || { [ -x /usr/sbin/bpftool ] && echo /usr/sbin/bpftool; } || true)}"
+libbpf_include="${LIBBPF_INCLUDE:-/usr/include}"
+bpf_flags=()
+if [ -n "$clang" ] && [ -n "$bpftool" ] && [ -f "$libbpf_include/bpf/libbpf.h" ] && [ -r /sys/kernel/btf/vmlinux ]; then
+    mkdir -p "$out/bpf"
+    "$bpftool" btf dump file /sys/kernel/btf/vmlinux format c > "$out/bpf/vmlinux.h"
+    "$clang" -g -O2 -target bpf -D__TARGET_ARCH_x86 -Wno-missing-declarations -I "$out/bpf" -I "$libbpf_include" \
+        -c agent/linux/bpf/monitor.bpf.c -o "$out/bpf/monitor.debug.o"
+    "$bpftool" gen object "$out/bpf/monitor.bpf.o" "$out/bpf/monitor.debug.o"
+    python3 - "$out/bpf/monitor.bpf.o" "$out/bpf/monitor_bpf_object.h" <<'PY'
+import sys
+data = open(sys.argv[1], "rb").read()
+rows = ",\n".join(",".join(str(b) for b in data[i:i + 32]) for i in range(0, len(data), 32))
+open(sys.argv[2], "w").write("static const unsigned char kMonitorBpfObject[] = {\n" + rows + "\n};\n")
+PY
+    if [ -e /usr/lib/x86_64-linux-gnu/libbpf.so ] || [ -n "${LIBBPF_LIB:-}" ]; then libbpf_link="${LIBBPF_LIB:--lbpf}"; else libbpf_link=-l:libbpf.so.1; fi
+    bpf_flags=(-DMSMON_BPF -I "$out/bpf" -I "$libbpf_include" "$libbpf_link")
+    echo "eBPF sensors: built ($out/bpf/monitor.bpf.o)"
+else
+    echo "eBPF sensors: NOT built (need clang, bpftool, libbpf headers and /sys/kernel/btf/vmlinux):" >&2
+    echo "  sudo apt install clang-18 libbpf-dev linux-tools-common linux-tools-\$(uname -r)" >&2
+fi
+
+"$cxx" "${flags[@]}" -o "$out/msmon-agent" agent/agent.cpp "${shared[@]}" "${sensors[@]}" "${bpf_flags[@]}"
+# The action probe tests/linux_ebpf_test.sh runs as root.
+"${CC:-gcc}" -O2 -Wall -pthread -o "$out/linux_ebpf_probe" tests/fixtures/linux_ebpf_probe.c
 "$cxx" "${flags[@]}" -o "$out/integration_regression" tests/integration_regression.cpp "${shared[@]}"
 python3 tools/check_sensor_map.py
 

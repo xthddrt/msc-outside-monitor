@@ -8,8 +8,9 @@ work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 cp /bin/sleep "$work/client"
 
+# MSMON_AGENT_ARGS: extra agent flags (tests/linux_ebpf_test.sh passes --no-ebpf).
 ./build/linux/msmon-agent --scope-root "$work" --output "$work/events.jsonl" \
-    --stop-file "$work/stop" --wait-ms 200 >/dev/null 2>&1 &
+    --stop-file "$work/stop" --wait-ms 200 ${MSMON_AGENT_ARGS:-} >/dev/null 2>&1 &
 agent=$!
 sleep 2
 "$work/client" 3 &

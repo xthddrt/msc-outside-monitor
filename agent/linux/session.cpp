@@ -6,6 +6,12 @@
 /* Longest string kept per field; bounds a record below MSMON_MAX_EVENT_RECORD_BYTES. */
 static const size_t MAX_STRING_CHARS = 1024;
 static const unsigned NO_SENSOR = MSMON_SENSOR_SLOTS;
+static bool gUseEbpf = true;
+
+void LinuxSessionUseEbpf(bool enabled)
+{
+    gUseEbpf = enabled;
+}
 
 LinuxSession& LinuxSession::Instance()
 {
@@ -56,35 +62,81 @@ bool LinuxSession::Start(const MSMON_SESSION_CONFIG& config)
         coverage_.RegistrationFailed |= 1ull << slot;
         coverage_.RegistrationStatus[slot] = ENOSYS;
     }
+    /* The kernel sensors own a class when they attached; its user-space source is then
+     * not started, so records are not duplicated.  --no-ebpf keeps the old sources. */
     std::wstring detail;
-    int error = FanotifyOpen(detail);
-    Registered(MSMON_SENSOR_REG_LINUX_FANOTIFY, error);
-    const bool fanotify = error == 0;
-    if (fanotify) {
-        notes_.push_back({L"fanotify_active", detail});
+    unsigned ebpf = 0;
+    int error = ENOTSUP;
+    if (gUseEbpf) {
+        error = BpfOpen(detail, roots_.empty() ? std::wstring() : roots_.front(), ebpf);
+        for (unsigned index = 0; index < 6; index++) {
+            const bool attached = error == 0 && (ebpf & (1u << index)) != 0;
+            Registered(MSMON_SENSOR_REG_LINUX_EBPF_PROCESS + index, attached ? 0 : (error != 0 ? error : EOPNOTSUPP));
+        }
+        if (error == 0) {
+            notes_.push_back({L"ebpf_active", detail});
+        } else {
+            notes_.push_back({L"bpf_unavailable", L"errno=" + ErrnoName(error) + L";" + detail +
+                              L";the fanotify, proc connector and polling sensors are used instead"});
+        }
     } else {
-        notes_.push_back({L"fanotify_unavailable", L"errno=" + ErrnoName(error) + L";" + detail +
-                          L";file_create, file_read, file_write, file_close and unlink/rename records are not produced"
-                          L" (needs CAP_SYS_ADMIN)"});
+        notes_.push_back({L"bpf_unavailable", L"errno=0;disabled with --no-ebpf"});
+    }
+    ebpf_ = error == 0;
+    auto owns = [&](unsigned sensor) { return ebpf_ && (ebpf & (1u << (sensor - MSMON_SENSOR_LINUX_EBPF_PROCESS))) != 0; };
+    const bool fileOwned = owns(MSMON_SENSOR_LINUX_EBPF_FILE);
+    const bool processOwned = owns(MSMON_SENSOR_LINUX_EBPF_PROCESS);
+    const bool netOwned = owns(MSMON_SENSOR_LINUX_EBPF_NET);
+    pollImages_ = !owns(MSMON_SENSOR_LINUX_EBPF_MEMORY);
+    pollNet_ = !netOwned;
+
+    detail.clear();
+    error = fileOwned ? 0 : FanotifyOpen(detail);
+    const bool fanotify = !fileOwned && error == 0;
+    if (fileOwned) {
+        notes_.push_back({L"fanotify_superseded", L"file records come from linux.ebpf_file"});
+    } else {
+        Registered(MSMON_SENSOR_REG_LINUX_FANOTIFY, error);
+        if (fanotify) {
+            notes_.push_back({L"fanotify_active", detail});
+        } else {
+            notes_.push_back({L"fanotify_unavailable", L"errno=" + ErrnoName(error) + L";" + detail +
+                              L";file_create, file_read, file_write, file_close and unlink/rename records are not produced"
+                              L" (needs CAP_SYS_ADMIN)"});
+        }
     }
     detail.clear();
-    error = ProcConnectorOpen(detail);
-    Registered(MSMON_SENSOR_REG_LINUX_PROC_CONNECTOR, error);
-    const bool procConnector = error == 0;
-    if (!procConnector) {
-        notes_.push_back({L"proc_connector_unavailable", L"errno=" + ErrnoName(error) + L";" + detail +
-                          L";forks, execs and exits after start are not seen; only processes running at start and"
-                          L" --pid are tracked (needs CAP_NET_ADMIN)"});
+    error = processOwned ? 0 : ProcConnectorOpen(detail);
+    const bool procConnector = !processOwned && error == 0;
+    if (processOwned) {
+        notes_.push_back({L"proc_connector_superseded", L"process and thread records come from linux.ebpf_process"});
+    } else {
+        Registered(MSMON_SENSOR_REG_LINUX_PROC_CONNECTOR, error);
+        if (!procConnector) {
+            notes_.push_back({L"proc_connector_unavailable", L"errno=" + ErrnoName(error) + L";" + detail +
+                              L";forks, execs and exits after start are not seen; only processes running at start and"
+                              L" --pid are tracked (needs CAP_NET_ADMIN)"});
+        }
     }
     const int mapsError = access("/proc/self/maps", R_OK) == 0 ? 0 : errno;
     Registered(MSMON_SENSOR_REG_LINUX_MAPS_POLL, mapsError);
-    const int netError = access("/proc/net/tcp", R_OK) == 0 ? 0 : errno;
-    Registered(MSMON_SENSOR_REG_LINUX_NET_POLL, netError);
+    if (!pollImages_) {
+        notes_.push_back({L"maps_poll_superseded",
+                          L"image_load comes from mmap records; /proc/<pid>/maps is read once when a process is tracked"});
+    }
+    if (pollNet_) {
+        const int netError = access("/proc/net/tcp", R_OK) == 0 ? 0 : errno;
+        Registered(MSMON_SENSOR_REG_LINUX_NET_POLL, netError);
+    } else {
+        notes_.push_back({L"net_poll_superseded", L"socket records come from linux.ebpf_net and linux.ebpf_ipc"});
+    }
     notes_.push_back({L"registry_unavailable",
-                      L"Linux has no registry: no registry_* events and no registry value payloads"});
+                      L"Wine keeps its registry in wineserver: no key-level registry_* events; the prefix's *.reg files"
+                      L" are recorded as file events and snapshotted when written"});
     notes_.push_back({L"blackcat_not_applicable",
                       L"BlackCat is a Windows kernel driver: no device discovery, kernel-module attribution or"
                       L" BlackCat-initiated tracking"});
+    if (ebpf_) threads_.emplace_back([this] { BpfRun(*this); });
     if (fanotify) threads_.emplace_back([this] { FanotifyRun(*this); });
     if (procConnector) threads_.emplace_back([this] { ProcConnectorRun(*this); });
     threads_.emplace_back([this] { PollLoop(); });
@@ -116,8 +168,10 @@ void LinuxSession::Stop()
     threads_.clear();
     FanotifyClose();
     ProcConnectorClose();
+    if (ebpf_) BpfClose();
     std::lock_guard<std::mutex> lock(mutex_);
     running_ = false;
+    ebpf_ = false;
     data_.notify_all();
 }
 
@@ -131,10 +185,10 @@ void LinuxSession::PollLoop()
             if (stopping_.load()) return;
             if (!tracking_) continue;
         }
-        if (tick % 2 == 0) {
+        if (tick % 2 == 0 && pollImages_) {
             for (const auto& process : TrackedProcesses()) ImagesScan(*this, process.first, process.second);
         }
-        NetPoll(*this);
+        if (pollNet_) NetPoll(*this);
     }
 }
 
@@ -162,6 +216,7 @@ void LinuxSession::StopTracking()
     std::lock_guard<std::mutex> lock(mutex_);
     tracking_ = false;
     tracked_.clear();
+    if (ebpf_) BpfClear();
 }
 
 bool LinuxSession::Read(DWORD waitMs, std::vector<BYTE>& buffer, DWORD& bytes)
@@ -231,6 +286,7 @@ bool LinuxSession::Admit(DWORD pid, uint64_t start, ULONG flags)
     std::lock_guard<std::mutex> lock(mutex_);
     if (!tracking_) return false;
     tracked_[pid] = {start, flags};
+    if (ebpf_) BpfTrack(pid, start, flags);
     return true;
 }
 
@@ -238,7 +294,10 @@ void LinuxSession::Forget(DWORD pid, uint64_t start)
 {
     std::lock_guard<std::mutex> lock(mutex_);
     auto found = tracked_.find(pid);
-    if (found != tracked_.end() && found->second.start == start) tracked_.erase(found);
+    if (found != tracked_.end() && found->second.start == start) {
+        tracked_.erase(found);
+        if (ebpf_) BpfForget(pid);
+    }
 }
 
 bool LinuxSession::UnderRoot(const std::wstring& path) const
@@ -268,28 +327,57 @@ static void AppendString(std::vector<BYTE>& record, const std::wstring& value,
 void LinuxSession::Log(unsigned sensor, ULONG type, DWORD pid, uint64_t start, ULONG flags, uint64_t value0,
                        uint64_t value1, const std::wstring& text, const std::wstring& detail, DWORD parent)
 {
+    LinuxRecord record;
+    record.sensor = sensor;
+    record.type = type;
+    record.pid = pid;
+    record.start = start;
+    record.flags = flags;
+    record.value0 = value0;
+    record.value1 = value1;
+    record.text = text;
+    record.detail = detail;
+    record.parent = parent;
+    Write(record);
+}
+
+void LinuxSession::Write(const LinuxRecord& input)
+{
     MSMON_EVENT_HEADER header{};
     header.Version = MSMON_PROTOCOL_VERSION;
-    header.Type = type;
-    header.Flags = flags;
-    header.Timestamp = Now();
-    header.ProcessId = pid;
-    header.ParentProcessId = parent;
-    header.ProcessStartTime = start;
+    header.Type = input.type;
+    header.Flags = input.flags;
+    header.Timestamp = input.timestamp != 0 ? input.timestamp : Now();
+    header.ProcessId = input.pid;
+    header.ParentProcessId = input.parent;
+    header.ThreadId = input.tid;
+    header.TargetProcessId = input.target;
+    header.ProcessStartTime = input.start;
+    header.Status = input.status;
     header.Category = MsMonCategoryUnknown;
     header.Attribution = MsMonAttributionProcessOnly;
-    header.Value0 = value0;
-    header.Value1 = value1;
+    header.Value0 = input.value0;
+    header.Value1 = input.value1;
     std::vector<BYTE> record(sizeof(header));
     bool textTruncated = false;
     bool detailTruncated = false;
-    AppendString(record, text, header.TextOffset, header.TextBytes, textTruncated);
-    AppendString(record, detail, header.DetailOffset, header.DetailBytes, detailTruncated);
+    AppendString(record, input.text, header.TextOffset, header.TextBytes, textTruncated);
+    AppendString(record, input.detail, header.DetailOffset, header.DetailBytes, detailTruncated);
     if (textTruncated) header.Flags |= MsMonFlagTruncatedPath;
+    if (!input.stack.empty()) {
+        record.resize((record.size() + 7) & ~size_t(7));
+        const size_t frames = std::min<size_t>(input.stack.size(), MSMON_MAX_STACK_FRAMES);
+        header.StackOffset = static_cast<unsigned short>(record.size());
+        header.StackFrames = static_cast<unsigned short>(frames);
+        const BYTE* data = reinterpret_cast<const BYTE*>(input.stack.data());
+        record.insert(record.end(), data, data + frames * sizeof(uint64_t));
+    }
     /* Keep every record 8-byte aligned so the next header and its strings stay aligned. */
     record.resize((record.size() + 7) & ~size_t(7));
     header.Size = static_cast<unsigned long>(record.size());
 
+    const unsigned sensor = input.sensor;
+    const ULONG type = input.type;
     std::lock_guard<std::mutex> lock(mutex_);
     /* After StopTracking nothing is tracked, as in the driver; this also drops records a sensor
      * computed just before (a socket poll would otherwise report every flow closed). */
