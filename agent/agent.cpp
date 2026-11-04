@@ -999,7 +999,7 @@ int wmain(int argc, wchar_t** argv)
 #ifdef _WIN32
     std::wstring clientRoot = L"C:\\Nexon\\Library\\maplestorycw";
 #else
-    std::wstring clientRoot = L".";
+    std::wstring clientRoot;
 #endif
     std::wstring scopeRootArg;
     std::vector<std::wstring> extraRootArgs;
@@ -1024,6 +1024,9 @@ int wmain(int argc, wchar_t** argv)
     std::filesystem::path stopFile;
     bool stopFileEnabled = false;
     std::vector<DWORD> explicitPids;
+#ifndef _WIN32
+    bool clientSet = false;
+#endif
 
     for (int index = 1; index < argc; index++) {
         std::wstring argument = argv[index];
@@ -1039,6 +1042,9 @@ int wmain(int argc, wchar_t** argv)
             capturePayloads = false;
         } else if (index + 1 < argc && argument == L"--client") {
             clientRoot = argv[++index];
+#ifndef _WIN32
+            clientSet = true;
+#endif
         } else if (index + 1 < argc && argument == L"--scope-root") {
             scopeRootArg = argv[++index];
         } else if (index + 1 < argc && argument == L"--extra-root") {
@@ -1117,6 +1123,25 @@ int wmain(int argc, wchar_t** argv)
     if (sessionLabel.empty()) sessionLabel = scenario;
     sessionLabel = SanitizeLabel(sessionLabel, L"session");
     machineLabelArg = machineLabelArg.empty() ? MachineLabel() : SanitizeLabel(machineLabelArg, L"unknown");
+
+#ifndef _WIN32
+    if (!clientSet) {
+        if (!scopeRootArg.empty()) {
+            clientRoot = scopeRootArg;
+        } else if (!explicitPids.empty()) {
+            std::wstring image;
+            uint64_t startTime = 0;
+            if (!ProcessIdentity(explicitPids.front(), image, startTime) || image.empty()) {
+                std::cerr << "Cannot read /proc/" << explicitPids.front() << "/exe; pass --client.\n";
+                return 1;
+            }
+            clientRoot = std::filesystem::path(image).parent_path().wstring();
+        } else {
+            std::cerr << "Linux needs --client, --scope-root or --pid.\n";
+            return 1;
+        }
+    }
+#endif
 
     clientRoot = FullPath(clientRoot);
     if (clientRoot.empty()) {

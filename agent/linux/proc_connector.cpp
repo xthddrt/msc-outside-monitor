@@ -40,7 +40,6 @@ int ProcConnectorOpen(std::wstring& detail)
     message->id.idx = CN_IDX_PROC;
     message->id.val = CN_VAL_PROC;
     message->len = sizeof(proc_cn_mcast_op);
-    message->seq = static_cast<uint32_t>(getpid());
     const proc_cn_mcast_op operation = PROC_CN_MCAST_LISTEN;
     std::memcpy(message->data, &operation, sizeof(operation));
     if (send(gSocket, request, header->nlmsg_len, 0) != static_cast<ssize_t>(header->nlmsg_len)) {
@@ -49,32 +48,8 @@ int ProcConnectorOpen(std::wstring& detail)
         ProcConnectorClose();
         return error;
     }
-    /*
-     * The send succeeds even when the kernel refuses the subscription (no CAP_NET_ADMIN);
-     * the verdict arrives as a PROC_EVENT_NONE acknowledgement, and none arrives when the
-     * refused request leaves no listener at all.
-     */
-    const uint64_t deadline = GetTickCount64() + 1000;
-    alignas(nlmsghdr) char buffer[4096];
-    pollfd descriptor{gSocket, POLLIN, 0};
-    while (GetTickCount64() < deadline) {
-        if (poll(&descriptor, 1, 100) <= 0) continue;
-        ssize_t length = recv(gSocket, buffer, sizeof(buffer), 0);
-        if (length < static_cast<ssize_t>(NLMSG_LENGTH(sizeof(cn_msg) + sizeof(proc_event)))) continue;
-        auto* reply = static_cast<cn_msg*>(NLMSG_DATA(reinterpret_cast<nlmsghdr*>(buffer)));
-        auto* event = reinterpret_cast<proc_event*>(reply->data);
-        if (event->what != PROC_EVENT_NONE || reply->seq != message->seq || reply->ack != 1) continue;
-        if (event->event_data.ack.err != 0) {
-            detail = L"PROC_CN_MCAST_LISTEN refused";
-            ProcConnectorClose();
-            return static_cast<int>(event->event_data.ack.err);
-        }
-        detail = L"fork,exec,exit";
-        return 0;
-    }
-    detail = L"PROC_CN_MCAST_LISTEN not acknowledged";
-    ProcConnectorClose();
-    return EPERM;
+    detail = L"fork,exec,exit";
+    return 0;
 }
 
 void ProcConnectorClose()

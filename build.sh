@@ -33,4 +33,5 @@ if gate build/tests/integration-events-bad.jsonl; then
     echo "[fail] verify_log gate accepted a truncated log" >&2
     exit 1
 fi
+sh tests/linux_proc_connector_test.sh
 echo "linux build and checks passed: $out/msmon-agent"
