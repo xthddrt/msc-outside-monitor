@@ -783,7 +783,7 @@
       "sensor_id": "linux.ebpf_process",
       "kind": "callback",
       "slot": 48,
-      "implementation": "agent/linux/bpf/monitor.bpf.c::mm_fork,mm_exec,mm_exit,mm_mmap_file",
+      "implementation": "agent/linux/bpf/monitor.bpf.c::mm_fork,mm_exec,mm_exit,mm_mmap_file,mm_file_mprotect",
       "event_types": [
         "process_start",
         "process_exit",
@@ -872,7 +872,6 @@
       "implementation": "agent/linux/bpf/monitor.bpf.c::mm_sys_exit,mm_ptrace,mm_bpf,mm_perf",
       "event_types": [
         "file_section",
-        "image_load",
         "process_handle"
       ],
       "expected_in": [

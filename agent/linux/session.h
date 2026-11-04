@@ -89,7 +89,6 @@ private:
     bool running_ = false;
     bool tracking_ = false;
     bool ebpf_ = false;
-    bool pollImages_ = true;
     bool pollNet_ = true;
 };
 

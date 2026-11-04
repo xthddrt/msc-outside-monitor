@@ -63,16 +63,18 @@ sockets of your own processes) is active.
 ## Sensors
 
 With root and a BPF-capable kernel the kernel sensors are used, and the user-space sensors
-of the classes they cover are not started (coverage notes `*_superseded`):
+of the classes they cover are not started (coverage notes `*_superseded`). The maps poll
+is the exception: it always stays active and owns `image_load`, because Wine maps PE
+modules without `PROT_EXEC` and makes their code sections executable with `mprotect`.
 
 | Sensor (slot) | Source | Records |
 |---|---|---|
-| `linux.ebpf_process` (48/54) | `tp_btf/task_newtask` (tracking copied before the child runs), `sched_process_fork/exec/exit`, `lsm/mmap_file` (an untracked process mapping an executable under the root joins the scope) | `process_start` (fork = inherited; exec = value1 1 with the image and argv), `process_exit`, `thread_start`, `thread_exit` |
+| `linux.ebpf_process` (48/54) | `tp_btf/task_newtask` (tracking copied before the child runs), `sched_process_fork/exec/exit`, `lsm/mmap_file` and `lsm/file_mprotect` (an untracked process mapping an executable under the root, or mprotecting a mapped file executable, joins the scope) | `process_start` (fork = inherited; exec = value1 1 with the image and argv), `process_exit`, `thread_start`, `thread_exit` |
 | `linux.ebpf_file` (49/55) | `tp_btf/sys_enter` + `sys_exit` for 85 syscalls of tracked processes | `file_create` (open*, mkdir, mknod), `file_read`/`file_write` (value0 bytes transferred, value1 offset), `file_close`, `file_set_information` (unlink 13, rename 10 as `rename;from`/`rename;to`, link 11, truncate 20), `file_set_security` (chmod/chown/utimes), `file_query_information` (stat, access, readlink, statfs), `file_directory_control` (getdents, value1 bytes), `file_set_ea`/`file_query_ea` |
 | `linux.ebpf_net` (50/56) | the same syscalls on sockets | `network_connect` (connect, sendto with an address), `network_accept` (accept, recvfrom with a source), `network_flow_close` (close of a socket; value0 socket inode) |
 | `linux.ebpf_ipc` (51/57) | AF_UNIX connect/accept, kill/tkill/tgkill | `network_connect`/`network_accept` with `unix:` endpoints, `process_handle` (`signal=N`, target_process_id) |
 | `linux.ebpf_device` (52/58) | ioctl | `file_device_control` (value0 request, value1 argument) |
-| `linux.ebpf_memory` (53/59) | mmap, mprotect, ptrace, process_vm_readv/writev; `lsm/ptrace_access_check`, `lsm/bpf`, `lsm/perf_event_open` | `file_section` (file or executable mappings; value0 flags, value1 protection), `image_load` (each executable file mapping, so stacks resolve), `process_handle` (ptrace request or VM read/write, target_process_id); the tracked tree is refused ptrace of the agent, `bpf()` and `perf_event_open` (`self_protection_denied=` records) |
+| `linux.ebpf_memory` (53/59) | mmap, mprotect, ptrace, process_vm_readv/writev; `lsm/ptrace_access_check`, `lsm/bpf`, `lsm/perf_event_open` | `file_section` (file or executable mappings; value0 flags, value1 protection); an executable file mmap or a successful `mprotect(PROT_EXEC)` triggers an immediate `linux.maps_poll` scan, so `image_load` arrives at once; `process_handle` (ptrace request or VM read/write, target_process_id); the tracked tree is refused ptrace of the agent, `bpf()` and `perf_event_open` (`self_protection_denied=` records) |
 
 Every syscall record carries the syscall name, all six arguments, the result and the
 duration in `detail`, the thread in `thread_id`, the negative errno in `status`, and up to
@@ -88,7 +90,7 @@ Without the kernel sensors (`--no-ebpf`, no root, or an agent built without clan
 |---|---|---|
 | `linux.fanotify` (40/44) | fanotify mount marks: `FAN_ACCESS`, `FAN_MODIFY`, `FAN_CLOSE_WRITE`; filesystem marks with `FAN_REPORT_DFID_NAME`: `FAN_CREATE`, `FAN_DELETE`, `FAN_MOVE` | `file_read`, `file_write`, `file_close`, `file_create`, `file_set_information` (value0 13 = unlink, 10 = rename; detail `unlink`, `rename;from`, `rename;to`) |
 | `linux.proc_connector` (41/45) | netlink process-events connector | `process_start` (fork from a tracked process = inherited; exec of an image under a root = explicit; a tracked exec is logged again with value1 = 1), `process_exit` |
-| `linux.maps_poll` (42/46) | `/proc/<pid>/maps` on track and every 2 s | `image_load` per executable file mapping (value0 base, value1 span) |
+| `linux.maps_poll` (42/46) | `/proc/<pid>/maps` on track, on an executable file mmap/mprotect, and every 2 s (also with the kernel sensors) | `image_load` per executable file mapping (value0 base, value1 span) |
 | `linux.net_poll` (43/47) | `/proc/net/{tcp,tcp6,udp,udp6}` every 1 s, owners via `/proc/<pid>/fd` | `network_connect`, `network_accept`, `network_flow_close` (value0 socket inode) |
 
 Process identity is PID plus start time (from `/proc/<pid>/stat`, in FILETIME units).
@@ -117,6 +119,8 @@ Without them:
 - Sockets are polled once a second: shorter-lived sockets are missed, the first poll reports
   already-open sockets, and timestamps are poll times.
 - Executable mappings are polled every 2 s; a library mapped and unmapped in between is missed.
+  An executable file mmap or `mprotect` triggers an extra scan, so a newly loaded module is
+  recorded at once even though the periodic poll still owns `image_load` under eBPF.
 - `registry_unavailable`, `etw_unavailable`, `blackcat_not_applicable`: no key-level registry, ETW
   (WMI/DNS/RPC/TCPIP/CodeIntegrity) or BlackCat sensors exist. The Windows driver's
   registration slots (20-38) are reported failed with ENOSYS.

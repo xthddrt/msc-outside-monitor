@@ -87,7 +87,8 @@ bool LinuxSession::Start(const MSMON_SESSION_CONFIG& config)
     const bool fileOwned = owns(MSMON_SENSOR_LINUX_EBPF_FILE);
     const bool processOwned = owns(MSMON_SENSOR_LINUX_EBPF_PROCESS);
     const bool netOwned = owns(MSMON_SENSOR_LINUX_EBPF_NET);
-    pollImages_ = !owns(MSMON_SENSOR_LINUX_EBPF_MEMORY);
+    /* The maps poll always runs: it is the only source of image_load for Wine PE modules,
+     * which are mapped without PROT_EXEC and made executable with mprotect later. */
     pollNet_ = !netOwned;
 
     detail.clear();
@@ -120,10 +121,6 @@ bool LinuxSession::Start(const MSMON_SESSION_CONFIG& config)
     }
     const int mapsError = access("/proc/self/maps", R_OK) == 0 ? 0 : errno;
     Registered(MSMON_SENSOR_REG_LINUX_MAPS_POLL, mapsError);
-    if (!pollImages_) {
-        notes_.push_back({L"maps_poll_superseded",
-                          L"image_load comes from mmap records; /proc/<pid>/maps is read once when a process is tracked"});
-    }
     if (pollNet_) {
         const int netError = access("/proc/net/tcp", R_OK) == 0 ? 0 : errno;
         Registered(MSMON_SENSOR_REG_LINUX_NET_POLL, netError);
@@ -185,7 +182,7 @@ void LinuxSession::PollLoop()
             if (stopping_.load()) return;
             if (!tracking_) continue;
         }
-        if (tick % 2 == 0 && pollImages_) {
+        if (tick % 2 == 0) {
             for (const auto& process : TrackedProcesses()) ImagesScan(*this, process.first, process.second);
         }
         if (pollNet_) NetPoll(*this);

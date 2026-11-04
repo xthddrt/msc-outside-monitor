@@ -33,7 +33,7 @@ CALLBACKS = [
     (42, "linux.maps_poll", "agent/linux/images.cpp::ImagesScan", "image_load", "startup,gameplay"),
     (43, "linux.net_poll", "agent/linux/net.cpp::NetPoll", "network_connect,network_accept,network_flow_close",
      "network,gameplay"),
-    (48, "linux.ebpf_process", "agent/linux/bpf/monitor.bpf.c::mm_fork,mm_exec,mm_exit,mm_mmap_file",
+    (48, "linux.ebpf_process", "agent/linux/bpf/monitor.bpf.c::mm_fork,mm_exec,mm_exit,mm_mmap_file,mm_file_mprotect",
      "process_start,process_exit,thread_start,thread_exit", "startup,gameplay"),
     (49, "linux.ebpf_file", "agent/linux/bpf/monitor.bpf.c::mm_sys_enter,mm_sys_exit",
      "file_create,file_read,file_write,file_close,file_set_information,file_set_security,file_query_information,"
@@ -45,7 +45,7 @@ CALLBACKS = [
     (52, "linux.ebpf_device", "agent/linux/bpf/monitor.bpf.c::mm_sys_enter,mm_sys_exit", "file_device_control",
      "file_io,gameplay"),
     (53, "linux.ebpf_memory", "agent/linux/bpf/monitor.bpf.c::mm_sys_exit,mm_ptrace,mm_bpf,mm_perf",
-     "file_section,image_load,process_handle", "gameplay"),
+     "file_section,process_handle", "gameplay"),
 ]
 
 REGISTRATIONS = {

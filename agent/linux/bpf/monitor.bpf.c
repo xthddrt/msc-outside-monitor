@@ -479,12 +479,13 @@ int BPF_PROG(mm_exit, struct task_struct* task, bool group_dead)
     return 0;
 }
 
-/* Scope: an untracked process that maps an executable file under the root is the client. */
-SEC("lsm/mmap_file")
-int BPF_PROG(mm_mmap_file, struct file* file, unsigned long reqprot, unsigned long prot, unsigned long flags, int ret)
+/* Scope: an untracked process that maps an executable file under the root is the client.
+ * Also used from file_mprotect, the path Wine takes: it maps PE sections without
+ * PROT_EXEC and mprotects the code sections executable afterwards. */
+static __always_inline int scope_file(struct file* file)
 {
     struct mm_config* c = cfg();
-    if (ret != 0 || !file || (prot & PROT_EXEC) == 0 || !c) return 0;
+    if (!file || !c) return 0;
     __u32 rootLength = c->root_len;
     if (rootLength == 0 || rootLength >= MM_PATH) return 0;
     __u32 tgid = bpf_get_current_pid_tgid() >> 32;
@@ -512,6 +513,23 @@ int BPF_PROG(mm_mmap_file, struct file* file, unsigned long reqprot, unsigned lo
     }
     bpf_probe_read_kernel(e, sizeof(*e), s);
     bpf_ringbuf_submit(e, 0);
+    return 0;
+}
+
+SEC("lsm/mmap_file")
+int BPF_PROG(mm_mmap_file, struct file* file, unsigned long reqprot, unsigned long prot, unsigned long flags, int ret)
+{
+    if (ret != 0 || (prot & PROT_EXEC) == 0) return 0;
+    if (file) scope_file(file);
+    return 0;
+}
+
+SEC("lsm/file_mprotect")
+int BPF_PROG(mm_file_mprotect, struct vm_area_struct* vma, unsigned long reqprot, unsigned long prot, int ret)
+{
+    if (ret != 0 || (prot & PROT_EXEC) == 0) return 0;
+    struct file* file = BPF_CORE_READ(vma, vm_file);
+    if (file) scope_file(file);
     return 0;
 }
 

@@ -43,6 +43,8 @@ int main(int argc, char** argv)
     fd = open("probe-b.txt", O_RDONLY);
     void* mapping = fd >= 0 ? mmap(NULL, 4096, PROT_READ | PROT_EXEC, MAP_PRIVATE, fd, 0) : MAP_FAILED;
     if (mapping == MAP_FAILED) return 7;
+    /* image_load comes from the 2 s /proc/<pid>/maps poll now, so let one tick see it. */
+    sleep(3);
     munmap(mapping, 4096);
     close(fd);
     if (unlink("probe-b.txt") != 0) return 8;

@@ -399,16 +399,16 @@ void OnSyscall(const mm_event& e)
         if (!fileBacked && !executable) break;
         const std::wstring text = fileBacked ? file : L"anonymous";
         Record(e, MSMON_SENSOR_LINUX_EBPF_MEMORY, MsMonFileSection, e.args[3], e.args[2], text, detail, flags);
-        if (fileBacked && executable && success) {
-            Record(e, MSMON_SENSOR_LINUX_EBPF_MEMORY, MsMonImageLoad, static_cast<uint64_t>(e.ret), e.args[1], file,
-                   L"mmap", flags);
-        }
+        /* The poll owns image_load (it also sees Wine's mprotect(PROT_EXEC) images); rescan
+         * now so a stack right after the mapping resolves without waiting for the tick. */
+        if (fileBacked && executable && success) ImagesScan(session, e.tgid, start);
         break;
     }
     case Op::Mprotect:
         if ((e.args[2] & 0x4) == 0) break;
         Record(e, MSMON_SENSOR_LINUX_EBPF_MEMORY, MsMonFileSection, 0, e.args[2], L"mprotect:" + Hex(e.args[0]),
                detail, 0);
+        if (success) ImagesScan(session, e.tgid, start);
         break;
     case Op::Ptrace:
         Record(e, MSMON_SENSOR_LINUX_EBPF_MEMORY, MsMonProcessHandle, e.args[0], e.args[2], {}, L"ptrace;" + detail, 0,
@@ -585,7 +585,7 @@ int BpfOpen(std::wstring& detail, const std::wstring& root, unsigned& registered
             failed += (failed.empty() ? L"" : L",") + LinuxWide(name) + L"=" + std::to_wstring(errno);
             if (name == "mm_sys_enter" || name == "mm_sys_exit") syscalls = false;
             if (name == "mm_newtask" || name == "mm_fork" || name == "mm_exec" || name == "mm_exit") process = false;
-            if (name == "mm_mmap_file") memory = false;
+            if (name == "mm_mmap_file" || name == "mm_file_mprotect") memory = false;
             continue;
         }
         gBpf.links.push_back(link);
