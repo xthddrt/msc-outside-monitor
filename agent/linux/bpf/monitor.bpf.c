@@ -527,7 +527,7 @@ int BPF_PROG(mm_mmap_file, struct file* file, unsigned long reqprot, unsigned lo
 SEC("lsm/file_mprotect")
 int BPF_PROG(mm_file_mprotect, struct vm_area_struct* vma, unsigned long reqprot, unsigned long prot, int ret)
 {
-    if (ret != 0 || (prot & PROT_EXEC) == 0) return 0;
+    if (ret != 0 || (prot & PROT_EXEC) == 0) return ret;
     struct file* file = BPF_CORE_READ(vma, vm_file);
     if (file) scope_file(file);
     return 0;
