@@ -1,12 +1,15 @@
 #include "etw.h"
+#ifdef _WIN32
 #include "rpc_names.h"
 #include <tdh.h>
 #include <winternl.h>
+#endif
 #include <algorithm>
 #include <cstddef>
 #include <cstring>
 #include <sstream>
 
+#ifdef _WIN32
 #ifndef TRACE_LEVEL_VERBOSE
 #define TRACE_LEVEL_VERBOSE 5
 #endif
@@ -24,6 +27,7 @@ static const GUID CODE_INTEGRITY_EVENTS = { 0x4ee76bd8, 0x3cf4, 0x44a0, { 0xa0, 
  */
 static const ULONGLONG TCPIP_KEYWORDS = 0x0000000400000000ull | 0x0000001000000000ull | 0x0000000200000000ull |
                                         0x0000008000000000ull | 0x80ull | 0x4ull;
+#endif
 
 /* Counter slot per provider; -1 for types that are not provider events. */
 static int ProviderIndex(unsigned long type)
@@ -38,6 +42,7 @@ static int ProviderIndex(unsigned long type)
     }
 }
 
+#ifdef _WIN32
 /*
  * TCP connection lifecycle events kept from Microsoft-Windows-TCPIP.  Each
  * names who ended a connection and how: a local close or abort, a
@@ -85,10 +90,12 @@ static const std::vector<USHORT> TCPIP_EVENT_IDS = {
     1176, 1184, 1201, 1479
 };
 static const std::vector<USHORT> CODE_INTEGRITY_EVENT_IDS = {3076, 3077};
+#endif
 
 static const ULONG ETW_PENDING_LIMIT = 4096;
 static const ULONG ETW_PENDING_MILLISECONDS = 5000;
 
+#ifdef _WIN32
 static const ULONG ETW_CANDIDATE_RECHECK_MILLISECONDS = 1000;
 static const int ETW_CANDIDATE_ANCESTOR_DEPTH = 4;
 
@@ -272,11 +279,13 @@ static void AppendField(std::wstring& target, const std::wstring& name, const st
     if (!target.empty()) target += L";";
     target += name + L"=" + value;
 }
+#endif
 
 EtwCollector::EtwCollector(ProcessScope& scope, EventQueue& queue, uint64_t sessionId, bool capturePayloads,
                            const std::vector<std::wstring>& scopeRoots)
     : scope_(scope), queue_(queue), scopeRoots_(scopeRoots), sessionId_(sessionId), capturePayloads_(capturePayloads) {}
 
+#ifdef _WIN32
 ProcessFacts EtwCollector::FactsForPid(DWORD pid)
 {
     const uint64_t nowTick = GetTickCount64();
@@ -461,6 +470,7 @@ void EtwCollector::Stop()
     }
     session_ = 0;
 }
+#endif
 
 void EtwCollector::Emit(TelemetryEvent&& event)
 {
@@ -482,6 +492,7 @@ void EtwCollector::Emit(TelemetryEvent&& event)
     queue_.Push(std::move(event));
 }
 
+#ifdef _WIN32
 void EtwCollector::OnRecord(PEVENT_RECORD record)
 {
     ULONG type;
@@ -759,6 +770,8 @@ void EtwCollector::OnCodeIntegrityRecord(PEVENT_RECORD record, const TRACE_EVENT
     if (PropertyNumber(record, info, L"Status", number)) event.header.Status = static_cast<LONG>(number);
     Emit(std::move(event));
 }
+
+#endif
 
 void EtwCollector::Defer(TelemetryEvent&& event, uint64_t created)
 {

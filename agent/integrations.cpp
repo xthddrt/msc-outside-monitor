@@ -1,8 +1,102 @@
 #include "integrations.h"
 #include <sstream>
 
+#ifdef _WIN32
 #define KFILTER_IOCTL_GET_STATUS_4 CTL_CODE(FILE_DEVICE_UNKNOWN, 0x800, METHOD_BUFFERED, FILE_READ_ACCESS)
 #define KFILTER_IOCTL_READ_EVENTS_4 CTL_CODE(FILE_DEVICE_UNKNOWN, 0x802, METHOD_BUFFERED, FILE_READ_ACCESS)
+#else
+#include <sys/socket.h>
+#include <sys/un.h>
+
+/* Copied from kernel-filter/linux/kfilter_socket.h, as the Windows structs are copied from kfilter.h. */
+#define KFILTER_SOCKET_PATH_4 "/run/kfilter.sock"
+#define KFILTER_OP_GET_STATUS_4 0x800u
+#define KFILTER_OP_READ_EVENTS_4 0x802u
+
+struct KFilterSocketRequest4 {
+    uint32_t Code;
+    uint32_t InputLength;
+    uint32_t OutputCapacity;
+    uint32_t Reserved;
+};
+
+struct KFilterSocketReply4 {
+    uint32_t Error;
+    uint32_t OutputLength;
+};
+
+static std::wstring ErrnoText(int error)
+{
+    const char* name = strerrorname_np(error);
+    return L"errno " + std::to_wstring(error) + (name != nullptr ? L" " + LinuxWide(name) : L"");
+}
+
+static bool SendAll(int fd, const void* data, size_t size)
+{
+    const char* cursor = static_cast<const char*>(data);
+    while (size != 0) {
+        ssize_t sent = send(fd, cursor, size, MSG_NOSIGNAL);
+        if (sent < 0 && errno == EINTR) continue;
+        if (sent <= 0) return false;
+        cursor += sent;
+        size -= static_cast<size_t>(sent);
+    }
+    return true;
+}
+
+static bool ReceiveAll(int fd, void* data, size_t size)
+{
+    char* cursor = static_cast<char*>(data);
+    while (size != 0) {
+        ssize_t got = recv(fd, cursor, size, 0);
+        if (got < 0 && errno == EINTR) continue;
+        if (got <= 0) {
+            if (got == 0) errno = ECONNRESET;
+            return false;
+        }
+        cursor += got;
+        size -= static_cast<size_t>(got);
+    }
+    return true;
+}
+
+/* A fresh connection per request works whether or not kfilterd keeps connections open. */
+bool KFilterReader::Call(uint32_t code, const void* input, uint32_t inputLength, void* output, uint32_t capacity,
+                         uint32_t& bytes, std::wstring& error)
+{
+    bytes = 0;
+    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) {
+        error = ErrnoText(errno);
+        return false;
+    }
+    sockaddr_un address{};
+    address.sun_family = AF_UNIX;
+    std::strncpy(address.sun_path, KFILTER_SOCKET_PATH_4, sizeof(address.sun_path) - 1);
+    KFilterSocketRequest4 request{code, inputLength, capacity, 0};
+    KFilterSocketReply4 reply{};
+    bool ok = connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0 &&
+              SendAll(fd, &request, sizeof(request)) &&
+              (inputLength == 0 || SendAll(fd, input, inputLength)) &&
+              ReceiveAll(fd, &reply, sizeof(reply));
+    if (!ok) {
+        error = ErrnoText(errno) + L";path=" + LinuxWide(KFILTER_SOCKET_PATH_4);
+    } else if (reply.Error != 0) {
+        error = L"kfilterd " + ErrnoText(static_cast<int>(reply.Error));
+        ok = false;
+    } else if (reply.OutputLength > capacity) {
+        error = L"oversized reply";
+        ok = false;
+    } else if (reply.OutputLength != 0 && !ReceiveAll(fd, output, reply.OutputLength)) {
+        error = ErrnoText(errno);
+        ok = false;
+    } else {
+        bytes = reply.OutputLength;
+    }
+    close(fd);
+    return ok;
+}
+#endif
 
 static std::wstring HexValue(unsigned long value)
 {
@@ -124,22 +218,35 @@ KFilterReader::~KFilterReader()
 
 void KFilterReader::Close()
 {
+#ifdef _WIN32
     if (handle_ != INVALID_HANDLE_VALUE) {
         CloseHandle(handle_);
         handle_ = INVALID_HANDLE_VALUE;
     }
+#else
+    open_ = false;
+#endif
 }
 
 bool KFilterReader::Status(KFILTER_STATUS_4& status, std::wstring& error)
 {
-    DWORD bytes = 0;
     status = {};
+#ifdef _WIN32
+    DWORD bytes = 0;
     if (handle_ == INVALID_HANDLE_VALUE ||
         !DeviceIoControl(handle_, KFILTER_IOCTL_GET_STATUS_4, nullptr, 0,
                          &status, sizeof(status), &bytes, nullptr)) {
         error = L"Win32 " + std::to_wstring(GetLastError());
         return false;
     }
+#else
+    uint32_t bytes = 0;
+    if (!open_) {
+        error = L"not open";
+        return false;
+    }
+    if (!Call(KFILTER_OP_GET_STATUS_4, nullptr, 0, &status, sizeof(status), bytes, error)) return false;
+#endif
     if (bytes != sizeof(status)) {
         error = L"short status response";
         return false;
@@ -149,6 +256,7 @@ bool KFilterReader::Status(KFILTER_STATUS_4& status, std::wstring& error)
 
 bool KFilterReader::Open(KFILTER_STATUS_4& status, std::wstring& state, std::wstring& detail)
 {
+#ifdef _WIN32
     handle_ = CreateFileW(L"\\\\.\\KFilter", GENERIC_READ, 0, nullptr, OPEN_EXISTING,
                           FILE_ATTRIBUTE_NORMAL, nullptr);
     if (handle_ == INVALID_HANDLE_VALUE) {
@@ -156,6 +264,9 @@ bool KFilterReader::Open(KFILTER_STATUS_4& status, std::wstring& state, std::wst
         detail = L"Win32 " + std::to_wstring(GetLastError());
         return false;
     }
+#else
+    open_ = true;
+#endif
     std::wstring error;
     if (!Status(status, error)) {
         state = L"kfilter_unavailable";
@@ -190,13 +301,20 @@ bool KFilterReader::Drain(std::vector<TelemetryEvent>& events, std::wstring& err
     unsigned total = 0;
     for (;;) {
         KFILTER_READ_REQUEST_4 request{};
-        request.MaximumEvents = static_cast<unsigned long>(std::size(buffer));
+        request.MaximumEvents = static_cast<KF4_ULONG>(std::size(buffer));
+#ifdef _WIN32
         DWORD bytes = 0;
         if (!DeviceIoControl(handle_, KFILTER_IOCTL_READ_EVENTS_4, &request, sizeof(request),
                              buffer, sizeof(buffer), &bytes, nullptr)) {
             error = L"Win32 " + std::to_wstring(GetLastError());
             return false;
         }
+#else
+        uint32_t bytes = 0;
+        if (!Call(KFILTER_OP_READ_EVENTS_4, &request, sizeof(request), buffer, sizeof(buffer), bytes, error)) {
+            return false;
+        }
+#endif
         if (bytes % sizeof(KFILTER_EVENT_4) != 0) {
             error = L"invalid event response size";
             return false;

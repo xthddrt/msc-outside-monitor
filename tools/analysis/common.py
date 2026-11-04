@@ -51,12 +51,22 @@ def short_image(path):
 
 
 def dos_path(path, volume=r"\Device\HarddiskVolume3", drive="C:"):
-    """Device path to drive letter, with the user name replaced. Adjust `volume` for other machines."""
+    """Device path to drive letter, with the user name replaced. Adjust `volume` for other machines.
+
+    Linux paths are already absolute; only the /home/<user> name is replaced."""
     text = path or ""
+    if text.startswith("/"):
+        return re.sub(r"^/home/[^/]+/", "/home/<you>/", text)
     if text.startswith(volume):
         text = drive + text[len(volume):]
     text = re.sub(r"^\\\?\?\\", "", text)
     return re.sub(r"\\Users\\[^\\]+\\", r"\\Users\\<you>\\", text)
+
+
+def path_prefix(path, parts):
+    """The first `parts` components of a Windows or Linux path, in its own separator."""
+    separator = "/" if path.startswith("/") else "\\"
+    return separator.join(path.split(separator)[:parts])
 
 
 def registry_key(key):

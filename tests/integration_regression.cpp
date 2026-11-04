@@ -2,6 +2,7 @@
 #include "../agent/classify.h"
 #include "../agent/etw.h"
 #include "../agent/rpc_names.h"
+#include <cstring>
 #include <fstream>
 #include <iostream>
 #include <string>
@@ -155,6 +156,30 @@ int main()
         ok &= Check(!collector.ResolveTcpOwner(9, 0, unknown, ownerEndpoints, owner, ownerStart),
                     "a reused PID no longer owns the cached connection");
     }
+    /* Linux paths classify through the same separator-folded terms. */
+    {
+        OutsideClassifier linuxClassifier(L"/opt/client", L"/opt/client", L"/usr", L"/usr");
+        auto category = [&](unsigned long type, const wchar_t* path) {
+            TelemetryEvent file;
+            file.header.Type = type;
+            file.text = path;
+            linuxClassifier.Classify(file);
+            return file.header.Category;
+        };
+        ok &= Check(category(MsMonFileRead, L"/sys/devices/virtual/dmi/id/product_uuid") == MsMonCategoryHardwareIdentity &&
+                        category(MsMonFileRead, L"/proc/cpuinfo") == MsMonCategoryHardwareIdentity &&
+                        category(MsMonFileRead, L"/sys/devices/pci0000:00/0000:00:1d.0/nvme/nvme0/serial") ==
+                            MsMonCategoryHardwareIdentity &&
+                        category(MsMonFileCreate, L"/etc/machine-id") == MsMonCategoryHardwareIdentity,
+                    "Linux identity files are hardware identity");
+        ok &= Check(category(MsMonFileRead, L"/opt/client/data.bin") == MsMonCategoryClientData &&
+                        category(MsMonImageLoad, L"/usr/lib/libc.so.6") == MsMonCategoryWindowsRuntime &&
+                        category(MsMonFileRead, L"/proc/self/maps") == MsMonCategoryWindowsRuntime &&
+                        category(MsMonFileWrite, L"/home/user/.config/x") == MsMonCategoryUserData &&
+                        category(MsMonFileRead, L"/system/x") == MsMonCategoryUnknown,
+                    "Linux client, runtime and user paths");
+    }
+
     const auto& opnumProperties = RpcOpnumProperties();
     ok &= Check(opnumProperties.size() == 3 && opnumProperties[0] == L"ProcNum" &&
                 opnumProperties[1] == L"OpNum" && opnumProperties[2] == L"OperationNum",
@@ -201,8 +226,9 @@ int main()
     ok &= Check(MsMonFlowRemoveComplete(static_cast<long>(0xC0000022)) == 0,
                 "an ordinary flow removal failure is not complete");
 
-    ok &= Check(sizeof(KFILTER_EVENT_4) == 1064 && sizeof(KFILTER_STATUS_4) == 80 &&
-                sizeof(KFILTER_READ_REQUEST_4) == 8, "ABI 4 layouts");
+    /* kfilterd's Linux layout keeps the 32-bit fields; only wchar_t grows to 4 bytes. */
+    ok &= Check(sizeof(KFILTER_EVENT_4) == (sizeof(wchar_t) == 2 ? 1064u : 2088u) &&
+                sizeof(KFILTER_STATUS_4) == 80 && sizeof(KFILTER_READ_REQUEST_4) == 8, "ABI 4 layouts");
     KFILTER_EVENT_4 source{};
     source.Timestamp = 123456789;
     source.ProcessId = 42;
@@ -463,7 +489,7 @@ int main()
         const uint32_t labelBytes = 8;
         std::memcpy(identity.data() + 8, &serial, sizeof(serial));
         std::memcpy(identity.data() + 12, &labelBytes, sizeof(labelBytes));
-        const wchar_t label[] = L"VOL1";
+        const char16_t label[] = u"VOL1";
         std::memcpy(identity.data() + 18, label, labelBytes);
         const std::string identityJson = TelemetryJson(volumeEvent(1, identity));
         ok &= Check(identityJson.find("\"volume_serial_hex\":\"12345678\"") != std::string::npos &&
@@ -479,7 +505,7 @@ int main()
                     "a size-information payload is not decoded as a volume identity");
     }
 
-    JsonlWriter writer(L"build\\tests\\integration-events.jsonl", 0);
+    JsonlWriter writer(L"build/tests/integration-events.jsonl", 0);
     ok &= Check(writer.Open(), "open JSONL output");
     ok &= Check(writer.Write(TelemetryJson(firstDecision)), "write first KFilter JSON");
     ok &= Check(writer.Write(TelemetryJson(secondDecision)), "write second KFilter JSON");
@@ -488,7 +514,7 @@ int main()
     ok &= Check(writer.Close(), "close JSONL output");
 
     /* verify_log.py keys written events on (source, sequence); zero would hide them. */
-    std::ifstream written(L"build\\tests\\integration-events.jsonl");
+    std::ifstream written("build/tests/integration-events.jsonl");
     std::vector<std::string> sequences;
     std::string line;
     while (std::getline(written, line)) {
@@ -505,7 +531,7 @@ int main()
                 "written decisions are numbered 1..N");
 
     /* The fixture must be the record class production writes at shutdown (type 111). */
-    std::ifstream serialized(L"build\\tests\\integration-events.jsonl");
+    std::ifstream serialized("build/tests/integration-events.jsonl");
     unsigned coverageUsageRecords = 0;
     while (std::getline(serialized, line)) {
         if (line.find("\"type\":\"coverage_usage\"") == std::string::npos) continue;

@@ -3,6 +3,7 @@
 #include <cwctype>
 #include <sstream>
 
+/* Both separators fold to '\\', so Linux paths match the same terms as Windows ones. */
 static std::wstring Normalize(std::wstring value)
 {
     std::replace(value.begin(), value.end(), L'/', L'\\');
@@ -73,14 +74,23 @@ void OutsideClassifier::Classify(TelemetryEvent& event) const
         event.header.Category = ContainsAny(text, {
             L"harddisk", L"physicaldrive", L"scsi", L"nvme", L"volume{", L"mounteddevice"
         }) ? MsMonCategoryHardwareIdentity : event.header.Category;
+    } else if (type >= MsMonFileCreate && type <= MsMonFileSetEa &&
+               (ContainsAny(text, {L"\\dmi\\id\\", L"\\proc\\cpuinfo", L"machine-id"}) ||
+                (StartsWith(text, L"\\sys") && text.size() > 7 &&
+                 text.compare(text.size() - 7, 7, L"\\serial") == 0))) {
+        /* Linux identity files.  Event paths are canonical, so /sys/class/dmi/id/... arrives as
+         * /sys/devices/virtual/dmi/id/... and /sys/block/<disk>/serial as a /sys/devices path. */
+        event.header.Category = MsMonCategoryHardwareIdentity;
     }
 
     if (event.header.Category == MsMonCategoryUnknown || event.header.Category == MsMonCategoryIpc) {
         if (StartsWith(text, clientDos_) || StartsWith(text, clientNt_)) {
             event.header.Category = MsMonCategoryClientData;
-        } else if (StartsWith(text, windowsDos_) || StartsWith(text, windowsNt_)) {
+        } else if (StartsWith(text, windowsDos_) || StartsWith(text, windowsNt_) ||
+                   StartsWith(text, L"\\proc") || StartsWith(text, L"\\sys")) {
             event.header.Category = MsMonCategoryWindowsRuntime;
-        } else if (ContainsAny(text, {L"\\users\\", L"\\documents and settings\\"})) {
+        } else if (ContainsAny(text, {L"\\users\\", L"\\documents and settings\\"}) ||
+                   StartsWith(text, L"\\home")) {
             event.header.Category = MsMonCategoryUserData;
         }
     }
