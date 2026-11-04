@@ -3,9 +3,14 @@
 #include "etw.h"
 #include "integrations.h"
 #include "../include/msmon_coverage.h"
+#ifdef _WIN32
 #include <tlhelp32.h>
 #include <bcrypt.h>
 #include <winver.h>
+#else
+#include "linux/session.h"
+#include <algorithm>
+#endif
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -23,7 +28,9 @@
 #include <sstream>
 #include <thread>
 
+#ifdef _WIN32
 #pragma comment(lib, "version.lib")
+#endif
 
 static std::atomic<bool> gStop(false);
 
@@ -105,6 +112,13 @@ static std::wstring MachineLabel()
 static std::string MachineIdHash()
 {
     std::string material;
+#ifndef _WIN32
+    for (const char* path : {"/etc/machine-id", "/var/lib/dbus/machine-id"}) {
+        std::ifstream file(path);
+        if (std::getline(file, material) && !material.empty()) break;
+    }
+    return material.empty() ? std::string() : "sha256:" + Sha256(material);
+#else
     wchar_t guid[128];
     DWORD bytes = sizeof(guid);
     if (RegGetValueW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Cryptography", L"MachineGuid",
@@ -119,10 +133,16 @@ static std::string MachineIdHash()
         material += ":" + std::to_string(serial);
     }
     return material.empty() ? std::string() : "sha256:" + Sha256(material);
+#endif
 }
 
 static std::string ClientVersion(const std::wstring& path)
 {
+#ifndef _WIN32
+    /* ELF executables carry no version resource. */
+    (void)path;
+    return {};
+#else
     DWORD handle = 0;
     DWORD size = GetFileVersionInfoSizeW(path.c_str(), &handle);
     if (size == 0) return {};
@@ -137,6 +157,7 @@ static std::string ClientVersion(const std::wstring& path)
              HIWORD(info->dwFileVersionMS), LOWORD(info->dwFileVersionMS),
              HIWORD(info->dwFileVersionLS), LOWORD(info->dwFileVersionLS));
     return buffer;
+#endif
 }
 
 static std::wstring ExecutablePath()
@@ -149,10 +170,15 @@ static std::wstring ExecutablePath()
 
 static std::wstring DriverFilePath()
 {
+#ifndef _WIN32
+    /* The Linux sensors are part of the agent binary. */
+    return {};
+#else
     wchar_t system[32768];
     UINT size = GetSystemDirectoryW(system, static_cast<UINT>(std::size(system)));
     if (size == 0 || size >= std::size(system)) return {};
     return std::wstring(system, size) + L"\\drivers\\msmon.sys";
+#endif
 }
 
 static bool ReadTextFile(const std::filesystem::path& path, std::string& output)
@@ -259,7 +285,7 @@ static std::string BuildCoverageJson(
     const std::wstring& kfilterState, uint64_t kfilterDropped,
     const std::unordered_map<unsigned long, uint64_t>& eventCounts)
 {
-    auto delta = [&](unsigned __int64 end, unsigned __int64 begin) { return end - begin; };
+    auto delta = [&](uint64_t end, uint64_t begin) { return end - begin; };
     std::ostringstream json;
     json << "{\"schema_version\":1,\"session_uuid\":\"" << WideToUtf8(sessionUuid) << "\""
          << ",\"driver_supported\":" << (supported ? "true" : "false")
@@ -390,6 +416,32 @@ static std::string BuildSessionMeta(
     return json.str();
 }
 
+#ifndef _WIN32
+static std::wstring FullPath(const std::wstring& input)
+{
+    std::error_code error;
+    if (input.empty()) return {};
+    std::wstring output = std::filesystem::absolute(input, error).lexically_normal().wstring();
+    while (output.size() > 1 && output.back() == L'/') output.pop_back();
+    return error ? std::wstring() : output;
+}
+
+/* Linux paths are used as they are: the sensors see the same absolute names. */
+static bool DevicePath(const std::wstring& dosPath, std::wstring& devicePath, std::string& error)
+{
+    if (dosPath.empty() || dosPath[0] != L'/') {
+        error = "Only absolute paths are supported";
+        return false;
+    }
+    devicePath = dosPath;
+    return true;
+}
+
+static bool ProcessIdentity(DWORD pid, std::wstring& path, uint64_t& startTime)
+{
+    return LinuxProcessIdentity(pid, path, startTime);
+}
+#else
 static std::wstring FullPath(const std::wstring& input)
 {
     DWORD needed = GetFullPathNameW(input.c_str(), 0, nullptr, nullptr);
@@ -511,6 +563,7 @@ private:
     HANDLE handle_ = INVALID_HANDLE_VALUE;
     bool started_ = false;
 };
+#endif
 
 /*
  * Drains the driver on its own thread.  When reading shared one loop with
@@ -681,8 +734,12 @@ private:
 static bool IsUnderRoot(const std::wstring& root, const std::wstring& path)
 {
     if (path.size() <= root.size()) return false;
+#ifdef _WIN32
     if (_wcsnicmp(path.c_str(), root.c_str(), root.size()) != 0) return false;
     return path[root.size()] == L'\\';
+#else
+    return path.compare(0, root.size(), root) == 0 && (root == L"/" || path[root.size()] == L'/');
+#endif
 }
 
 static bool IsUnderAnyRoot(const std::vector<std::wstring>& roots, const std::wstring& path)
@@ -717,6 +774,7 @@ public:
     FileSnapshotter(const std::filesystem::path& sessionDir, std::vector<std::wstring> roots)
         : directory_(sessionDir / L"snapshots"), roots_(std::move(roots))
     {
+#ifdef _WIN32
         for (wchar_t letter = L'A'; letter <= L'Z'; letter++) {
             wchar_t drive[3] = {letter, L':', L'\0'};
             wchar_t target[1024];
@@ -724,6 +782,7 @@ public:
                 devices_.emplace_back(target, drive);
             }
         }
+#endif
     }
 
     void Note(const std::wstring& devicePath)
@@ -761,6 +820,9 @@ private:
 
     std::wstring DosPath(const std::wstring& devicePath) const
     {
+#ifndef _WIN32
+        return devicePath;
+#endif
         for (const auto& device : devices_) {
             const std::wstring& prefix = device.first;
             if (devicePath.size() > prefix.size() &&
@@ -887,6 +949,24 @@ static unsigned TrackExisting(DeviceSession& device, const std::vector<std::wstr
     return count;
 }
 
+/* The executable whose hash and version identify the client; empty when there is none. */
+static std::filesystem::path ClientExecutable(const std::wstring& scopeRoot)
+{
+    std::error_code error;
+#ifdef _WIN32
+    std::filesystem::path executable = std::filesystem::path(scopeRoot) / L"MapleStory.exe";
+    return std::filesystem::exists(executable, error) ? executable : std::filesystem::path();
+#else
+    /* Any client: the first (by name) executable regular file directly under the scope root. */
+    std::vector<std::filesystem::path> found;
+    for (const auto& entry : std::filesystem::directory_iterator(scopeRoot, error)) {
+        if (entry.is_regular_file(error) && access(entry.path().c_str(), X_OK) == 0) found.push_back(entry.path());
+    }
+    std::sort(found.begin(), found.end());
+    return found.empty() ? std::filesystem::path() : found.front();
+#endif
+}
+
 static std::wstring DefaultOutputPath()
 {
     SYSTEMTIME time{};
@@ -916,7 +996,11 @@ static bool ParseNumber(const wchar_t* text, uint64_t& value)
 
 int wmain(int argc, wchar_t** argv)
 {
+#ifdef _WIN32
     std::wstring clientRoot = L"C:\\Nexon\\Library\\maplestorycw";
+#else
+    std::wstring clientRoot = L".";
+#endif
     std::wstring scopeRootArg;
     std::vector<std::wstring> extraRootArgs;
     std::wstring output = DefaultOutputPath();
@@ -1058,9 +1142,13 @@ int wmain(int argc, wchar_t** argv)
         std::filesystem::exists(std::filesystem::path(scopeRoot) / L"appdata" / L"MapleStory.exe", fsError)) {
         scopeRoot = (std::filesystem::path(scopeRoot) / L"appdata").wstring();
     }
-    if (!std::filesystem::exists(std::filesystem::path(scopeRoot) / L"MapleStory.exe", fsError) &&
-        explicitPids.empty()) {
+    const std::filesystem::path clientExe = ClientExecutable(scopeRoot);
+    if (clientExe.empty() && explicitPids.empty()) {
+#ifdef _WIN32
         std::cerr << "No MapleStory.exe was found under scope root:\n  " << WideToUtf8(scopeRoot)
+#else
+        std::cerr << "No executable file was found directly under scope root:\n  " << WideToUtf8(scopeRoot)
+#endif
                   << "\nUse --scope-root to point at the folder containing the executable, or --pid for an already running process.\n";
         return 1;
     }
@@ -1114,12 +1202,17 @@ int wmain(int argc, wchar_t** argv)
     }
     std::vector<std::wstring> scopeRoots{scopeRoot};
     scopeRoots.insert(scopeRoots.end(), extraRoots.begin(), extraRoots.end());
+#ifdef _WIN32
     wchar_t windowsBuffer[32768];
     if (GetWindowsDirectoryW(windowsBuffer, static_cast<UINT>(std::size(windowsBuffer))) == 0) {
         std::cerr << "Could not resolve the Windows directory.\n";
         return 1;
     }
     std::wstring windowsDos = windowsBuffer;
+#else
+    /* The OS runtime the classifier calls windows_runtime: libraries and programs under /usr. */
+    std::wstring windowsDos = L"/usr";
+#endif
     std::wstring windowsNt;
     if (!DevicePath(windowsDos, windowsNt, error)) {
         std::cerr << error << "\n";
@@ -1181,9 +1274,7 @@ int wmain(int argc, wchar_t** argv)
     if (binaries.buildCommit.empty()) binaries.buildCommit = "unknown";
     binaries.agentHash = Sha256File(ExecutablePath());
     binaries.driverHash = Sha256File(DriverFilePath());
-    std::filesystem::path clientExe = std::filesystem::path(scopeRoot) / L"MapleStory.exe";
-    std::error_code clientError;
-    if (std::filesystem::exists(clientExe, clientError)) {
+    if (!clientExe.empty()) {
         binaries.clientVersion = ClientVersion(clientExe.wstring());
         binaries.clientHash = Sha256File(clientExe.wstring());
     }
@@ -1313,7 +1404,7 @@ int wmain(int argc, wchar_t** argv)
             firstCallback = false;
         };
         auto registrationSucceeded = [&](unsigned slot) {
-            const unsigned __int64 bit = 1ull << slot;
+            const uint64_t bit = 1ull << slot;
             return startCoverageSupported &&
                    (startCoverage.RegistrationOk & bit) != 0 &&
                    (startCoverage.RegistrationFailed & bit) == 0;
@@ -1326,6 +1417,10 @@ int wmain(int argc, wchar_t** argv)
             if (registrationSucceeded(MSMON_SENSOR_REG_IMAGE_NOTIFY)) appendCallback(L"image");
             if (registrationSucceeded(MSMON_SENSOR_REG_OBJECT_PROCESS)) appendCallback(L"object_process");
             if (registrationSucceeded(MSMON_SENSOR_REG_OBJECT_THREAD)) appendCallback(L"object_thread");
+            if (registrationSucceeded(MSMON_SENSOR_REG_LINUX_FANOTIFY)) appendCallback(L"fanotify");
+            if (registrationSucceeded(MSMON_SENSOR_REG_LINUX_PROC_CONNECTOR)) appendCallback(L"proc_connector");
+            if (registrationSucceeded(MSMON_SENSOR_REG_LINUX_MAPS_POLL)) appendCallback(L"maps_poll");
+            if (registrationSucceeded(MSMON_SENSOR_REG_LINUX_NET_POLL)) appendCallback(L"net_poll");
             fileRegistered = registrationSucceeded(MSMON_SENSOR_REG_FILTER_REGISTER) &&
                              registrationSucceeded(MSMON_SENSOR_REG_FILTER_START);
             if (fileRegistered) {
@@ -1363,13 +1458,33 @@ int wmain(int argc, wchar_t** argv)
                                 L";registry_enum_names=" + registryState +
                                 L";memory=false;ui=false;hardware_direct=false";
         if (!startCoverageSupported) manifest += L";driver_registration=unknown";
+#ifdef _WIN32
         manifest += L";" + IntegrationCoverageState(enableEtw, kfilterState);
+#else
+        /* ETW never runs on Linux (etw_unavailable follows). */
+        manifest += L";" + IntegrationCoverageState(false, kfilterState);
+#endif
         manifest += sessionDir.empty() ? L";file_snapshots=disabled" : L";file_snapshots=client_text_files";
         manifest += L";etw_level=verbose;payload_mode=";
         manifest += capturePayloads ? L"full" : L"metadata";
         manifest += L";blind_spots=per_page_mmap_io,named_pipe_payload,memory_ops,ui_clipboard_input,hardware_direct,brokered_actions,tls_plaintext";
         if (!writeCoverage(L"coverage_manifest", manifest)) return 1;
     }
+#ifndef _WIN32
+    if (!writeCoverage(L"payload_unavailable",
+                       L"Linux has no registry values or volume-information queries to capture; hardware identity is"
+                       L" seen as file events on /sys/class/dmi/id/*, /proc/cpuinfo and /sys/block/*/serial; file and"
+                       L" network contents are not captured")) return 1;
+    if (!writeCoverage(L"coverage_limit",
+                       L"fanotify file events carry no byte counts, offsets, open flags or status; sockets are polled"
+                       L" from /proc/net once a second (shorter-lived sockets are missed, already-open ones are reported"
+                       L" by the first poll, timestamps are poll times); executable mappings are polled from"
+                       L" /proc/<pid>/maps every two seconds; no thread, handle, registry, ETW, stack or payload sensors;"
+                       L" pre-start activity and dropped events are not guaranteed")) return 1;
+    for (const auto& note : device.Notes()) {
+        if (!writeCoverage(note.first, note.second)) return 1;
+    }
+#else
     if (!writeCoverage(capturePayloads ? L"payload_capture_enabled" : L"payload_capture_disabled",
                        capturePayloads ?
                            L"Exact registry values and volume information will be logged; logs may contain hardware identifiers and registry secrets. Registry values are capped at 64 KiB; WMI result rows, direct adapter-API results, file contents, and network contents remain unavailable" :
@@ -1404,6 +1519,7 @@ int wmain(int argc, wchar_t** argv)
         if (!writeCoverage(L"blackcat_device_discovery",
                            L"matches=" + std::to_wstring(discovered))) return 1;
     }
+#endif
     if (enableEtw) {
         etw = std::make_unique<EtwCollector>(scope, etwQueue, sessionId, capturePayloads, scopeRoots);
         if (!etw->Start(error)) {
@@ -1808,3 +1924,15 @@ int wmain(int argc, wchar_t** argv)
     SetConsoleCtrlHandler(ConsoleHandler, FALSE);
     return result;
 }
+
+#ifndef _WIN32
+int main(int argc, char** argv)
+{
+    std::vector<std::wstring> arguments;
+    for (int index = 0; index < argc; index++) arguments.push_back(LinuxWide(argv[index]));
+    std::vector<wchar_t*> pointers;
+    for (auto& argument : arguments) pointers.push_back(argument.data());
+    pointers.push_back(nullptr);
+    return wmain(argc, pointers.data());
+}
+#endif

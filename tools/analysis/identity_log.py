@@ -39,6 +39,12 @@ IDENTITY_TEXT = re.compile(
     r"shell folders|volatile environment|identitycrl|susclientid|defaultusername|defaultdomainname",
     re.I,
 )
+# Linux identity files; event paths are canonical, so /sys/class/dmi/id and /sys/block/<disk> may
+# arrive as their /sys/devices targets.
+LINUX_IDENTITY = re.compile(
+    r"^/sys/(class|devices/virtual)/dmi/id/|^/etc/machine-id$|^/var/lib/dbus/machine-id$|^/proc/cpuinfo$|"
+    r"^/sys/(block|devices)/.*/serial$"
+)
 CONNECTIONS = {"network_connect", "network_accept", "network_flow_established",
                "network_flow_close", "etw_tcp"}
 DIRECT = {"etw_wmi", "etw_dns", "etw_rpc"}
@@ -80,6 +86,8 @@ def identity_event(event, deny_rules=None):
     if kind == "image_load":
         name = text.replace("/", "\\").rsplit("\\", 1)[-1].lower()
         return name.endswith(".sys") or name in RISK_MODULES
+    if kind.startswith("file_") and LINUX_IDENTITY.search(text):
+        return True
     if kind == "coverage" and text == "blackcat_loaded":
         return True
     if kind == "kfilter_decision" and ("action=RISK" in detail or "decision=RISK" in detail):
@@ -178,6 +186,9 @@ def self_test():
             {"type": "network_flow_close", "timestamp": "t7", "process_id": 8,
              "text": "10.0.0.5:52000 -> 203.0.113.10:443", "detail": "flow=17;state=closed"},
             {"type": "file_read", "timestamp": "t6", "process_id": 7, "text": "ordinary.txt"},
+            {"type": "file_read", "timestamp": "t16", "process_id": 7, "text": "/sys/devices/virtual/dmi/id/product_uuid"},
+            {"type": "file_read", "timestamp": "t17", "process_id": 7, "text": "/sys/devices/pci0000:00/nvme/nvme0/serial"},
+            {"type": "file_read", "timestamp": "t18", "process_id": 7, "text": "/home/user/ordinary-linux.txt"},
             # Rule 2 is the policy's explicit deny (the network rule is not numbered).
             {"type": "kfilter_decision", "timestamp": "t8", "process_id": 7,
              "text": "\\REGISTRY\\MACHINE\\DenyKey\\IdentityDenied", "detail": "action=deny;rule_id=2"},
@@ -210,16 +221,17 @@ def self_test():
             encoding="utf-8")
         output = root / "identity.md"
         counts = append_identity_log(bundle, policy, output)
-        assert counts == (12, 3), counts
+        assert counts == (14, 3), counts
         text = output.read_text(encoding="utf-8")
         for expected in ("Win32_ComputerSystemProduct", "login.example", "SamrLookupNamesInDomain",
                          "action=RISK", "Software\\Valve", "login-endpoint", "CPUID/MSR", "Machine SID",
                          "driver_dropped=2", "10.0.0.5:52000 -> 203.0.113.10:443",
                          "audit-reason", "deny-reason", "\\REGISTRY\\MACHINE\\AuditKey",
                          "\\REGISTRY\\MACHINE\\DenyKey", "IdentityDenied", "\\Device\\Nsi",
-                         "DeviceAllow", "DeviceDeny", "DeviceAudit", "DeviceRisk", "0x006D0008"):
+                         "DeviceAllow", "DeviceDeny", "DeviceAudit", "DeviceRisk", "0x006D0008",
+                         "dmi/id/product_uuid", "nvme0/serial"):
             assert expected in text, expected
-        for unexpected in ("ordinary.txt", "DefaultDenied", "SpentAllow"):
+        for unexpected in ("ordinary.txt", "ordinary-linux.txt", "DefaultDenied", "SpentAllow"):
             assert unexpected not in text, unexpected
         append_identity_log(bundle, policy, output)
         text = output.read_text(encoding="utf-8")

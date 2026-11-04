@@ -1,9 +1,11 @@
 #pragma once
 
 #include "telemetry.h"
+#ifdef _WIN32
 #include <evntrace.h>
 #include <evntcons.h>
 #include <tdh.h>
+#endif
 #include <deque>
 #include <mutex>
 #include <thread>
@@ -54,16 +56,18 @@ public:
     uint64_t Expired(int index) const { return index >= 0 && index < PROVIDERS ? expired_[index].load() : 0; }
 
 private:
+#ifdef _WIN32
     static ULONG WINAPI BufferCallback(PEVENT_TRACE_LOGFILEW logfile);
     void OnRecord(PEVENT_RECORD record);
     void OnTcpRecord(PEVENT_RECORD record, const TRACE_EVENT_INFO* info);
     void OnCodeIntegrityRecord(PEVENT_RECORD record, const TRACE_EVENT_INFO* info);
     void EnableProvider(const GUID& provider, const std::wstring& name, ULONGLONG anyKeyword = 0,
                         const std::vector<USHORT>& eventIds = {}, bool stacks = true);
-    void Emit(TelemetryEvent&& event);
-    std::wstring ProviderName(unsigned long type) const;
     bool MayBelongToClient(DWORD pid, uint64_t nowFileTime);
     ProcessFacts FactsForPid(DWORD pid);
+#endif
+    void Emit(TelemetryEvent&& event);
+    std::wstring ProviderName(unsigned long type) const;
 
     struct CandidateDecision {
         ProcessFacts facts;
@@ -85,10 +89,12 @@ private:
     std::unordered_map<DWORD, CandidateDecision> candidates_;
     uint64_t sessionId_;
     bool capturePayloads_ = true;
+#ifdef _WIN32
     TRACEHANDLE session_ = 0;
     TRACEHANDLE trace_ = 0;
     std::wstring loggerName_;
     std::vector<BYTE> properties_;
+#endif
     std::thread worker_;
     std::atomic<uint64_t> sequence_{0};
     std::atomic<uint64_t> unattributed_{0};

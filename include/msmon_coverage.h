@@ -1,5 +1,13 @@
 #pragma once
 
+/* Kernel-mode builds may not have the CRT's <stdint.h>; MSVC accepts the identical
+ * typedef if it is also included elsewhere. */
+#if defined(_KERNEL_MODE)
+typedef unsigned __int64 uint64_t;
+#else
+#include <stdint.h>
+#endif
+
 /*
  * Runtime sensor accounting.  This is additive: it does not change the event
  * header or MSMON_STATISTICS.  One slot per event type and one per sensor/call
@@ -48,7 +56,17 @@ typedef enum _MSMON_SENSOR_ID {
     MSMON_SENSOR_REG_ETW_RPC = 37,
     MSMON_SENSOR_REG_ATTRIBUTION = 38,
 
-    MSMON_SENSOR_MAX = 39
+    /* Linux agent sensors (agent/linux): event sources, then their set-up calls. */
+    MSMON_SENSOR_LINUX_FANOTIFY = 40,
+    MSMON_SENSOR_LINUX_PROC_CONNECTOR = 41,
+    MSMON_SENSOR_LINUX_MAPS_POLL = 42,
+    MSMON_SENSOR_LINUX_NET_POLL = 43,
+    MSMON_SENSOR_REG_LINUX_FANOTIFY = 44,
+    MSMON_SENSOR_REG_LINUX_PROC_CONNECTOR = 45,
+    MSMON_SENSOR_REG_LINUX_MAPS_POLL = 46,
+    MSMON_SENSOR_REG_LINUX_NET_POLL = 47,
+
+    MSMON_SENSOR_MAX = 48
 } MSMON_SENSOR_ID;
 
 typedef enum _MSMON_SKIP_REASON {
@@ -64,21 +82,21 @@ typedef enum _MSMON_SKIP_REASON {
 typedef struct _MSMON_COVERAGE {
     unsigned long Version;
     unsigned long Size;
-    unsigned __int64 SessionId;
-    unsigned __int64 EventAttempted[MSMON_EVENT_SLOTS];
-    unsigned __int64 EventDropped[MSMON_EVENT_SLOTS];
-    unsigned __int64 SensorEntered[MSMON_SENSOR_SLOTS];
-    unsigned __int64 SensorLogged[MSMON_SENSOR_SLOTS];
-    unsigned __int64 SkipUntracked;
-    unsigned __int64 SkipIrql;
-    unsigned __int64 SkipNoName;
-    unsigned __int64 AllocFailures;
-    unsigned __int64 TrackFailures;
-    unsigned __int64 QueueDrops;
-    unsigned __int64 BlackCatMatches;
-    unsigned __int64 PayloadCaptured[4];
-    unsigned __int64 RegistrationOk;
-    unsigned __int64 RegistrationFailed;
+    uint64_t SessionId;
+    uint64_t EventAttempted[MSMON_EVENT_SLOTS];
+    uint64_t EventDropped[MSMON_EVENT_SLOTS];
+    uint64_t SensorEntered[MSMON_SENSOR_SLOTS];
+    uint64_t SensorLogged[MSMON_SENSOR_SLOTS];
+    uint64_t SkipUntracked;
+    uint64_t SkipIrql;
+    uint64_t SkipNoName;
+    uint64_t AllocFailures;
+    uint64_t TrackFailures;
+    uint64_t QueueDrops;
+    uint64_t BlackCatMatches;
+    uint64_t PayloadCaptured[4];
+    uint64_t RegistrationOk;
+    uint64_t RegistrationFailed;
     long RegistrationStatus[MSMON_SENSOR_SLOTS];
 } MSMON_COVERAGE;
 #pragma pack(pop)

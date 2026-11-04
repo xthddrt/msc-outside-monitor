@@ -9,7 +9,7 @@ import re
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from common import dos_path, iter_events, process_rights, registry_key, short_image  # noqa: E402
+from common import dos_path, iter_events, path_prefix, process_rights, registry_key, short_image  # noqa: E402
 
 IOCTL = {
     0x2D1400: "IOCTL_STORAGE_QUERY_PROPERTY (disk model/serial)",
@@ -41,6 +41,17 @@ BUCKETS = [
     ("mailslots", r"^\\device\\mailslot"),
     ("volumes / disks", r"^\\device\\harddiskvolume\d+\\?$|^\\device\\harddisk|^\\device\\physicaldrive|^c:\\?$"),
     ("other devices", r"^\\device\\"),
+    # Linux agent paths (absolute, /home/<user> already replaced by dos_path).
+    ("your home folder", r"^/home/<you>/"),
+    ("temporary files (/tmp, /var/tmp)", r"^/(var/)?tmp/"),
+    ("hardware identity files", r"^/sys/(class/dmi/id|devices/virtual/dmi/id)/|^/proc/cpuinfo$|^/etc/machine-id$|"
+                                r"^/var/lib/dbus/machine-id$|^/sys/.*/serial$"),
+    ("/proc (process and kernel state)", r"^/proc/"),
+    ("/sys (devices and kernel)", r"^/sys/"),
+    ("/dev (devices)", r"^/dev/"),
+    ("/etc (system configuration)", r"^/etc/"),
+    ("system files (/usr, /lib, /opt)", r"^/(usr|lib|lib64|bin|sbin|opt)/"),
+    ("/run and /var", r"^/(run|var)/"),
 ]
 
 IDENTITY = re.compile(r"Cryptography|MachineGuid|ComputerName|HARDWARE\\DESCRIPTION|SystemInformation|BIOS|"
@@ -141,7 +152,7 @@ def collect(session_dir):
             process.end = max(process.end or "", event.get("timestamp") or "") or None
         elif kind == "image_load":
             path = dos_path(text)
-            if not path.lower().startswith("c:\\windows"):
+            if not path.lower().startswith(("c:\\windows", "/usr/")):
                 sections["images_non_windows"][path] += 1
         elif kind.startswith("file_"):
             name = bucket(text)
@@ -160,7 +171,7 @@ def collect(session_dir):
             elif kind == "file_create" and event.get("status") == 0 and ((event.get("value0") or 0) >> 24) in (0, 2, 3, 4, 5):
                 sections["created"][path] += 1
             elif kind == "file_read" and "maplestorycw" not in path.lower():
-                sections["reads_outside_client"]["\\".join(path.split("\\")[:6])] += 1
+                sections["reads_outside_client"][path_prefix(path, 6)] += 1
         elif kind.startswith("registry"):
             key = registry_key(text)
             value_name = detail if "=" not in detail else ""

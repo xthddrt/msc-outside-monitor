@@ -6,7 +6,6 @@ import hashlib
 import json
 from pathlib import Path
 
-import pefile
 
 MACHINES = {0x14C: "x86", 0x8664: "x86-64", 0xAA64: "ARM64"}
 SUBSYSTEMS = {1: "native", 2: "windows_gui", 3: "windows_console"}
@@ -38,6 +37,8 @@ def version_info(pe):
 
 
 def pe_metadata(path):
+    import pefile  # only needed for PE images, so an ELF-only client inventories without it
+
     pe = pefile.PE(str(path), fast_load=False)
     try:
         security = pe.OPTIONAL_HEADER.DATA_DIRECTORY[4]
@@ -97,6 +98,7 @@ def analyze(root):
     files = []
     extensions = collections.Counter()
     pe_count = 0
+    elf_count = 0
     pkg1_count = 0
     for path in sorted(item for item in root.rglob("*") if item.is_file()):
         with path.open("rb") as stream:
@@ -114,6 +116,10 @@ def analyze(root):
             record["kind"] = "pe"
             record["pe"] = pe_metadata(path)
             pe_count += 1
+        elif data.startswith(b"\x7fELF"):
+            # Only PE images are parsed; ELF files are listed and reported as a gap below.
+            record["kind"] = "elf"
+            elf_count += 1
         elif data.startswith(b"PKG1"):
             pkg1_count += 1
             record["kind"] = "pkg1"
@@ -141,8 +147,10 @@ def analyze(root):
             "files": len(files),
             "bytes": sum(item["size"] for item in files),
             "pe_images": pe_count,
+            "elf_images": elf_count,
             "pkg1_containers": pkg1_count,
             "extensions": dict(sorted(extensions.items())),
+            "gaps": ["elf_inventory: ELF headers, imports and needed libraries are not parsed"] if elf_count else [],
         },
         "files": files,
     }

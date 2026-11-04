@@ -1,6 +1,10 @@
 #pragma once
 
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include "linux/win32.h"
+#endif
 #include <cstdint>
 #include <string>
 #include <vector>

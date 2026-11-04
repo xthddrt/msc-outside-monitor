@@ -130,6 +130,15 @@ python tools\analyze_client.py C:\Nexon\Library\maplestorycw analysis\pe-invento
 
 The committed inventory covers all 391 supplied files and 46 PE images, including PE-formatted GRAP `.aes` payloads. No proprietary client binaries are included here. The installation contains no original C/C++ source or symbols; import analysis is not a complete decompilation.
 
+## Linux
+
+```sh
+./build.sh
+sudo build/linux/msmon-agent --client /opt/client --log-dir /var/tmp/msmon-sessions
+```
+
+The Linux agent has no driver: fanotify, the process-events connector and `/proc` polling produce the same records and bundle format, so the Python tools work unchanged. Without root it still writes a verified log but records fanotify and the connector as unavailable. Registry, ETW and BlackCat sensors do not exist there. `driver/`, `compat/`, `tools/windows-test/` and the PowerShell tests are Windows-only. See `docs/LINUX.md` for sensors and coverage limits.
+
 ## Safety and privacy
 
 Use only on systems and software you are authorized to inspect. Logs can contain exact hardware identifiers, registry secrets, command lines, paths, process relationships, network endpoints, DNS names, and original WMI queries. Use synthetic data in tests, restrict log access, define a retention period, and never commit real payload logs. The control device is administrator-only, and the driver is not hidden or hardened against tampering.

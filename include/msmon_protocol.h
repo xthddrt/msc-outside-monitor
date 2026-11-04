@@ -1,5 +1,13 @@
 #pragma once
 
+/* Kernel-mode builds may not have the CRT's <stdint.h>; MSVC accepts the identical
+ * typedef if it is also included elsewhere. */
+#if defined(_KERNEL_MODE)
+typedef unsigned __int64 uint64_t;
+#else
+#include <stdint.h>
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -116,15 +124,15 @@ typedef struct _MSMON_EVENT_HEADER {
     unsigned long Version;
     unsigned long Type;
     unsigned long Flags;
-    unsigned __int64 Sequence;
-    unsigned __int64 Timestamp;
-    unsigned __int64 SessionId;
+    uint64_t Sequence;
+    uint64_t Timestamp;
+    uint64_t SessionId;
     unsigned long ProcessId;
     unsigned long ParentProcessId;
     unsigned long ThreadId;
     unsigned long TargetProcessId;
-    unsigned __int64 ProcessStartTime;
-    unsigned __int64 TargetProcessStartTime;
+    uint64_t ProcessStartTime;
+    uint64_t TargetProcessStartTime;
     long Status;
     unsigned long DesiredAccess;
     unsigned long Category;
@@ -135,19 +143,19 @@ typedef struct _MSMON_EVENT_HEADER {
     unsigned short DetailBytes;
     unsigned short ComponentOffset;
     unsigned short ComponentBytes;
-    unsigned __int64 Value0;
-    unsigned __int64 Value1;
-    unsigned __int64 OperationId;
-    unsigned __int64 PayloadTotalBytes;
-    unsigned __int64 PayloadByteOffset;
+    uint64_t Value0;
+    uint64_t Value1;
+    uint64_t OperationId;
+    uint64_t PayloadTotalBytes;
+    uint64_t PayloadByteOffset;
     unsigned long PayloadChunkIndex;
     unsigned long PayloadChunkCount;
     unsigned long PayloadKind;
     unsigned long PayloadOffset;
     unsigned long PayloadBytes;
     /*
-     * User-mode return addresses of the requesting thread, one unsigned
-     * __int64 each, at StackOffset; both zero when no stack was captured.
+     * User-mode return addresses of the requesting thread, one uint64_t
+     * each, at StackOffset; both zero when no stack was captured.
      * These two fields were a zeroed Reserved ULONG, so the layout is unchanged.
      */
     unsigned short StackOffset;
@@ -155,18 +163,18 @@ typedef struct _MSMON_EVENT_HEADER {
 } MSMON_EVENT_HEADER;
 
 typedef struct _MSMON_PAYLOAD {
-    unsigned __int64 OperationId;
-    unsigned __int64 TotalBytes;
-    unsigned __int64 ByteOffset;
+    uint64_t OperationId;
+    uint64_t TotalBytes;
+    uint64_t ByteOffset;
     unsigned long ChunkIndex;
     unsigned long ChunkCount;
     unsigned long Kind;
-    const VOID* Data;
+    const void* Data;
     unsigned long ByteCount;
 } MSMON_PAYLOAD;
 
 typedef struct _MSMON_SESSION_CONFIG {
-    unsigned __int64 SessionId;
+    uint64_t SessionId;
     unsigned long QueueRecords;
     unsigned long QueueBytes;
     unsigned long PayloadMode;
@@ -182,7 +190,7 @@ typedef struct _MSMON_SESSION_CONFIG {
 typedef struct _MSMON_TRACK_REQUEST {
     unsigned long ProcessId;
     unsigned long Flags;
-    unsigned __int64 ProcessStartTime;
+    uint64_t ProcessStartTime;
 } MSMON_TRACK_REQUEST;
 
 typedef struct _MSMON_READ_REQUEST {
@@ -191,13 +199,13 @@ typedef struct _MSMON_READ_REQUEST {
 } MSMON_READ_REQUEST;
 
 typedef struct _MSMON_STATISTICS {
-    unsigned __int64 SessionId;
-    unsigned __int64 QueuedEvents;
-    unsigned __int64 QueuedBytes;
-    unsigned __int64 DroppedEvents;
-    unsigned __int64 TrackedProcesses;
-    unsigned __int64 QueueRecordLimit;
-    unsigned __int64 QueueByteLimit;
+    uint64_t SessionId;
+    uint64_t QueuedEvents;
+    uint64_t QueuedBytes;
+    uint64_t DroppedEvents;
+    uint64_t TrackedProcesses;
+    uint64_t QueueRecordLimit;
+    uint64_t QueueByteLimit;
 } MSMON_STATISTICS;
 #pragma pack(pop)
 
@@ -207,6 +215,8 @@ typedef MSMON_TRACK_REQUEST* PMSMON_TRACK_REQUEST;
 typedef MSMON_READ_REQUEST* PMSMON_READ_REQUEST;
 typedef MSMON_STATISTICS* PMSMON_STATISTICS;
 
+/* The Linux agent has no device; its in-process sensors produce the same records. */
+#ifdef CTL_CODE
 #define MSMON_IOCTL_START_SESSION CTL_CODE(FILE_DEVICE_UNKNOWN, 0x800, METHOD_BUFFERED, FILE_WRITE_ACCESS)
 #define MSMON_IOCTL_STOP_SESSION CTL_CODE(FILE_DEVICE_UNKNOWN, 0x801, METHOD_BUFFERED, FILE_WRITE_ACCESS)
 #define MSMON_IOCTL_TRACK_PID CTL_CODE(FILE_DEVICE_UNKNOWN, 0x802, METHOD_BUFFERED, FILE_WRITE_ACCESS)
@@ -215,6 +225,7 @@ typedef MSMON_STATISTICS* PMSMON_STATISTICS;
 #define MSMON_IOCTL_STOP_TRACKING CTL_CODE(FILE_DEVICE_UNKNOWN, 0x805, METHOD_BUFFERED, FILE_WRITE_ACCESS)
 #define MSMON_IOCTL_REFRESH_MODULES CTL_CODE(FILE_DEVICE_UNKNOWN, 0x806, METHOD_BUFFERED, FILE_WRITE_ACCESS)
 #define MSMON_IOCTL_COVERAGE CTL_CODE(FILE_DEVICE_UNKNOWN, 0x807, METHOD_BUFFERED, FILE_READ_ACCESS)
+#endif
 
 static __inline int MsMonNetworkUnregisterComplete(long Status)
 {
@@ -238,7 +249,7 @@ static __inline int MsMonFlowRemoveComplete(long Status)
  * must equal the creation time the driver just read, or the PID was reused
  * between the caller's identity query and this IOCTL.
  */
-static __inline int MsMonTrackAdmitsStart(unsigned __int64 Expected, unsigned __int64 Actual)
+static __inline int MsMonTrackAdmitsStart(uint64_t Expected, uint64_t Actual)
 {
     return Expected == 0 || Expected == Actual;
 }

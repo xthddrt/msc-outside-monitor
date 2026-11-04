@@ -1,5 +1,7 @@
 #include "telemetry.h"
+#ifdef _WIN32
 #include <bcrypt.h>
+#endif
 #include <algorithm>
 #include <cstring>
 #include <iomanip>
@@ -293,6 +295,7 @@ std::string Timestamp(uint64_t value)
     return buffer;
 }
 
+#ifdef _WIN32
 static std::string HexDigest(const unsigned char* digest, size_t size)
 {
     static const char hex[] = "0123456789abcdef";
@@ -320,10 +323,14 @@ std::string Sha256Bytes(const void* data, size_t size)
     return HexDigest(digest, sizeof(digest));
 }
 
+#endif
+
 std::string Sha256(const std::string& input)
 {
     return Sha256Bytes(input.data(), input.size());
 }
+
+#ifdef _WIN32
 
 std::string Sha256File(const std::wstring& path)
 {
@@ -366,6 +373,7 @@ std::string Sha256File(const std::wstring& path)
     CloseHandle(file);
     return result;
 }
+#endif
 
 std::string StatusName(long status)
 {
@@ -395,15 +403,22 @@ std::string StatusName(long status)
         {0xC00000CC, "STATUS_BAD_NETWORK_NAME"},
     };
     for (const auto& entry : entries) {
-        if (entry.code == static_cast<unsigned long>(status)) return entry.name;
+        if (entry.code == static_cast<uint32_t>(status)) return entry.name;
     }
+#ifndef _WIN32
+    /* Linux sensors and kfilterd report positive errno values. */
+    if (status > 0 && status < 4096) {
+        const char* name = strerrorname_np(static_cast<int>(status));
+        if (name != nullptr) return name;
+    }
+#endif
     return {};
 }
 
 std::string StatusHex(long status)
 {
     char buffer[16];
-    snprintf(buffer, sizeof(buffer), "0x%08X", static_cast<unsigned long>(status));
+    snprintf(buffer, sizeof(buffer), "0x%08X", static_cast<uint32_t>(status));
     return buffer;
 }
 
@@ -440,7 +455,7 @@ std::string FlagsNames(unsigned long flags)
 std::string DesiredAccessHex(unsigned long access)
 {
     char buffer[16];
-    snprintf(buffer, sizeof(buffer), "0x%08X", access);
+    snprintf(buffer, sizeof(buffer), "0x%08X", static_cast<uint32_t>(access));
     return buffer;
 }
 
@@ -517,9 +532,9 @@ static std::wstring DecodeUtf16(const BYTE* data, size_t bytes)
     std::wstring output;
     output.reserve(bytes / 2);
     for (size_t offset = 0; offset < bytes; offset += 2) {
-        wchar_t c;
+        uint16_t c;
         std::memcpy(&c, data + offset, sizeof(c));
-        output.push_back(c);
+        output.push_back(static_cast<wchar_t>(c));
     }
     while (!output.empty() && output.back() == L'\0') output.pop_back();
     return output;
@@ -541,9 +556,9 @@ static void AppendDecodedValue(std::ostringstream& json, const TelemetryEvent& e
             while (offset + 1 < event.payload.size()) {
                 size_t end = offset;
                 while (end + 1 < event.payload.size()) {
-                    wchar_t c;
+                    uint16_t c;
                     std::memcpy(&c, event.payload.data() + end, sizeof(c));
-                    if (c == L'\0') break;
+                    if (c == 0) break;
                     end += 2;
                 }
                 if (end > offset) {

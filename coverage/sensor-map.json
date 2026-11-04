@@ -717,6 +717,69 @@
       "status": "active"
     },
     {
+      "sensor_id": "linux.fanotify",
+      "kind": "callback",
+      "slot": 40,
+      "implementation": "agent/linux/fanotify.cpp::FanotifyRun",
+      "event_types": [
+        "file_create",
+        "file_read",
+        "file_write",
+        "file_close",
+        "file_set_information"
+      ],
+      "expected_in": [
+        "file_io",
+        "gameplay"
+      ],
+      "status": "active"
+    },
+    {
+      "sensor_id": "linux.proc_connector",
+      "kind": "callback",
+      "slot": 41,
+      "implementation": "agent/linux/proc_connector.cpp::ProcConnectorRun",
+      "event_types": [
+        "process_start",
+        "process_exit"
+      ],
+      "expected_in": [
+        "startup",
+        "gameplay"
+      ],
+      "status": "active"
+    },
+    {
+      "sensor_id": "linux.maps_poll",
+      "kind": "callback",
+      "slot": 42,
+      "implementation": "agent/linux/images.cpp::ImagesScan",
+      "event_types": [
+        "image_load"
+      ],
+      "expected_in": [
+        "startup",
+        "gameplay"
+      ],
+      "status": "active"
+    },
+    {
+      "sensor_id": "linux.net_poll",
+      "kind": "callback",
+      "slot": 43,
+      "implementation": "agent/linux/net.cpp::NetPoll",
+      "event_types": [
+        "network_connect",
+        "network_accept",
+        "network_flow_close"
+      ],
+      "expected_in": [
+        "network",
+        "gameplay"
+      ],
+      "status": "active"
+    },
+    {
       "sensor_id": "registration.process.notify",
       "kind": "registration",
       "slot": 20,
@@ -871,6 +934,46 @@
       "kind": "registration",
       "slot": 38,
       "implementation": "driver registration call",
+      "expected_in": [
+        "startup"
+      ],
+      "status": "active"
+    },
+    {
+      "sensor_id": "registration.linux.fanotify",
+      "kind": "registration",
+      "slot": 44,
+      "implementation": "agent/linux/session.cpp::LinuxSession::Start",
+      "expected_in": [
+        "startup"
+      ],
+      "status": "active"
+    },
+    {
+      "sensor_id": "registration.linux.proc_connector",
+      "kind": "registration",
+      "slot": 45,
+      "implementation": "agent/linux/session.cpp::LinuxSession::Start",
+      "expected_in": [
+        "startup"
+      ],
+      "status": "active"
+    },
+    {
+      "sensor_id": "registration.linux.maps_poll",
+      "kind": "registration",
+      "slot": 46,
+      "implementation": "agent/linux/session.cpp::LinuxSession::Start",
+      "expected_in": [
+        "startup"
+      ],
+      "status": "active"
+    },
+    {
+      "sensor_id": "registration.linux.net_poll",
+      "kind": "registration",
+      "slot": 47,
+      "implementation": "agent/linux/session.cpp::LinuxSession::Start",
       "expected_in": [
         "startup"
       ],
