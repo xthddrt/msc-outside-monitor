@@ -14,6 +14,7 @@
 #include <cwchar>
 #include <string>
 #include <unistd.h>
+#include <vector>
 
 typedef uint8_t BYTE;
 typedef uint16_t WORD;
@@ -149,3 +150,9 @@ std::string LinuxNarrow(const std::wstring& value);
 /* Start time of a live process as a FILETIME value, from /proc/<pid>/stat; 0 if gone. */
 uint64_t LinuxProcessStart(DWORD pid, DWORD* parent = nullptr);
 bool LinuxProcessIdentity(DWORD pid, std::wstring& path, uint64_t& startTime);
+/* Boot time as FILETIME; LinuxProcessStart is this plus the /proc start ticks. */
+uint64_t LinuxBootFileTime();
+/* Under Wine /proc/<pid>/exe is the loader, so the client is found by what it maps or
+ * by its Wine prefix: true when the process has an executable file mapping under a root,
+ * or its WINEPREFIX (default $HOME/.wine) is Prefix. */
+bool LinuxInScope(DWORD pid, const std::vector<std::wstring>& roots, const std::wstring& prefix);

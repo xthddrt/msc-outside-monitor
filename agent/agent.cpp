@@ -815,6 +815,7 @@ private:
     static constexpr uint64_t SETTLE_MS = 150;
     static constexpr uint64_t INTERVAL_MS = 2000;
     static constexpr uint64_t MAX_FILE_BYTES = 256u * 1024u;
+    static constexpr uint64_t MAX_REG_FILE_BYTES = 16u * 1024u * 1024u;
     static constexpr uint64_t MAX_TOTAL_BYTES = 64ull * 1024ull * 1024ull;
     static constexpr unsigned MAX_FILES = 2000;
 
@@ -836,7 +837,7 @@ private:
 
     bool Eligible(const std::wstring& path) const
     {
-        static const wchar_t* extensions[] = {L".ini", L".log", L".txt", L".json", L".xml", L".cfg"};
+        static const wchar_t* extensions[] = {L".ini", L".log", L".txt", L".json", L".xml", L".cfg", L".reg"};
         std::wstring extension = std::filesystem::path(path).extension().wstring();
         bool textual = false;
         for (const wchar_t* candidate : extensions) {
@@ -864,7 +865,10 @@ private:
         bool ok = GetFileSizeEx(file, &size) != 0;
         if (ok) {
             uint64_t wanted = static_cast<uint64_t>(size.QuadPart);
-            if (wanted > MAX_FILE_BYTES) wanted = MAX_FILE_BYTES;
+            /* A Wine system.reg is several MB; the other text files stay small. */
+            const bool registryFile = _wcsicmp(std::filesystem::path(path).extension().wstring().c_str(), L".reg") == 0;
+            const uint64_t limit = registryFile ? MAX_REG_FILE_BYTES : MAX_FILE_BYTES;
+            if (wanted > limit) wanted = limit;
             data.resize(static_cast<size_t>(wanted));
             DWORD read = 0;
             if (!data.empty()) ok = ReadFile(file, data.data(), static_cast<DWORD>(data.size()), &read, nullptr) != 0;
@@ -903,7 +907,7 @@ private:
 };
 
 static unsigned TrackExisting(DeviceSession& device, const std::vector<std::wstring>& scopeRoots,
-                              ProcessScope& scope)
+                              ProcessScope& scope, const std::wstring& winePrefix = {})
 {
     HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snapshot == INVALID_HANDLE_VALUE) return 0;
@@ -928,6 +932,12 @@ static unsigned TrackExisting(DeviceSession& device, const std::vector<std::wstr
             std::wstring path;
             uint64_t startTime = 0;
             if (!ProcessIdentity(process.th32ProcessID, path, startTime)) continue;
+            /* A rescan: already tracked, but a parent for the processes still to check. */
+            if (scope.IsTracked(process.th32ProcessID, startTime)) {
+                tracked[process.th32ProcessID] = startTime;
+                changed = true;
+                continue;
+            }
             bool inherited = false;
             auto parent = tracked.find(process.th32ParentProcessID);
             if (parent != tracked.end()) {
@@ -936,7 +946,13 @@ static unsigned TrackExisting(DeviceSession& device, const std::vector<std::wstr
                 inherited = ProcessIdentity(process.th32ParentProcessID, parentPath, parentStart) &&
                             ProcessScope::ValidParentIncarnation(parent->second, parentStart, startTime);
             }
+#ifdef _WIN32
             if (!inherited && !IsUnderAnyRoot(scopeRoots, path)) continue;
+#else
+            /* Under Wine the image is the loader: also an executable mapping under a root or the prefix. */
+            if (!inherited && !IsUnderAnyRoot(scopeRoots, path) &&
+                !LinuxInScope(process.th32ProcessID, scopeRoots, winePrefix)) continue;
+#endif
             ULONG flags = inherited ? MsMonFlagInheritedTrack : MsMonFlagExplicitTrack;
             if (device.Track(process.th32ProcessID, startTime, flags)) {
                 tracked[process.th32ProcessID] = startTime;
@@ -983,8 +999,18 @@ static void Usage()
                  "[--log-dir DIR] [--session-label LABEL] [--test-id ID] [--scenario NAME] [--phase NAME] "
                  "[--iteration N] [--machine-label NAME] [--outcome-override NAME] [--compact] "
                  "[--wait-ms N] [--max-file-mb N] [--queue-records N] [--queue-mb N] "
-                 "[--stop-file FILE] [--extra-root DIRECTORY]... [--no-etw] [--no-payloads] [--once]\n"
-                 "Without --extra-root, %ProgramData%\\Nexon\\NGS is added when it exists.\n";
+                 "[--stop-file FILE] [--extra-root DIRECTORY]... [--no-etw] [--no-payloads] [--once]"
+#ifndef _WIN32
+                 " [--prefix WINEPREFIX] [--no-ebpf]"
+#endif
+                 "\n"
+                 "Without --extra-root, %ProgramData%\\Nexon\\NGS is added when it exists.\n"
+#ifndef _WIN32
+                 "--prefix defaults to the nearest folder above --client that holds system.reg; every process\n"
+                 "running with that WINEPREFIX is in scope. --no-ebpf uses fanotify, the proc connector and\n"
+                 "/proc polling instead of the kernel (eBPF) sensors.\n"
+#endif
+                 ;
 }
 
 static bool ParseNumber(const wchar_t* text, uint64_t& value)
@@ -1026,6 +1052,8 @@ int wmain(int argc, wchar_t** argv)
     std::vector<DWORD> explicitPids;
 #ifndef _WIN32
     bool clientSet = false;
+    bool useEbpf = true;
+    std::wstring prefixArg;
 #endif
 
     for (int index = 1; index < argc; index++) {
@@ -1040,6 +1068,12 @@ int wmain(int argc, wchar_t** argv)
             enableEtw = false;
         } else if (argument == L"--no-payloads") {
             capturePayloads = false;
+#ifndef _WIN32
+        } else if (argument == L"--no-ebpf") {
+            useEbpf = false;
+        } else if (index + 1 < argc && argument == L"--prefix") {
+            prefixArg = argv[++index];
+#endif
         } else if (index + 1 < argc && argument == L"--client") {
             clientRoot = argv[++index];
 #ifndef _WIN32
@@ -1227,6 +1261,22 @@ int wmain(int argc, wchar_t** argv)
     }
     std::vector<std::wstring> scopeRoots{scopeRoot};
     scopeRoots.insert(scopeRoots.end(), extraRoots.begin(), extraRoots.end());
+    std::wstring winePrefix;
+#ifndef _WIN32
+    if (!prefixArg.empty()) {
+        winePrefix = FullPath(prefixArg);
+    } else {
+        /* The Wine prefix is the nearest folder above the client that holds system.reg. */
+        for (std::filesystem::path folder = clientRoot; !folder.empty() && folder != folder.root_path();
+             folder = folder.parent_path()) {
+            if (std::filesystem::exists(folder / L"system.reg", fsError)) {
+                winePrefix = folder.wstring();
+                break;
+            }
+        }
+    }
+    LinuxSessionUseEbpf(useEbpf);
+#endif
 #ifdef _WIN32
     wchar_t windowsBuffer[32768];
     if (GetWindowsDirectoryW(windowsBuffer, static_cast<UINT>(std::size(windowsBuffer))) == 0) {
@@ -1343,7 +1393,7 @@ int wmain(int argc, wchar_t** argv)
     bool startCoverageSupported = device.Coverage(startCoverage);
 
     ProcessScope scope;
-    unsigned registered = TrackExisting(device, scopeRoots, scope);
+    unsigned registered = TrackExisting(device, scopeRoots, scope, winePrefix);
     for (DWORD pid : explicitPids) {
         std::wstring path;
         uint64_t startTime = 0;
@@ -1446,6 +1496,11 @@ int wmain(int argc, wchar_t** argv)
             if (registrationSucceeded(MSMON_SENSOR_REG_LINUX_PROC_CONNECTOR)) appendCallback(L"proc_connector");
             if (registrationSucceeded(MSMON_SENSOR_REG_LINUX_MAPS_POLL)) appendCallback(L"maps_poll");
             if (registrationSucceeded(MSMON_SENSOR_REG_LINUX_NET_POLL)) appendCallback(L"net_poll");
+            static const wchar_t* ebpfNames[] = {L"ebpf_process", L"ebpf_file", L"ebpf_net",
+                                                 L"ebpf_ipc", L"ebpf_device", L"ebpf_memory"};
+            for (unsigned index = 0; index < std::size(ebpfNames); index++) {
+                if (registrationSucceeded(MSMON_SENSOR_REG_LINUX_EBPF_PROCESS + index)) appendCallback(ebpfNames[index]);
+            }
             fileRegistered = registrationSucceeded(MSMON_SENSOR_REG_FILTER_REGISTER) &&
                              registrationSucceeded(MSMON_SENSOR_REG_FILTER_START);
             if (fileRegistered) {
@@ -1500,7 +1555,17 @@ int wmain(int argc, wchar_t** argv)
                        L"Linux has no registry values or volume-information queries to capture; hardware identity is"
                        L" seen as file events on /sys/class/dmi/id/*, /proc/cpuinfo and /sys/block/*/serial; file and"
                        L" network contents are not captured")) return 1;
-    if (!writeCoverage(L"coverage_limit",
+    const bool ebpfFile = startCoverageSupported &&
+                          (startCoverage.RegistrationOk & (1ull << MSMON_SENSOR_REG_LINUX_EBPF_FILE)) != 0;
+    if (ebpfFile) {
+        if (!writeCoverage(L"coverage_limit",
+                           L"eBPF records cover the recorded syscalls of tracked processes (argument values, result,"
+                           L" duration, kernel-resolved paths, 8 user frames) but not file or network contents, work"
+                           L" done inside the kernel, page faults on existing mappings or io_uring worker I/O;"
+                           L" registry is file-level (Wine *.reg files); paths over 255 bytes are truncated;"
+                           L" pre-start activity and records lost when the ring is full (sequence gaps) are not"
+                           L" guaranteed")) return 1;
+    } else if (!writeCoverage(L"coverage_limit",
                        L"fanotify file events carry no byte counts, offsets, open flags or status; sockets are polled"
                        L" from /proc/net once a second (shorter-lived sockets are missed, already-open ones are reported"
                        L" by the first poll, timestamps are poll times); executable mappings are polled from"
@@ -1636,9 +1701,12 @@ int wmain(int argc, wchar_t** argv)
             DWORD length = GetEnvironmentVariableW(variable, value, MAX_PATH);
             if (length != 0 && length < MAX_PATH) snapshotRoots.push_back((std::filesystem::path(value) / L"Nexon").wstring());
         }
+        /* The Wine prefix: its *.reg files are the registry wineserver saves (file-level). */
+        if (!winePrefix.empty()) snapshotRoots.push_back(winePrefix);
         snapshotter = std::make_unique<FileSnapshotter>(sessionDir, snapshotRoots);
         if (!writeCoverage(L"file_snapshots", L"roots=" + JoinRoots(snapshotRoots) +
-                                                L";extensions=.ini|.log|.txt|.json|.xml|.cfg;max_bytes=262144")) return 1;
+                                                L";extensions=.ini|.log|.txt|.json|.xml|.cfg|.reg;max_bytes=262144"
+                                                L";reg_max_bytes=16777216")) return 1;
     }
     auto logSnapshot = [&](const std::wstring& text, const std::wstring& detail) { return writeCoverage(text, detail); };
     bool draining = false;
@@ -1728,6 +1796,11 @@ int wmain(int argc, wchar_t** argv)
                                    event.header.Value0, event.header.Value1, event.text);
                 }
                 if (snapshotter && event.header.Type == MsMonFileWrite) snapshotter->Note(event.text);
+                /* wineserver saves a registry file under a temporary name and renames it into place. */
+                if (snapshotter && event.header.Type == MsMonFileSetInformation && event.header.Value0 == 10 &&
+                    event.detail.compare(0, 9, L"rename;to") == 0) {
+                    snapshotter->Note(event.text);
+                }
                 if (!event.stackAddresses.empty()) {
                     /* Name the modules inside the process that made the request. */
                     event.modules = scope.ResolveStack(event.stackPid, event.stackAddresses.data(),
@@ -1778,6 +1851,11 @@ int wmain(int argc, wchar_t** argv)
                 moduleRefreshWarning = true;
             }
             nextModuleRefresh = GetTickCount64() + 1000;
+#ifndef _WIN32
+            /* Processes the kernel inheritance cannot see (started outside the tracked tree
+             * but in the prefix, or mapping the client) join within a second. */
+            TrackExisting(device, scopeRoots, scope, winePrefix);
+#endif
         }
         if (!draining && GetTickCount64() >= nextStatistics) {
             /*

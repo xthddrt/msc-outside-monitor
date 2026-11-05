@@ -6,6 +6,28 @@
 #include <thread>
 #include <utility>
 
+/* One record with every header field a sensor can fill (Log fills the common ones). */
+struct LinuxRecord {
+    unsigned sensor = MSMON_SENSOR_SLOTS;
+    ULONG type = 0;
+    DWORD pid = 0;
+    DWORD tid = 0;
+    DWORD parent = 0;
+    DWORD target = 0;
+    uint64_t start = 0;
+    uint64_t timestamp = 0;   /* FILETIME; 0 = now */
+    ULONG flags = 0;
+    long status = 0;
+    uint64_t value0 = 0;
+    uint64_t value1 = 0;
+    std::wstring text;
+    std::wstring detail;
+    std::vector<uint64_t> stack;
+};
+
+/* Set before LinuxSession::Start; false keeps the eBPF sensors off (--no-ebpf). */
+void LinuxSessionUseEbpf(bool enabled);
+
 /*
  * In-process stand-in for the Windows driver.  The Linux sensors log records here in
  * the driver's wire format (MSMON_EVENT_HEADER + strings), with one sequence and one
@@ -34,6 +56,7 @@ public:
     bool UnderRoot(const std::wstring& path) const;
     void Log(unsigned sensor, ULONG type, DWORD pid, uint64_t start, ULONG flags, uint64_t value0, uint64_t value1,
              const std::wstring& text, const std::wstring& detail = {}, DWORD parent = 0);
+    void Write(const LinuxRecord& record);
     void Enter(unsigned sensor);
     void SkipUntracked();
     /* A source lost events it cannot name: burn a sequence number so the agent logs a gap. */
@@ -65,6 +88,8 @@ private:
     std::atomic<bool> stopping_{false};
     bool running_ = false;
     bool tracking_ = false;
+    bool ebpf_ = false;
+    bool pollNet_ = true;
 };
 
 /* The agent's driver handle, backed by LinuxSession. */
@@ -119,5 +144,14 @@ void ImagesForget(DWORD pid);
 void ImagesReset();
 void NetPoll(LinuxSession& session);
 void NetReset();
+/* eBPF sensors (bpf.cpp).  BpfOpen returns 0 or an errno and sets bit (slot - 48) of
+ * Registered for each MSMON_SENSOR_LINUX_EBPF_* sensor that attached; Root is the scope
+ * root an untracked process's executable mapping is matched against. */
+int BpfOpen(std::wstring& detail, const std::wstring& root, unsigned& registered);
+void BpfRun(LinuxSession& session);
+void BpfClose();
+void BpfTrack(DWORD pid, uint64_t start, ULONG flags);
+void BpfForget(DWORD pid);
+void BpfClear();
 /* "/proc/<pid>/cmdline" with NUL separators as spaces, as the Windows command line. */
 std::wstring ProcessCommandLine(DWORD pid);

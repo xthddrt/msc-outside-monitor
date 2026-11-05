@@ -26,6 +26,26 @@ CALLBACKS = [
     (11, "wfp.notify", "driver/network.c::MsMonWfpNotify", "", "network,gameplay"),
     (12, "blackcat.check", "driver/attribution.c::MsMonCurrentIsBlackCat", "", "gameplay"),
     (13, "ioctl.dispatch", "driver/driver.c::MsMonDeviceControl", "", "startup,shutdown"),
+    (40, "linux.fanotify", "agent/linux/fanotify.cpp::FanotifyRun",
+     "file_create,file_read,file_write,file_close,file_set_information", "file_io,gameplay"),
+    (41, "linux.proc_connector", "agent/linux/proc_connector.cpp::ProcConnectorRun", "process_start,process_exit",
+     "startup,gameplay"),
+    (42, "linux.maps_poll", "agent/linux/images.cpp::ImagesScan", "image_load", "startup,gameplay"),
+    (43, "linux.net_poll", "agent/linux/net.cpp::NetPoll", "network_connect,network_accept,network_flow_close",
+     "network,gameplay"),
+    (48, "linux.ebpf_process", "agent/linux/bpf/monitor.bpf.c::mm_fork,mm_exec,mm_exit,mm_mmap_file,mm_file_mprotect",
+     "process_start,process_exit,thread_start,thread_exit", "startup,gameplay"),
+    (49, "linux.ebpf_file", "agent/linux/bpf/monitor.bpf.c::mm_sys_enter,mm_sys_exit",
+     "file_create,file_read,file_write,file_close,file_set_information,file_set_security,file_query_information,"
+     "file_directory_control,file_set_ea,file_query_ea", "file_io,gameplay"),
+    (50, "linux.ebpf_net", "agent/linux/bpf/monitor.bpf.c::mm_sys_enter,mm_sys_exit",
+     "network_connect,network_accept,network_flow_close", "network,gameplay"),
+    (51, "linux.ebpf_ipc", "agent/linux/bpf/monitor.bpf.c::mm_sys_enter,mm_sys_exit",
+     "network_connect,network_accept,process_handle", "ipc,gameplay"),
+    (52, "linux.ebpf_device", "agent/linux/bpf/monitor.bpf.c::mm_sys_enter,mm_sys_exit", "file_device_control",
+     "file_io,gameplay"),
+    (53, "linux.ebpf_memory", "agent/linux/bpf/monitor.bpf.c::mm_sys_exit,mm_ptrace,mm_bpf,mm_perf",
+     "file_section,process_handle", "gameplay"),
 ]
 
 REGISTRATIONS = {
@@ -45,6 +65,26 @@ REGISTRATIONS = {
     33: "wfp.callout5",
     34: "wfp.engine",
     38: "attribution",
+}
+
+LINUX_REGISTRATIONS = {
+    44: "linux.fanotify",
+    45: "linux.proc_connector",
+    46: "linux.maps_poll",
+    47: "linux.net_poll",
+    54: "linux.ebpf_process",
+    55: "linux.ebpf_file",
+    56: "linux.ebpf_net",
+    57: "linux.ebpf_ipc",
+    58: "linux.ebpf_device",
+    59: "linux.ebpf_memory",
+}
+
+
+# Events written by the agent itself rather than a driver callback.
+AGENT_EVENTS = {
+    "etw_code_integrity": "agent/etw.cpp::OnCodeIntegrityRecord",
+    "kfilter_decision": "agent/integrations.cpp::KFilterDecisionEvent",
 }
 
 
@@ -87,8 +127,8 @@ def main():
             "kind": "event",
             "event_type": event_name,
             "type_id": type_id,
-            "implementation": "driver event " + name,
-            "expected_in": expected_for(event_name),
+            "implementation": AGENT_EVENTS.get(event_name, "driver event " + name),
+            "expected_in": [] if event_name in AGENT_EVENTS else expected_for(event_name),
             "status": "active",
         })
     for slot, sensor_id, implementation, events, expected in CALLBACKS:
@@ -110,6 +150,15 @@ def main():
             "expected_in": ["startup"],
             "status": "active",
         })
+    for slot, sensor_id in LINUX_REGISTRATIONS.items():
+        sensors.append({
+            "sensor_id": "registration." + sensor_id,
+            "kind": "registration",
+            "slot": slot,
+            "implementation": "agent/linux/session.cpp::LinuxSession::Start",
+            "expected_in": ["startup"],
+            "status": "active",
+        })
     for index, name in enumerate(("wmi", "dns", "rpc")):
         sensors.append({
             "sensor_id": "etw." + name,
@@ -119,6 +168,14 @@ def main():
             "expected_in": [name, "gameplay"],
             "status": "active",
         })
+    sensors.append({
+        "sensor_id": "etw.codeintegrity",
+        "kind": "agent",
+        "provider": "codeintegrity",
+        "implementation": "agent/etw.cpp",
+        "expected_in": [],
+        "status": "active",
+    })
     for name, implementation in (
         ("per_page_mmap", "section acquire only; no page-fault callbacks"),
         ("memory_ops", "no process-memory/APC/remote-thread callbacks"),

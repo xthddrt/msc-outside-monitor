@@ -7,6 +7,7 @@
 #include <sys/stat.h>
 #include <ctime>
 #include <fstream>
+#include <iterator>
 #include <sstream>
 #include <vector>
 
@@ -288,7 +289,7 @@ BOOL Process32NextW(HANDLE snapshot, PROCESSENTRY32W* entry)
 
 /* Boot time is read once: /proc/stat's btime can shift by a second as the clock is adjusted,
  * which would make one process appear as two incarnations. */
-static uint64_t BootFileTime()
+uint64_t LinuxBootFileTime()
 {
     static const uint64_t boot = [] {
         std::ifstream stat("/proc/stat");
@@ -323,7 +324,7 @@ uint64_t LinuxProcessStart(DWORD pid, DWORD* parent)
     }
     static const long hertz = sysconf(_SC_CLK_TCK);
     if (hertz <= 0) return 0;
-    return BootFileTime() + startTicks * (10000000ull / static_cast<uint64_t>(hertz));
+    return LinuxBootFileTime() + startTicks * (10000000ull / static_cast<uint64_t>(hertz));
 }
 
 bool LinuxProcessIdentity(DWORD pid, std::wstring& path, uint64_t& startTime)
@@ -335,6 +336,58 @@ bool LinuxProcessIdentity(DWORD pid, std::wstring& path, uint64_t& startTime)
     if (startTime == 0) return false;
     path = LinuxWide(std::string(target, static_cast<size_t>(length)));
     return true;
+}
+
+static std::string WithoutTrailingSlash(std::string path)
+{
+    while (path.size() > 1 && path.back() == '/') path.pop_back();
+    return path;
+}
+
+bool LinuxInScope(DWORD pid, const std::vector<std::wstring>& roots, const std::wstring& prefix)
+{
+    const std::string base = "/proc/" + std::to_string(pid);
+    std::ifstream maps(base + "/maps");
+    std::string line;
+    while (std::getline(maps, line)) {
+        std::istringstream fields(line);
+        std::string range, perms, offset, device, inode, path;
+        if (!(fields >> range >> perms >> offset >> device >> inode)) continue;
+        std::getline(fields >> std::ws, path);
+        if (path.empty() || path[0] != '/' || perms.size() < 3 || perms[2] != 'x') continue;
+        for (const auto& root : roots) {
+            const std::string narrow = WithoutTrailingSlash(LinuxNarrow(root));
+            if (!narrow.empty() && path.size() > narrow.size() && path.compare(0, narrow.size(), narrow) == 0 &&
+                path[narrow.size()] == '/') {
+                return true;
+            }
+        }
+    }
+    if (prefix.empty()) return false;
+    /* environ is NUL-separated and readable by the owner or root. */
+    std::ifstream file(base + "/environ", std::ios::binary);
+    std::string environment((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    std::string winePrefix, home;
+    bool wine = false;
+    for (size_t start = 0; start < environment.size();) {
+        size_t end = environment.find('\0', start);
+        if (end == std::string::npos) end = environment.size();
+        const std::string entry = environment.substr(start, end - start);
+        if (entry.compare(0, 11, "WINEPREFIX=") == 0) winePrefix = entry.substr(11);
+        if (entry.compare(0, 5, "HOME=") == 0) home = entry.substr(5);
+        if (entry.compare(0, 11, "WINELOADER=") == 0) wine = true;
+        start = end + 1;
+    }
+    if (winePrefix.empty()) {
+        /* Without WINEPREFIX only a Wine process can be in the default prefix. */
+        std::wstring image;
+        uint64_t startTime = 0;
+        if (home.empty() || !LinuxProcessIdentity(pid, image, startTime)) return false;
+        const std::wstring name = image.substr(image.find_last_of(L'/') + 1);
+        if (!wine && name.rfind(L"wine", 0) != 0) return false;
+        winePrefix = home + "/.wine";
+    }
+    return WithoutTrailingSlash(winePrefix) == WithoutTrailingSlash(LinuxNarrow(prefix));
 }
 
 /* FIPS 180-4 SHA-256; the hash chain and every bundle checksum depend on it. */
