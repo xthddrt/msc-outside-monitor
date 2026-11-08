@@ -38,14 +38,19 @@ CALLBACKS = [
     (49, "linux.ebpf_file", "agent/linux/bpf/monitor.bpf.c::mm_sys_enter,mm_sys_exit",
      "file_create,file_read,file_write,file_close,file_set_information,file_set_security,file_query_information,"
      "file_directory_control,file_set_ea,file_query_ea", "file_io,gameplay"),
-    (50, "linux.ebpf_net", "agent/linux/bpf/monitor.bpf.c::mm_sys_enter,mm_sys_exit",
-     "network_connect,network_accept,network_flow_close", "network,gameplay"),
+    (50, "linux.ebpf_net", "agent/linux/bpf/monitor.bpf.c::mm_sys_enter,mm_sys_exit,mm_sock_*,mm_tcp_*,mm_skb_*",
+     "network_connect,network_accept,network_flow_established,network_flow_close,file_read,file_write,etw_dns,etw_tcp",
+     "network,gameplay"),
     (51, "linux.ebpf_ipc", "agent/linux/bpf/monitor.bpf.c::mm_sys_enter,mm_sys_exit",
      "network_connect,network_accept,process_handle", "ipc,gameplay"),
     (52, "linux.ebpf_device", "agent/linux/bpf/monitor.bpf.c::mm_sys_enter,mm_sys_exit", "file_device_control",
      "file_io,gameplay"),
     (53, "linux.ebpf_memory", "agent/linux/bpf/monitor.bpf.c::mm_sys_exit,mm_ptrace,mm_bpf,mm_perf",
      "file_section,process_handle", "gameplay"),
+    (60, "linux.ebpf_wineserver", "agent/linux/bpf/ws.bpf.h::mm_ws_enter,mm_ws_exit",
+     "registry_open,registry_create,registry_set_value,registry_delete,registry_rename,registry_query,"
+     "registry_enumerate,process_handle,thread_handle,file_create,file_section,file_query_volume_information,"
+     "file_query_information,network_connect,network_accept,coverage", "registry,startup,gameplay"),
 ]
 
 REGISTRATIONS = {
@@ -78,6 +83,7 @@ LINUX_REGISTRATIONS = {
     57: "linux.ebpf_ipc",
     58: "linux.ebpf_device",
     59: "linux.ebpf_memory",
+    61: "linux.ebpf_wineserver",
 }
 
 

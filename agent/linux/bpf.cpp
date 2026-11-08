@@ -1,10 +1,17 @@
 #include "session.h"
 #include "bpf/monitor_bpf.h"
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/un.h>
+#include <algorithm>
+#include <chrono>
+#include <condition_variable>
+#include <deque>
 #include <fstream>
+#include <mutex>
+#include <thread>
 #include <unordered_map>
 
 /*
@@ -17,7 +24,7 @@
  */
 
 #ifndef MSMON_BPF
-int BpfOpen(std::wstring& detail, const std::wstring&, unsigned& registered)
+int BpfOpen(std::wstring& detail, const std::wstring&, bool, unsigned& registered)
 {
     registered = 0;
     detail = L"agent built without BPF (no clang/libbpf at build time)";
@@ -28,6 +35,8 @@ void BpfClose() {}
 void BpfTrack(DWORD, uint64_t, ULONG) {}
 void BpfForget(DWORD) {}
 void BpfClear() {}
+std::vector<std::pair<std::wstring, std::wstring>> BpfNotes() { return {}; }
+void BpfFlush() {}
 #else
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
@@ -38,7 +47,7 @@ namespace {
 enum class Op {
     Read, Write, Open, Close, Query, Directory, Unlink, Rename, Link, Symlink, Mkdir, Truncate, Security,
     SetEa, QueryEa, Ioctl, Mmap, Mprotect, Ptrace, VmRead, VmWrite, Signal, Connect, Accept, SendTo, RecvFrom,
-    Exec,
+    Exec, Bind, Listen, Prctl, Module, ProcessOp, Flush, SystemInfo, Socket, Shutdown, Watch, SysvShm,
 };
 
 struct Syscall {
@@ -50,95 +59,131 @@ struct Syscall {
 
 constexpr uint8_t CWD = MM_DIR_CWD;
 
-/* {want, path_a, dir_a, path_b, dir_b, fd, retfd, sock, argv} */
+/* {want, path_a, dir_a, path_b, dir_b, fd, retfd, sock, argv, data, flags_arg} */
 const Syscall kSyscalls[] = {
-    {SYS_read, "read", Op::Read, {1, 0, 0, 0, 0, 1, 0, 0, 0, {}}},
-    {SYS_pread64, "pread64", Op::Read, {1, 0, 0, 0, 0, 1, 0, 0, 0, {}}},
-    {SYS_readv, "readv", Op::Read, {1, 0, 0, 0, 0, 1, 0, 0, 0, {}}},
-    {SYS_preadv, "preadv", Op::Read, {1, 0, 0, 0, 0, 1, 0, 0, 0, {}}},
-    {SYS_preadv2, "preadv2", Op::Read, {1, 0, 0, 0, 0, 1, 0, 0, 0, {}}},
-    {SYS_recvmsg, "recvmsg", Op::Read, {1, 0, 0, 0, 0, 1, 0, 0, 0, {}}},
-    {SYS_write, "write", Op::Write, {1, 0, 0, 0, 0, 1, 0, 0, 0, {}}},
-    {SYS_pwrite64, "pwrite64", Op::Write, {1, 0, 0, 0, 0, 1, 0, 0, 0, {}}},
-    {SYS_writev, "writev", Op::Write, {1, 0, 0, 0, 0, 1, 0, 0, 0, {}}},
-    {SYS_pwritev, "pwritev", Op::Write, {1, 0, 0, 0, 0, 1, 0, 0, 0, {}}},
-    {SYS_pwritev2, "pwritev2", Op::Write, {1, 0, 0, 0, 0, 1, 0, 0, 0, {}}},
-    {SYS_sendmsg, "sendmsg", Op::Write, {1, 0, 0, 0, 0, 1, 0, 0, 0, {}}},
-    {SYS_open, "open", Op::Open, {1, 1, CWD, 0, 0, 0, 1, 0, 0, {}}},
-    {SYS_creat, "creat", Op::Open, {1, 1, CWD, 0, 0, 0, 1, 0, 0, {}}},
-    {SYS_openat, "openat", Op::Open, {1, 2, 1, 0, 0, 0, 1, 0, 0, {}}},
-    {SYS_openat2, "openat2", Op::Open, {1, 2, 1, 0, 0, 0, 1, 0, 0, {}}},
-    {SYS_open_by_handle_at, "open_by_handle_at", Op::Open, {1, 0, 0, 0, 0, 0, 1, 0, 0, {}}},
-    {SYS_close, "close", Op::Close, {1, 0, 0, 0, 0, 1, 0, 0, 0, {}}},
-    {SYS_stat, "stat", Op::Query, {1, 1, CWD, 0, 0, 0, 0, 0, 0, {}}},
-    {SYS_lstat, "lstat", Op::Query, {1, 1, CWD, 0, 0, 0, 0, 0, 0, {}}},
-    {SYS_fstat, "fstat", Op::Query, {1, 0, 0, 0, 0, 1, 0, 0, 0, {}}},
-    {SYS_newfstatat, "newfstatat", Op::Query, {1, 2, 1, 0, 0, 1, 0, 0, 0, {}}},
-    {SYS_statx, "statx", Op::Query, {1, 2, 1, 0, 0, 1, 0, 0, 0, {}}},
-    {SYS_access, "access", Op::Query, {1, 1, CWD, 0, 0, 0, 0, 0, 0, {}}},
-    {SYS_faccessat, "faccessat", Op::Query, {1, 2, 1, 0, 0, 0, 0, 0, 0, {}}},
-    {SYS_faccessat2, "faccessat2", Op::Query, {1, 2, 1, 0, 0, 0, 0, 0, 0, {}}},
-    {SYS_readlink, "readlink", Op::Query, {1, 1, CWD, 0, 0, 0, 0, 0, 0, {}}},
-    {SYS_readlinkat, "readlinkat", Op::Query, {1, 2, 1, 0, 0, 0, 0, 0, 0, {}}},
-    {SYS_statfs, "statfs", Op::Query, {1, 1, CWD, 0, 0, 0, 0, 0, 0, {}}},
-    {SYS_fstatfs, "fstatfs", Op::Query, {1, 0, 0, 0, 0, 1, 0, 0, 0, {}}},
-    {SYS_getdents, "getdents", Op::Directory, {1, 0, 0, 0, 0, 1, 0, 0, 0, {}}},
-    {SYS_getdents64, "getdents64", Op::Directory, {1, 0, 0, 0, 0, 1, 0, 0, 0, {}}},
-    {SYS_unlink, "unlink", Op::Unlink, {1, 1, CWD, 0, 0, 0, 0, 0, 0, {}}},
-    {SYS_unlinkat, "unlinkat", Op::Unlink, {1, 2, 1, 0, 0, 0, 0, 0, 0, {}}},
-    {SYS_rmdir, "rmdir", Op::Unlink, {1, 1, CWD, 0, 0, 0, 0, 0, 0, {}}},
-    {SYS_rename, "rename", Op::Rename, {1, 1, CWD, 2, CWD, 0, 0, 0, 0, {}}},
-    {SYS_renameat, "renameat", Op::Rename, {1, 2, 1, 4, 3, 0, 0, 0, 0, {}}},
-    {SYS_renameat2, "renameat2", Op::Rename, {1, 2, 1, 4, 3, 0, 0, 0, 0, {}}},
-    {SYS_link, "link", Op::Link, {1, 1, CWD, 2, CWD, 0, 0, 0, 0, {}}},
-    {SYS_linkat, "linkat", Op::Link, {1, 2, 1, 4, 3, 0, 0, 0, 0, {}}},
-    {SYS_symlink, "symlink", Op::Symlink, {1, 1, 0, 2, CWD, 0, 0, 0, 0, {}}},
-    {SYS_symlinkat, "symlinkat", Op::Symlink, {1, 1, 0, 3, 2, 0, 0, 0, 0, {}}},
-    {SYS_mkdir, "mkdir", Op::Mkdir, {1, 1, CWD, 0, 0, 0, 0, 0, 0, {}}},
-    {SYS_mkdirat, "mkdirat", Op::Mkdir, {1, 2, 1, 0, 0, 0, 0, 0, 0, {}}},
-    {SYS_mknod, "mknod", Op::Mkdir, {1, 1, CWD, 0, 0, 0, 0, 0, 0, {}}},
-    {SYS_mknodat, "mknodat", Op::Mkdir, {1, 2, 1, 0, 0, 0, 0, 0, 0, {}}},
-    {SYS_truncate, "truncate", Op::Truncate, {1, 1, CWD, 0, 0, 0, 0, 0, 0, {}}},
-    {SYS_ftruncate, "ftruncate", Op::Truncate, {1, 0, 0, 0, 0, 1, 0, 0, 0, {}}},
-    {SYS_fallocate, "fallocate", Op::Truncate, {1, 0, 0, 0, 0, 1, 0, 0, 0, {}}},
-    {SYS_chmod, "chmod", Op::Security, {1, 1, CWD, 0, 0, 0, 0, 0, 0, {}}},
-    {SYS_fchmod, "fchmod", Op::Security, {1, 0, 0, 0, 0, 1, 0, 0, 0, {}}},
-    {SYS_fchmodat, "fchmodat", Op::Security, {1, 2, 1, 0, 0, 0, 0, 0, 0, {}}},
+    {SYS_read, "read", Op::Read, {1, 0, 0, 0, 0, 1, 0, 0, 0, MM_DATA_BUF, 0, {}}},
+    {SYS_pread64, "pread64", Op::Read, {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, {}}},
+    {SYS_readv, "readv", Op::Read, {1, 0, 0, 0, 0, 1, 0, 0, 0, MM_DATA_IOV, 0, {}}},
+    {SYS_preadv, "preadv", Op::Read, {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, {}}},
+    {SYS_preadv2, "preadv2", Op::Read, {1, 0, 0, 0, 0, 1, 0, 0, 0, MM_DATA_IOV, 0, {}}},
+    {SYS_recvmsg, "recvmsg", Op::RecvFrom, {1, 0, 0, 0, 0, 1, 0, MM_SOCK_MSG_OUT_1, 0, MM_DATA_MSG, 3, {}}},
+    {SYS_recvmmsg, "recvmmsg", Op::Read, {1, 0, 0, 0, 0, 1, 0, 0, 0, MM_DATA_MMSG, 4, {}}},
+    /* Reads through another fd: the source (input) fd is the one resolved. */
+    {SYS_sendfile, "sendfile", Op::Read, {1, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, {}}},
+    {SYS_copy_file_range, "copy_file_range", Op::Read, {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, {}}},
+    {SYS_splice, "splice", Op::Read, {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, {}}},
+    {SYS_write, "write", Op::Write, {1, 0, 0, 0, 0, 1, 0, 0, 0, MM_DATA_BUF, 0, {}}},
+    {SYS_pwrite64, "pwrite64", Op::Write, {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, {}}},
+    {SYS_writev, "writev", Op::Write, {1, 0, 0, 0, 0, 1, 0, 0, 0, MM_DATA_IOV, 0, {}}},
+    {SYS_pwritev, "pwritev", Op::Write, {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, {}}},
+    {SYS_pwritev2, "pwritev2", Op::Write, {1, 0, 0, 0, 0, 1, 0, 0, 0, MM_DATA_IOV, 0, {}}},
+    {SYS_sendmsg, "sendmsg", Op::SendTo, {1, 0, 0, 0, 0, 1, 0, MM_SOCK_MSG_IN_1, 0, MM_DATA_MSG, 0, {}}},
+    {SYS_sendmmsg, "sendmmsg", Op::Write, {1, 0, 0, 0, 0, 1, 0, 0, 0, MM_DATA_MMSG, 0, {}}},
+    {SYS_open, "open", Op::Open, {1, 1, CWD, 0, 0, 0, 1, 0, 0, 0, 0, {}}},
+    {SYS_creat, "creat", Op::Open, {1, 1, CWD, 0, 0, 0, 1, 0, 0, 0, 0, {}}},
+    {SYS_openat, "openat", Op::Open, {1, 2, 1, 0, 0, 0, 1, 0, 0, 0, 0, {}}},
+    {SYS_openat2, "openat2", Op::Open, {1, 2, 1, 0, 0, 0, 1, 0, 0, 0, 0, {}}},
+    {SYS_open_by_handle_at, "open_by_handle_at", Op::Open, {1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, {}}},
+    {SYS_close, "close", Op::Close, {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, {}}},
+    {SYS_stat, "stat", Op::Query, {1, 1, CWD, 0, 0, 0, 0, 0, 0, 0, 0, {}}},
+    {SYS_lstat, "lstat", Op::Query, {1, 1, CWD, 0, 0, 0, 0, 0, 0, 0, 0, {}}},
+    {SYS_fstat, "fstat", Op::Query, {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, {}}},
+    {SYS_newfstatat, "newfstatat", Op::Query, {1, 2, 1, 0, 0, 1, 0, 0, 0, 0, 0, {}}},
+    {SYS_statx, "statx", Op::Query, {1, 2, 1, 0, 0, 1, 0, 0, 0, 0, 0, {}}},
+    {SYS_access, "access", Op::Query, {1, 1, CWD, 0, 0, 0, 0, 0, 0, 0, 0, {}}},
+    {SYS_faccessat, "faccessat", Op::Query, {1, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, {}}},
+    {SYS_faccessat2, "faccessat2", Op::Query, {1, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, {}}},
+    {SYS_readlink, "readlink", Op::Query, {1, 1, CWD, 0, 0, 0, 0, 0, 0, 0, 0, {}}},
+    {SYS_readlinkat, "readlinkat", Op::Query, {1, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, {}}},
+    {SYS_statfs, "statfs", Op::Query, {1, 1, CWD, 0, 0, 0, 0, 0, 0, 0, 0, {}}},
+    {SYS_fstatfs, "fstatfs", Op::Query, {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, {}}},
+    {SYS_getdents, "getdents", Op::Directory, {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, {}}},
+    {SYS_getdents64, "getdents64", Op::Directory, {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, {}}},
+    {SYS_unlink, "unlink", Op::Unlink, {1, 1, CWD, 0, 0, 0, 0, 0, 0, 0, 0, {}}},
+    {SYS_unlinkat, "unlinkat", Op::Unlink, {1, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, {}}},
+    {SYS_rmdir, "rmdir", Op::Unlink, {1, 1, CWD, 0, 0, 0, 0, 0, 0, 0, 0, {}}},
+    {SYS_rename, "rename", Op::Rename, {1, 1, CWD, 2, CWD, 0, 0, 0, 0, 0, 0, {}}},
+    {SYS_renameat, "renameat", Op::Rename, {1, 2, 1, 4, 3, 0, 0, 0, 0, 0, 0, {}}},
+    {SYS_renameat2, "renameat2", Op::Rename, {1, 2, 1, 4, 3, 0, 0, 0, 0, 0, 0, {}}},
+    {SYS_link, "link", Op::Link, {1, 1, CWD, 2, CWD, 0, 0, 0, 0, 0, 0, {}}},
+    {SYS_linkat, "linkat", Op::Link, {1, 2, 1, 4, 3, 0, 0, 0, 0, 0, 0, {}}},
+    {SYS_symlink, "symlink", Op::Symlink, {1, 1, 0, 2, CWD, 0, 0, 0, 0, 0, 0, {}}},
+    {SYS_symlinkat, "symlinkat", Op::Symlink, {1, 1, 0, 3, 2, 0, 0, 0, 0, 0, 0, {}}},
+    {SYS_mkdir, "mkdir", Op::Mkdir, {1, 1, CWD, 0, 0, 0, 0, 0, 0, 0, 0, {}}},
+    {SYS_mkdirat, "mkdirat", Op::Mkdir, {1, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, {}}},
+    {SYS_mknod, "mknod", Op::Mkdir, {1, 1, CWD, 0, 0, 0, 0, 0, 0, 0, 0, {}}},
+    {SYS_mknodat, "mknodat", Op::Mkdir, {1, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, {}}},
+    {SYS_truncate, "truncate", Op::Truncate, {1, 1, CWD, 0, 0, 0, 0, 0, 0, 0, 0, {}}},
+    {SYS_ftruncate, "ftruncate", Op::Truncate, {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, {}}},
+    {SYS_fallocate, "fallocate", Op::Truncate, {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, {}}},
+    {SYS_chmod, "chmod", Op::Security, {1, 1, CWD, 0, 0, 0, 0, 0, 0, 0, 0, {}}},
+    {SYS_fchmod, "fchmod", Op::Security, {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, {}}},
+    {SYS_fchmodat, "fchmodat", Op::Security, {1, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, {}}},
 #ifdef SYS_fchmodat2
-    {SYS_fchmodat2, "fchmodat2", Op::Security, {1, 2, 1, 0, 0, 0, 0, 0, 0, {}}},
+    {SYS_fchmodat2, "fchmodat2", Op::Security, {1, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, {}}},
 #endif
-    {SYS_chown, "chown", Op::Security, {1, 1, CWD, 0, 0, 0, 0, 0, 0, {}}},
-    {SYS_lchown, "lchown", Op::Security, {1, 1, CWD, 0, 0, 0, 0, 0, 0, {}}},
-    {SYS_fchown, "fchown", Op::Security, {1, 0, 0, 0, 0, 1, 0, 0, 0, {}}},
-    {SYS_fchownat, "fchownat", Op::Security, {1, 2, 1, 0, 0, 0, 0, 0, 0, {}}},
-    {SYS_utimensat, "utimensat", Op::Security, {1, 2, 1, 0, 0, 1, 0, 0, 0, {}}},
-    {SYS_setxattr, "setxattr", Op::SetEa, {1, 1, CWD, 0, 0, 0, 0, 0, 0, {}}},
-    {SYS_lsetxattr, "lsetxattr", Op::SetEa, {1, 1, CWD, 0, 0, 0, 0, 0, 0, {}}},
-    {SYS_fsetxattr, "fsetxattr", Op::SetEa, {1, 0, 0, 0, 0, 1, 0, 0, 0, {}}},
-    {SYS_removexattr, "removexattr", Op::SetEa, {1, 1, CWD, 0, 0, 0, 0, 0, 0, {}}},
-    {SYS_lremovexattr, "lremovexattr", Op::SetEa, {1, 1, CWD, 0, 0, 0, 0, 0, 0, {}}},
-    {SYS_fremovexattr, "fremovexattr", Op::SetEa, {1, 0, 0, 0, 0, 1, 0, 0, 0, {}}},
-    {SYS_getxattr, "getxattr", Op::QueryEa, {1, 1, CWD, 0, 0, 0, 0, 0, 0, {}}},
-    {SYS_lgetxattr, "lgetxattr", Op::QueryEa, {1, 1, CWD, 0, 0, 0, 0, 0, 0, {}}},
-    {SYS_fgetxattr, "fgetxattr", Op::QueryEa, {1, 0, 0, 0, 0, 1, 0, 0, 0, {}}},
-    {SYS_listxattr, "listxattr", Op::QueryEa, {1, 1, CWD, 0, 0, 0, 0, 0, 0, {}}},
-    {SYS_flistxattr, "flistxattr", Op::QueryEa, {1, 0, 0, 0, 0, 1, 0, 0, 0, {}}},
-    {SYS_ioctl, "ioctl", Op::Ioctl, {1, 0, 0, 0, 0, 1, 0, 0, 0, {}}},
-    {SYS_mmap, "mmap", Op::Mmap, {1, 0, 0, 0, 0, 5, 0, 0, 0, {}}},
-    {SYS_mprotect, "mprotect", Op::Mprotect, {1, 0, 0, 0, 0, 0, 0, 0, 0, {}}},
-    {SYS_ptrace, "ptrace", Op::Ptrace, {1, 0, 0, 0, 0, 0, 0, 0, 0, {}}},
-    {SYS_process_vm_readv, "process_vm_readv", Op::VmRead, {1, 0, 0, 0, 0, 0, 0, 0, 0, {}}},
-    {SYS_process_vm_writev, "process_vm_writev", Op::VmWrite, {1, 0, 0, 0, 0, 0, 0, 0, 0, {}}},
-    {SYS_kill, "kill", Op::Signal, {1, 0, 0, 0, 0, 0, 0, 0, 0, {}}},
-    {SYS_tkill, "tkill", Op::Signal, {1, 0, 0, 0, 0, 0, 0, 0, 0, {}}},
-    {SYS_tgkill, "tgkill", Op::Signal, {1, 0, 0, 0, 0, 0, 0, 0, 0, {}}},
-    {SYS_connect, "connect", Op::Connect, {1, 0, 0, 0, 0, 1, 0, MM_SOCK_IN_1, 0, {}}},
-    {SYS_accept, "accept", Op::Accept, {1, 0, 0, 0, 0, 1, 1, MM_SOCK_OUT_1, 0, {}}},
-    {SYS_accept4, "accept4", Op::Accept, {1, 0, 0, 0, 0, 1, 1, MM_SOCK_OUT_1, 0, {}}},
-    {SYS_sendto, "sendto", Op::SendTo, {1, 0, 0, 0, 0, 1, 0, MM_SOCK_IN_4, 0, {}}},
-    {SYS_recvfrom, "recvfrom", Op::RecvFrom, {1, 0, 0, 0, 0, 1, 0, MM_SOCK_OUT_4, 0, {}}},
-    {SYS_execve, "execve", Op::Exec, {2, 1, CWD, 0, 0, 0, 0, 0, 2, {}}},
-    {SYS_execveat, "execveat", Op::Exec, {2, 2, 1, 0, 0, 0, 0, 0, 3, {}}},
+    {SYS_chown, "chown", Op::Security, {1, 1, CWD, 0, 0, 0, 0, 0, 0, 0, 0, {}}},
+    {SYS_lchown, "lchown", Op::Security, {1, 1, CWD, 0, 0, 0, 0, 0, 0, 0, 0, {}}},
+    {SYS_fchown, "fchown", Op::Security, {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, {}}},
+    {SYS_fchownat, "fchownat", Op::Security, {1, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, {}}},
+    {SYS_utimensat, "utimensat", Op::Security, {1, 2, 1, 0, 0, 1, 0, 0, 0, 0, 0, {}}},
+    {SYS_utime, "utime", Op::Security, {1, 1, CWD, 0, 0, 0, 0, 0, 0, 0, 0, {}}},
+    {SYS_utimes, "utimes", Op::Security, {1, 1, CWD, 0, 0, 0, 0, 0, 0, 0, 0, {}}},
+    {SYS_futimesat, "futimesat", Op::Security, {1, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, {}}},
+    {SYS_setxattr, "setxattr", Op::SetEa, {1, 1, CWD, 0, 0, 0, 0, 0, 0, 0, 0, {}}},
+    {SYS_lsetxattr, "lsetxattr", Op::SetEa, {1, 1, CWD, 0, 0, 0, 0, 0, 0, 0, 0, {}}},
+    {SYS_fsetxattr, "fsetxattr", Op::SetEa, {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, {}}},
+    {SYS_removexattr, "removexattr", Op::SetEa, {1, 1, CWD, 0, 0, 0, 0, 0, 0, 0, 0, {}}},
+    {SYS_lremovexattr, "lremovexattr", Op::SetEa, {1, 1, CWD, 0, 0, 0, 0, 0, 0, 0, 0, {}}},
+    {SYS_fremovexattr, "fremovexattr", Op::SetEa, {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, {}}},
+    {SYS_getxattr, "getxattr", Op::QueryEa, {1, 1, CWD, 0, 0, 0, 0, 0, 0, 0, 0, {}}},
+    {SYS_lgetxattr, "lgetxattr", Op::QueryEa, {1, 1, CWD, 0, 0, 0, 0, 0, 0, 0, 0, {}}},
+    {SYS_fgetxattr, "fgetxattr", Op::QueryEa, {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, {}}},
+    {SYS_listxattr, "listxattr", Op::QueryEa, {1, 1, CWD, 0, 0, 0, 0, 0, 0, 0, 0, {}}},
+    {SYS_flistxattr, "flistxattr", Op::QueryEa, {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, {}}},
+    {SYS_ioctl, "ioctl", Op::Ioctl, {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, {}}},
+    {SYS_mmap, "mmap", Op::Mmap, {1, 0, 0, 0, 0, 5, 0, 0, 0, 0, 0, {}}},
+    {SYS_mprotect, "mprotect", Op::Mprotect, {1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, {}}},
+    {SYS_ptrace, "ptrace", Op::Ptrace, {1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, {}}},
+    {SYS_process_vm_readv, "process_vm_readv", Op::VmRead, {1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, {}}},
+    {SYS_process_vm_writev, "process_vm_writev", Op::VmWrite, {1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, {}}},
+    {SYS_kill, "kill", Op::Signal, {1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, {}}},
+    {SYS_tkill, "tkill", Op::Signal, {1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, {}}},
+    {SYS_tgkill, "tgkill", Op::Signal, {1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, {}}},
+    {SYS_connect, "connect", Op::Connect, {1, 0, 0, 0, 0, 1, 0, MM_SOCK_IN_1, 0, 0, 0, {}}},
+    {SYS_accept, "accept", Op::Accept, {1, 0, 0, 0, 0, 1, 1, MM_SOCK_OUT_1, 0, 0, 0, {}}},
+    {SYS_accept4, "accept4", Op::Accept, {1, 0, 0, 0, 0, 1, 1, MM_SOCK_OUT_1, 0, 0, 0, {}}},
+    {SYS_sendto, "sendto", Op::SendTo, {1, 0, 0, 0, 0, 1, 0, MM_SOCK_IN_4, 0, MM_DATA_BUF, 0, {}}},
+    {SYS_recvfrom, "recvfrom", Op::RecvFrom, {1, 0, 0, 0, 0, 1, 0, MM_SOCK_OUT_4, 0, MM_DATA_BUF, 4, {}}},
+    /* What kfilter's BPF layer can refuse beyond the calls above (bind/listen, prctl
+     * PR_SET_MM/PR_SET_PTRACER, module loads, ptrace-checked process access, queued signals). */
+    {SYS_bind, "bind", Op::Bind, {1, 0, 0, 0, 0, 1, 0, MM_SOCK_IN_1, 0, 0, 0, {}}},
+    {SYS_listen, "listen", Op::Listen, {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, {}}},
+    {SYS_prctl, "prctl", Op::Prctl, {1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, {}}},
+    {SYS_init_module, "init_module", Op::Module, {1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, {}}},
+    {SYS_finit_module, "finit_module", Op::Module, {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, {}}},
+    {SYS_pidfd_open, "pidfd_open", Op::ProcessOp, {1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, {}}},
+    {SYS_pidfd_getfd, "pidfd_getfd", Op::ProcessOp, {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, {}}},
+    {SYS_pidfd_send_signal, "pidfd_send_signal", Op::ProcessOp, {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, {}}},
+    {SYS_process_madvise, "process_madvise", Op::ProcessOp, {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, {}}},
+    {SYS_kcmp, "kcmp", Op::ProcessOp, {1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, {}}},
+    {SYS_rt_sigqueueinfo, "rt_sigqueueinfo", Op::ProcessOp, {1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, {}}},
+    {SYS_rt_tgsigqueueinfo, "rt_tgsigqueueinfo", Op::ProcessOp, {1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, {}}},
+    /* Machine and environment probing, socket creation (netlink, raw), file watching and
+     * shared memory (X11 MIT-SHM screen capture uses SysV segments). */
+    {SYS_fsync, "fsync", Op::Flush, {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, {}}},
+    {SYS_fdatasync, "fdatasync", Op::Flush, {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, {}}},
+    {SYS_syncfs, "syncfs", Op::Flush, {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, {}}},
+    {SYS_uname, "uname", Op::SystemInfo, {1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, {}}},
+    {SYS_sysinfo, "sysinfo", Op::SystemInfo, {1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, {}}},
+    {SYS_socket, "socket", Op::Socket, {1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, {}}},
+    {SYS_shutdown, "shutdown", Op::Shutdown, {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, {}}},
+    {SYS_inotify_add_watch, "inotify_add_watch", Op::Watch, {1, 2, CWD, 0, 0, 0, 0, 0, 0, 0, 0, {}}},
+    {SYS_memfd_create, "memfd_create", Op::Open, {1, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, {}}},
+    {SYS_shmget, "shmget", Op::SysvShm, {1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, {}}},
+    {SYS_shmat, "shmat", Op::SysvShm, {1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, {}}},
+    {SYS_execve, "execve", Op::Exec, {2, 1, CWD, 0, 0, 0, 0, 0, 2, 0, 0, {}}},
+    {SYS_execveat, "execveat", Op::Exec, {2, 2, 1, 0, 0, 0, 0, 0, 3, 0, 0, {}}},
 };
 
 /* Windows information classes the analysis already reads (as fanotify.cpp uses them). */
@@ -151,16 +196,189 @@ constexpr uint64_t CREATE_DISPOSITION_CREATE = 2ull << 24;
 struct State {
     bpf_object* object = nullptr;
     ring_buffer* ring = nullptr;
-    std::vector<bpf_link*> links;
+    std::vector<std::pair<std::string, bpf_link*>> links;   /* program name, its link */
+    bool payloads = false;   /* payload mode full (not --no-payloads) */
     int tracked = -1;
     int drops = -1;
     uint64_t dropsSeen = 0;
     const Syscall* byNumber[MM_SYSCALLS] = {};
     /* (pid << 32 | fd) -> path, from opens and accepts, for fds the kernel walk could not name. */
     std::unordered_map<uint64_t, std::wstring> fds;
+    /* Repeats of one call on one target, collapsed per second: "tgid|nr|extra|target" -> counts. */
+    struct Repeat {
+        uint64_t window = 0;
+        uint64_t count = 0;
+        uint64_t bytes = 0;
+        unsigned sensor = 0;
+        ULONG type = 0;
+        std::wstring text;
+        const char* name = "";
+    };
+    std::unordered_map<std::wstring, Repeat> repeats;
     LinuxSession* session = nullptr;
 };
 State gBpf;
+
+/* ---- Kernel rings to memory. A copy thread (CopyRun) only moves records out of the events, pkts and
+ * payload rings into these queues; the BPF thread (BpfRun) processes them from there. Processing (paths,
+ * stacks, wineserver decoding) is the slow part: in a Wine start-up burst the BPF thread was busy for a
+ * whole second while the 64 MiB events ring (~32k records) filled and the kernel dropped the rest.
+ * Each copy pass publishes its payload chunks and packets before its events, so when an event is
+ * processed, its call's chunks and the packets that preceded it (a socket's last packets before its
+ * close) are already queued. ---- */
+using Raw = std::vector<uint8_t>;
+struct Copied {
+    std::mutex mutex;
+    std::condition_variable published;   /* a pass was published, a flush was asked for, or copying ended */
+    std::condition_variable flushed;
+    std::deque<Raw> events, packets, chunks;
+    uint64_t bytes = 0;         /* queued */
+    uint64_t peak = 0;          /* most bytes queued at once */
+    uint64_t passes = 0;
+    uint64_t lost = 0;          /* records refused past kBacklogMax; counted as drops */
+    bool done = false;          /* the copy thread ended: nothing more is published */
+    uint64_t flushPass = 0;     /* BpfFlush: serve once this pass is published and processed */
+    bool flushAsked = false;
+    bool flushDone = false;
+} gCopy;
+/* The backlog is RAM; past this, records are counted as dropped rather than exhausting memory. */
+constexpr uint64_t kBacklogMax = 2ull << 30;
+/* One copy pass, filled by the ring callbacks (copy thread only). */
+struct {
+    std::vector<Raw> events, packets, chunks;
+} gBatch;
+
+int CopyTo(std::vector<Raw>& to, const void* data, size_t size)
+{
+    const auto* bytes = static_cast<const uint8_t*>(data);
+    to.emplace_back(bytes, bytes + size);
+    return 0;
+}
+int CopyEvent(void*, void* data, size_t size) { return CopyTo(gBatch.events, data, size); }
+int CopyPacket(void*, void* data, size_t size) { return CopyTo(gBatch.packets, data, size); }
+int CopyChunk(void*, void* data, size_t size) { return CopyTo(gBatch.chunks, data, size); }
+
+void Publish()
+{
+    std::lock_guard<std::mutex> lock(gCopy.mutex);
+    auto move = [](std::vector<Raw>& from, std::deque<Raw>& to) {
+        for (Raw& record : from) {
+            if (gCopy.bytes + record.size() > kBacklogMax) {
+                gCopy.lost++;
+                continue;
+            }
+            gCopy.bytes += record.size();
+            to.push_back(std::move(record));
+        }
+        from.clear();
+    };
+    move(gBatch.chunks, gCopy.chunks);
+    move(gBatch.packets, gCopy.packets);
+    move(gBatch.events, gCopy.events);
+    gCopy.peak = std::max(gCopy.peak, gCopy.bytes);
+    gCopy.passes++;
+    gCopy.published.notify_all();
+}
+
+/* BPF thread: the records of one queue published so far (at most max of them). */
+std::deque<Raw> TakeQueued(std::deque<Raw>& queue, size_t max = SIZE_MAX)
+{
+    std::lock_guard<std::mutex> lock(gCopy.mutex);
+    std::deque<Raw> taken;
+    while (!queue.empty() && taken.size() < max) {
+        gCopy.bytes -= queue.front().size();
+        taken.push_back(std::move(queue.front()));
+        queue.pop_front();
+    }
+    return taken;
+}
+
+/* BPF thread: waits until a copy pass that started after this call is published (or copying ended). */
+void WaitFullPass(std::chrono::steady_clock::time_point deadline)
+{
+    std::unique_lock<std::mutex> lock(gCopy.mutex);
+    const uint64_t target = gCopy.passes + 2;   /* the pass under way may have started before the call */
+    gCopy.published.wait_until(lock, deadline, [&] { return gCopy.passes >= target || gCopy.done; });
+}
+
+/* Optional program groups (docs/LINUX.md "Kernel sensor upgrades"): when the verifier refuses one,
+ * the object is loaded without it and only that group's records are lost. */
+struct Group {
+    const char* name;
+    const char* prefix;   /* its programs' names start with it */
+    const char* needs;    /* a group it is useless without, or nullptr */
+    bool wanted = false;
+    int state = -1;       /* 0 loaded; -1 off; otherwise the errno of its refused load */
+};
+Group gGroups[] = {
+    {"socks", "mm_sock_", nullptr},
+    {"tcp", "mm_tcp_", "socks"},
+    {"packets", "mm_skb_", "socks"},
+    {"wineserver", "mm_ws_", nullptr},
+};
+
+Group* FindGroup(const char* name)
+{
+    for (Group& group : gGroups) {
+        if (std::strcmp(group.name, name) == 0) return &group;
+    }
+    return nullptr;
+}
+
+/* true when the named group's programs were loaded. */
+[[maybe_unused]] bool GroupOn(const char* name)
+{
+    const Group* group = FindGroup(name);
+    return group != nullptr && group->state == 0;
+}
+
+[[maybe_unused]] bool Attached(const char* program)
+{
+    for (const auto& link : gBpf.links) {
+        if (link.first == program) return true;
+    }
+    return false;
+}
+
+/* ---- Upgrade hooks. Each upgrade defines its own in agent/linux/bpf_<upgrade>.inc (included
+ * below); the foundation ships them as no-ops (PeFrames: the unix frames only). ---- */
+using Notes = std::vector<std::pair<std::wstring, std::wstring>>;
+/* pecaller (bpf_pe.inc): a record's stack, PE frames first when pe.rip != 0; may append to its detail. */
+void PeFrames(const mm_pe& pe, DWORD tgid, uint64_t start, const __u64* frames, uint32_t count, LinuxRecord& record);
+int PeOpened(std::wstring& detail, unsigned& registered);
+void PeNotes(Notes& notes);
+/* payload (bpf_payload.inc) */
+void PayloadPrepare(bpf_object* object, bool payloads);
+int PayloadOpened(std::wstring& detail, unsigned& registered);
+void PayloadPoll();
+void PayloadForget(const mm_event& e);
+void PayloadClose();
+/* netattr (bpf_join.inc) */
+void JoinSocket(const mm_event& e, const Syscall& call, uint64_t start, const std::wstring& endpoint, unsigned family,
+                uint16_t port);
+void JoinForget(const mm_event& e, uint64_t start, const std::wstring& reason);
+void JoinFlush();
+void JoinClose();
+void JoinNotes(Notes& notes);
+/* tcp (bpf_tcp.inc) */
+int TcpOpened(std::wstring& detail, unsigned& registered);
+void TcpRing(const void* data, size_t size);
+void TcpClose();
+void TcpNotes(Notes& notes);
+/* packets (bpf_pkt.inc) */
+bool PktWanted();
+void PktPrepare(bpf_object* object, bool on);
+int PktOpened(std::wstring& detail, unsigned& registered);
+void PktSyscall(const mm_event& e, const Syscall& call);
+void PktPoll();
+void PktClose();
+/* wineserver (bpf_ws.inc) */
+void WsConfigure(bpf_object* object);
+int WsOpened(std::wstring& detail, unsigned& registered);
+void WsRing(const void* data, size_t size);
+void WsForget(const mm_event& e);
+void WsClose();
+void WsNotes(Notes& notes);
 
 uint64_t HertzTicksToFileTime(uint64_t nanoseconds)
 {
@@ -193,8 +411,11 @@ std::wstring Hex(uint64_t value)
     return text;
 }
 
-std::wstring Join(const std::wstring& directory, const std::wstring& name)
+std::wstring Join(const std::wstring& directory, std::wstring name)
 {
+    /* "." and a leading "./" name the directory itself; ".." stays (a symlink may sit before it). */
+    while (name.size() > 2 && name.compare(0, 2, L"./") == 0) name.erase(0, 2);
+    if ((name == L"." || name == L"./") && !directory.empty()) return directory;
     if (name.empty() || name[0] == L'/' || directory.empty()) return name;
     return directory + (directory.back() == L'/' ? L"" : L"/") + name;
 }
@@ -205,7 +426,11 @@ std::wstring FilePath(const mm_event& e)
     if ((e.flags & MM_F_KPATH) == 0) return {};
     std::wstring path = Text(e.kpath, sizeof(e.kpath));
     if (path == L"/" && !S_ISDIR(e.mode)) {
-        const wchar_t* kind = S_ISSOCK(e.mode) ? L"socket" : S_ISFIFO(e.mode) ? L"pipe" : L"anon_inode";
+        /* A pseudo file with no path: a regular one is shmem behind memfd_create. */
+        const wchar_t* kind = S_ISSOCK(e.mode)  ? L"socket"
+                              : S_ISFIFO(e.mode) ? L"pipe"
+                              : S_ISREG(e.mode)  ? L"memfd"
+                                                 : L"anon_inode";
         path = std::wstring(kind) + L":[" + std::to_wstring(e.ino) + L"]";
     }
     return path;
@@ -257,8 +482,8 @@ std::wstring Argv(const mm_event& e)
     return line;
 }
 
-void Record(const mm_event& e, unsigned sensor, ULONG type, uint64_t value0, uint64_t value1,
-            const std::wstring& text, const std::wstring& detail, ULONG flags, DWORD target = 0)
+LinuxRecord MakeRecord(const mm_event& e, unsigned sensor, ULONG type, uint64_t value0, uint64_t value1,
+                       const std::wstring& text, const std::wstring& detail, ULONG flags, DWORD target = 0)
 {
     LinuxRecord record;
     record.sensor = sensor;
@@ -274,15 +499,86 @@ void Record(const mm_event& e, unsigned sensor, ULONG type, uint64_t value0, uin
     record.value1 = value1;
     record.text = text;
     record.detail = detail;
-    record.stack.assign(e.stack, e.stack + std::min<uint32_t>(e.frames, MM_FRAMES));
+    PeFrames(e.pe, e.tgid, record.start, e.stack, std::min<uint32_t>(e.frames, MM_FRAMES), record);
+    return record;
+}
+
+void Record(const mm_event& e, unsigned sensor, ULONG type, uint64_t value0, uint64_t value1,
+            const std::wstring& text, const std::wstring& detail, ULONG flags, DWORD target = 0)
+{
+    LinuxRecord record = MakeRecord(e, sensor, type, value0, value1, text, detail, flags, target);
+    if (type == MsMonProcessStart) record.parent = e.ppid;   /* the kernel's real_parent tgid */
     gBpf.session->Write(record);
 }
+
+constexpr uint64_t kRepeatWindowNs = 1000000000ull;
+
+/* The same call on the same target (path, endpoint, ioctl request, target process) by one process
+ * is recorded at most once per second: the first call keeps its full record (arguments, stack),
+ * the others are counted and their count and bytes are added to the next record of that key, or
+ * written when the process exits or leaves scope. true: this call was counted, write nothing. */
+bool Repeated(const mm_event& e, const char* name, unsigned sensor, ULONG type, const std::wstring& text,
+              uint64_t extra, bool bytes, std::wstring& detail)
+{
+    /* The errno is part of the key, so a failure after successes (or another errno) is recorded. */
+    const std::wstring key = std::to_wstring(e.tgid) + L"|" + std::to_wstring(e.nr) + L"|" + std::to_wstring(extra) +
+                             L"|" + std::to_wstring(e.ret < 0 ? e.ret : 0) + L"|" + text;
+    State::Repeat& repeat = gBpf.repeats[key];
+    if (repeat.window != 0 && e.ts_ns - repeat.window < kRepeatWindowNs) {
+        repeat.count++;
+        if (bytes && e.ret > 0) repeat.bytes += static_cast<uint64_t>(e.ret);
+        return true;
+    }
+    if (repeat.count != 0) {
+        detail += L";repeats_before=" + std::to_wstring(repeat.count) + L";repeat_bytes=" + std::to_wstring(repeat.bytes);
+    }
+    repeat = {e.ts_ns, 0, 0, sensor, type, text, name};
+    return false;
+}
+
+/* Writes the counts still held for a process (e is its exit or exec) and drops its keys.
+ * shortcut: counts held when the agent stops (< 1 s per key) are not written; flush from
+ * BpfClose if a session must account for every call up to the stop. */
+void FlushRepeats(const mm_event& e, std::wstring prefix = {})
+{
+    /* Prefix narrows the keys (e.g. "tgid|nr|extra|"); empty = all of the process's. */
+    if (prefix.empty()) prefix = std::to_wstring(e.tgid) + L"|";
+    for (auto it = gBpf.repeats.begin(); it != gBpf.repeats.end();) {
+        if (it->first.compare(0, prefix.size(), prefix) != 0) {
+            ++it;
+            continue;
+        }
+        const State::Repeat& repeat = it->second;
+        if (repeat.count != 0) {
+            mm_event tail = e;
+            tail.ret = 0;
+            tail.frames = 0;
+            Record(tail, repeat.sensor, repeat.type, repeat.bytes, repeat.count, repeat.text,
+                   L"repeats_tail;syscall=" + LinuxWide(repeat.name) + L";repeats_before=" + std::to_wstring(repeat.count) +
+                       L";repeat_bytes=" + std::to_wstring(repeat.bytes),
+                   0);
+        }
+        it = gBpf.repeats.erase(it);
+    }
+}
+
+}  // namespace
+
+#include "bpf_pe.inc"
+#include "bpf_payload.inc"
+#include "bpf_join.inc"
+#include "bpf_tcp.inc"
+#include "bpf_pkt.inc"
+#include "bpf_ws.inc"
+
+namespace {
 
 void OnSyscall(const mm_event& e)
 {
     if (e.nr >= MM_SYSCALLS || gBpf.byNumber[e.nr] == nullptr) return;
     const Syscall& call = *gBpf.byNumber[e.nr];
     LinuxSession& session = *gBpf.session;
+    PayloadMessages payload = (e.flags & MM_F_PAYLOAD) != 0 ? TakePayload(e) : PayloadMessages{};
     uint64_t start = 0;
     ULONG trackFlags = 0;
     if (!session.Tracked(e.tgid, start, trackFlags)) return;
@@ -315,38 +611,64 @@ void OnSyscall(const mm_event& e)
                                 ? e.args[3]
                                 : e.pos;
 
+    JoinSocket(e, call, start, endpoint, family, port);
+    PktSyscall(e, call);
     switch (call.op) {
     case Op::Read:
-    case Op::Write:
-        Record(e, fileSensor, call.op == Op::Read ? MsMonFileRead : MsMonFileWrite, success ? e.ret : 0, offset, file,
-               detail + L";requested=" + std::to_wstring(e.args[2]), flags | missing(file));
+    case Op::Write: {
+        const ULONG type = call.op == Op::Read ? MsMonFileRead : MsMonFileWrite;
+        std::wstring text = detail + L";requested=" + std::to_wstring(e.args[2]);
+        if ((e.flags & MM_F_PAYLOAD) != 0) {
+            RecordPayload(e, payload, fileSensor, type, success ? e.ret : 0, offset, file, text, flags | missing(file),
+                          call.op == Op::Write);
+            break;
+        }
+        if (Repeated(e, call.name, fileSensor, type, file, 0, true, text)) break;
+        Record(e, fileSensor, type, success ? e.ret : 0, offset, file, text, flags | missing(file));
         break;
+    }
     case Op::Open: {
-        const std::wstring path = !file.empty() ? file : pathA;
+        /* memfd_create's argument is the name (shown as memfd:<name> in /proc/<pid>/fd), not a path. */
+        const std::wstring path = e.nr == SYS_memfd_create ? L"memfd:" + Text(e.path_a, sizeof(e.path_a))
+                                  : !file.empty()          ? file
+                                                           : pathA;
         if (success && !path.empty()) gBpf.fds[(static_cast<uint64_t>(e.tgid) << 32) | static_cast<uint32_t>(e.ret)] = path;
-        const uint64_t openFlags = e.nr == SYS_open ? e.args[1] : e.nr == SYS_creat ? 0x241 : e.args[2];
-        Record(e, MSMON_SENSOR_LINUX_EBPF_FILE, MsMonFileCreate, openFlags, success ? e.ret : 0, path,
-               detail + L";open_flags=" + Hex(openFlags) + (pathA != path && !pathA.empty() ? L";requested=" + pathA : L""),
+        const uint64_t openFlags = e.nr == SYS_open || e.nr == SYS_memfd_create ? e.args[1]
+                                   : e.nr == SYS_creat                         ? 0x241
+                                                                               : e.args[2];
+        std::wstring text =
+            detail + L";open_flags=" + Hex(openFlags) + (pathA != path && !pathA.empty() ? L";requested=" + pathA : L"");
+        if (Repeated(e, call.name, MSMON_SENSOR_LINUX_EBPF_FILE, MsMonFileCreate, path, openFlags, false, text)) break;
+        Record(e, MSMON_SENSOR_LINUX_EBPF_FILE, MsMonFileCreate, openFlags, success ? e.ret : 0, path, text,
                flags | missing(path));
         break;
     }
     case Op::Close:
         gBpf.fds.erase(fdKey);
         if (socketFd) {
+            dnsStreams.erase({e.tgid, e.ino, false});
+            dnsStreams.erase({e.tgid, e.ino, true});
             Record(e, MSMON_SENSOR_LINUX_EBPF_NET, MsMonNetworkFlowClose, e.ino, 0, file, L"close;" + detail, flags);
         } else {
-            Record(e, MSMON_SENSOR_LINUX_EBPF_FILE, MsMonFileClose, 0, 0, file, detail, flags | missing(file));
+            std::wstring text = detail;
+            if (Repeated(e, call.name, MSMON_SENSOR_LINUX_EBPF_FILE, MsMonFileClose, file, 0, false, text)) break;
+            Record(e, MSMON_SENSOR_LINUX_EBPF_FILE, MsMonFileClose, 0, 0, file, text, flags | missing(file));
         }
         break;
     case Op::Query: {
         const std::wstring path = !pathA.empty() ? pathA : file;
-        Record(e, MSMON_SENSOR_LINUX_EBPF_FILE, MsMonFileQueryInformation, e.nr, 0, path, detail, flags | missing(path));
+        std::wstring text = detail;
+        if (Repeated(e, call.name, MSMON_SENSOR_LINUX_EBPF_FILE, MsMonFileQueryInformation, path, 0, false, text)) break;
+        Record(e, MSMON_SENSOR_LINUX_EBPF_FILE, MsMonFileQueryInformation, e.nr, 0, path, text, flags | missing(path));
         break;
     }
-    case Op::Directory:
-        Record(e, MSMON_SENSOR_LINUX_EBPF_FILE, MsMonFileDirectoryControl, 1, success ? e.ret : 0, file, detail,
+    case Op::Directory: {
+        std::wstring text = detail;
+        if (Repeated(e, call.name, MSMON_SENSOR_LINUX_EBPF_FILE, MsMonFileDirectoryControl, file, 0, true, text)) break;
+        Record(e, MSMON_SENSOR_LINUX_EBPF_FILE, MsMonFileDirectoryControl, 1, success ? e.ret : 0, file, text,
                flags | missing(file));
         break;
+    }
     case Op::Unlink: {
         const bool directory = e.nr == SYS_rmdir || (e.nr == SYS_unlinkat && (e.args[2] & 0x200) != 0);
         Record(e, MSMON_SENSOR_LINUX_EBPF_FILE, MsMonFileSetInformation, FILE_DISPOSITION_INFORMATION, 0, pathA,
@@ -385,14 +707,21 @@ void OnSyscall(const mm_event& e)
     case Op::SetEa:
     case Op::QueryEa: {
         const std::wstring path = !pathA.empty() ? pathA : file;
-        Record(e, MSMON_SENSOR_LINUX_EBPF_FILE, call.op == Op::SetEa ? MsMonFileSetEa : MsMonFileQueryEa, 0, 0, path,
-               detail, flags | missing(path));
+        const ULONG type = call.op == Op::SetEa ? MsMonFileSetEa : MsMonFileQueryEa;
+        std::wstring text = detail;
+        if (call.op == Op::QueryEa &&
+            Repeated(e, call.name, MSMON_SENSOR_LINUX_EBPF_FILE, type, path, 0, false, text)) break;
+        Record(e, MSMON_SENSOR_LINUX_EBPF_FILE, type, 0, 0, path, text, flags | missing(path));
         break;
     }
-    case Op::Ioctl:
-        Record(e, MSMON_SENSOR_LINUX_EBPF_DEVICE, MsMonFileDeviceControl, e.args[1], e.args[2], file, detail,
+    case Op::Ioctl: {
+        std::wstring text = detail;
+        if (Repeated(e, call.name, MSMON_SENSOR_LINUX_EBPF_DEVICE, MsMonFileDeviceControl, file, e.args[1], false, text))
+            break;
+        Record(e, MSMON_SENSOR_LINUX_EBPF_DEVICE, MsMonFileDeviceControl, e.args[1], e.args[2], file, text,
                flags | missing(file));
         break;
+    }
     case Op::Mmap: {
         const bool fileBacked = (e.flags & MM_F_KPATH) != 0 && static_cast<int>(e.args[4]) >= 0;
         const bool executable = (e.args[2] & 0x4) != 0;   // PROT_EXEC
@@ -410,25 +739,37 @@ void OnSyscall(const mm_event& e)
                detail, 0);
         if (success) ImagesScan(session, e.tgid, start);
         break;
-    case Op::Ptrace:
-        Record(e, MSMON_SENSOR_LINUX_EBPF_MEMORY, MsMonProcessHandle, e.args[0], e.args[2], {}, L"ptrace;" + detail, 0,
+    case Op::Ptrace: {
+        std::wstring text = L"ptrace;" + detail;
+        if (Repeated(e, call.name, MSMON_SENSOR_LINUX_EBPF_MEMORY, MsMonProcessHandle, {},
+                     (e.args[1] << 16) | (e.args[0] & 0xffff), false, text)) break;
+        Record(e, MSMON_SENSOR_LINUX_EBPF_MEMORY, MsMonProcessHandle, e.args[0], e.args[2], {}, text, 0,
                static_cast<DWORD>(e.args[1]));
         break;
+    }
     case Op::VmRead:
-    case Op::VmWrite:
+    case Op::VmWrite: {
+        std::wstring text = LinuxWide(call.name) + L";" + detail;
+        if (Repeated(e, call.name, MSMON_SENSOR_LINUX_EBPF_MEMORY, MsMonProcessHandle, {}, e.args[0], true, text)) break;
         Record(e, MSMON_SENSOR_LINUX_EBPF_MEMORY, MsMonProcessHandle, call.op == Op::VmRead ? 1 : 2,
-               success ? e.ret : 0, {}, LinuxWide(call.name) + L";" + detail, 0, static_cast<DWORD>(e.args[0]));
-        break;
-    case Op::Signal: {
-        const uint64_t signal = e.nr == SYS_tgkill ? e.args[2] : e.args[1];
-        Record(e, MSMON_SENSOR_LINUX_EBPF_IPC, MsMonProcessHandle, 0, signal, {},
-               L"signal=" + std::to_wstring(signal) + L";" + detail, 0, static_cast<DWORD>(e.args[0]));
+               success ? e.ret : 0, {}, text, 0, static_cast<DWORD>(e.args[0]));
         break;
     }
-    case Op::Connect:
-        Record(e, netSensor, MsMonNetworkConnect, e.ino, port, endpoint,
-               L"connect;family=" + std::to_wstring(family) + L";" + detail, endpoint.empty() ? MsMonFlagMissingPath : 0);
+    case Op::Signal: {
+        const uint64_t signal = e.nr == SYS_tgkill ? e.args[2] : e.args[1];
+        std::wstring text = L"signal=" + std::to_wstring(signal) + L";" + detail;
+        if (Repeated(e, call.name, MSMON_SENSOR_LINUX_EBPF_IPC, MsMonProcessHandle, {}, (e.args[0] << 8) | (signal & 0xff),
+                     false, text)) break;
+        Record(e, MSMON_SENSOR_LINUX_EBPF_IPC, MsMonProcessHandle, 0, signal, {}, text, 0,
+               static_cast<DWORD>(e.args[0]));
         break;
+    }
+    case Op::Connect: {
+        std::wstring text = L"connect;family=" + std::to_wstring(family) + L";" + detail;
+        if (Repeated(e, call.name, netSensor, MsMonNetworkConnect, endpoint, family, false, text)) break;
+        Record(e, netSensor, MsMonNetworkConnect, e.ino, port, endpoint, text, endpoint.empty() ? MsMonFlagMissingPath : 0);
+        break;
+    }
     case Op::Accept:
         if (success) gBpf.fds[(static_cast<uint64_t>(e.tgid) << 32) | static_cast<uint32_t>(e.ret)] = L"socket:" + endpoint;
         Record(e, netSensor, MsMonNetworkAccept, e.ino, port, endpoint,
@@ -437,20 +778,124 @@ void OnSyscall(const mm_event& e)
     case Op::SendTo:
     case Op::RecvFrom:
         if (!endpoint.empty()) {
-            Record(e, netSensor, call.op == Op::SendTo ? MsMonNetworkConnect : MsMonNetworkAccept, e.ino, port, endpoint,
-                   std::wstring(call.op == Op::SendTo ? L"sendto" : L"recvfrom") + L";family=" + std::to_wstring(family) +
-                       L";bytes=" + std::to_wstring(success ? e.ret : 0) + L";" + detail,
-                   0);
+            const ULONG type = call.op == Op::SendTo ? MsMonNetworkConnect : MsMonNetworkAccept;
+            std::wstring text = LinuxWide(call.name) + L";family=" + std::to_wstring(family) +
+                                L";bytes=" + std::to_wstring(success ? e.ret : 0) + L";" + detail;
+            if ((e.flags & MM_F_PAYLOAD) != 0) {
+                RecordPayload(e, payload, netSensor, type, e.ino, port, endpoint, text, 0, call.op == Op::SendTo);
+                break;
+            }
+            if (Repeated(e, call.name, netSensor, type, endpoint, family, true, text)) break;
+            Record(e, netSensor, type, e.ino, port, endpoint, text, 0);
         } else {
-            Record(e, fileSensor, call.op == Op::SendTo ? MsMonFileWrite : MsMonFileRead, success ? e.ret : 0, 0, file,
-                   detail, flags | missing(file));
+            const ULONG type = call.op == Op::SendTo ? MsMonFileWrite : MsMonFileRead;
+            std::wstring text = detail;
+            if ((e.flags & MM_F_PAYLOAD) != 0) {
+                RecordPayload(e, payload, fileSensor, type, success ? e.ret : 0, 0, file, text, flags | missing(file),
+                              call.op == Op::SendTo);
+                break;
+            }
+            if (Repeated(e, call.name, fileSensor, type, file, 0, true, text)) break;
+            Record(e, fileSensor, type, success ? e.ret : 0, 0, file, text, flags | missing(file));
         }
         break;
+    case Op::Bind:
+        Record(e, netSensor, MsMonNetworkAccept, e.ino, port, endpoint,
+               L"bind;family=" + std::to_wstring(family) + L";" + detail, endpoint.empty() ? MsMonFlagMissingPath : 0);
+        break;
+    case Op::Listen:
+        Record(e, MSMON_SENSOR_LINUX_EBPF_NET, MsMonNetworkAccept, e.ino, e.args[1], file, L"listen;" + detail,
+               flags | missing(file));
+        break;
+    case Op::Prctl: {
+        /* PR_SET_PTRACER (0x59616d61) names the process allowed to ptrace this one. */
+        const DWORD target = e.args[0] == 0x59616d61 ? static_cast<DWORD>(e.args[1]) : 0;
+        Record(e, MSMON_SENSOR_LINUX_EBPF_MEMORY, MsMonProcessHandle, e.args[0], e.args[1], {},
+               L"prctl;option=" + std::to_wstring(e.args[0]) + L";" + detail, 0, target);
+        break;
+    }
+    case Op::Module:
+        Record(e, MSMON_SENSOR_LINUX_EBPF_MEMORY, MsMonProcessHandle, e.nr, 0, file, LinuxWide(call.name) + L";" + detail,
+               0);
+        break;
+    case Op::ProcessOp: {
+        /* pidfd_open, kcmp and the queued signals name a pid; the others take a pidfd (named by file). */
+        const bool pid = e.nr == SYS_pidfd_open || e.nr == SYS_kcmp || e.nr == SYS_rt_sigqueueinfo ||
+                         e.nr == SYS_rt_tgsigqueueinfo;
+        std::wstring text = LinuxWide(call.name) + L";" + detail;
+        if (Repeated(e, call.name, MSMON_SENSOR_LINUX_EBPF_MEMORY, MsMonProcessHandle, file, e.args[0], false, text))
+            break;
+        Record(e, MSMON_SENSOR_LINUX_EBPF_MEMORY, MsMonProcessHandle, e.nr, e.args[1], file, text, 0,
+               pid ? static_cast<DWORD>(e.args[0]) : 0);
+        break;
+    }
+    case Op::Flush: {
+        std::wstring text = detail;
+        if (Repeated(e, call.name, MSMON_SENSOR_LINUX_EBPF_FILE, MsMonFileFlush, file, 0, false, text)) break;
+        Record(e, MSMON_SENSOR_LINUX_EBPF_FILE, MsMonFileFlush, 0, 0, file, text, flags | missing(file));
+        break;
+    }
+    case Op::SystemInfo: {
+        /* No file is involved; the text names the call so the classifier can mark it. */
+        const std::wstring what = L"system:" + LinuxWide(call.name);
+        std::wstring text = detail;
+        if (Repeated(e, call.name, MSMON_SENSOR_LINUX_EBPF_FILE, MsMonFileQueryInformation, what, 0, false, text)) break;
+        Record(e, MSMON_SENSOR_LINUX_EBPF_FILE, MsMonFileQueryInformation, e.nr, 0, what, text, 0);
+        break;
+    }
+    case Op::Socket: {
+        /* As on Windows (an AFD create): a file_create of the new socket, value0 family, value1 type. */
+        const unsigned socketFamily = static_cast<unsigned>(e.args[0]);
+        const unsigned sensor = socketFamily == AF_UNIX ? MSMON_SENSOR_LINUX_EBPF_IPC : MSMON_SENSOR_LINUX_EBPF_NET;
+        std::wstring text = L"socket;family=" + std::to_wstring(socketFamily) + L";type=" + std::to_wstring(e.args[1] & 0xf) +
+                            L";protocol=" + std::to_wstring(e.args[2]) + L";" + detail;
+        if (Repeated(e, call.name, sensor, MsMonFileCreate, L"", (e.args[0] << 32) | e.args[1], false, text)) break;
+        Record(e, sensor, MsMonFileCreate, e.args[0], e.args[1], file, text, flags | missing(file));
+        break;
+    }
+    case Op::Shutdown:
+        Record(e, netSensor, MsMonNetworkFlowClose, e.ino, e.args[1], file, L"shutdown;how=" + std::to_wstring(e.args[1]) +
+               L";" + detail, flags | missing(file));
+        break;
+    case Op::Watch:
+        /* Like ReadDirectoryChangesW (directory control); value1 the inotify mask. */
+        Record(e, MSMON_SENSOR_LINUX_EBPF_FILE, MsMonFileDirectoryControl, 2, e.args[2], pathA,
+               L"inotify_add_watch;mask=" + Hex(e.args[2]) + L";" + detail, flags | missing(pathA));
+        break;
+    case Op::SysvShm: {
+        /* shmget: key, size; shmat: segment id. value0 key or id, value1 size or address. */
+        const std::wstring what = (e.nr == SYS_shmget ? L"sysv_shm:key=" : L"sysv_shm:id=") + Hex(e.args[0]);
+        std::wstring text = LinuxWide(call.name) + L";" + detail;
+        if (Repeated(e, call.name, MSMON_SENSOR_LINUX_EBPF_MEMORY, MsMonFileSection, what, 0, false, text)) break;
+        Record(e, MSMON_SENSOR_LINUX_EBPF_MEMORY, MsMonFileSection, e.args[0], e.nr == SYS_shmget ? e.args[1] : e.ret, what,
+               text, 0);
+        break;
+    }
     case Op::Exec:
         /* Only a failed exec reaches here; a successful one is the MM_EXEC record. */
         Record(e, MSMON_SENSOR_LINUX_EBPF_PROCESS, MsMonProcessStart, start, 2, pathA, L"exec_failed;" + detail,
                flags | missing(pathA));
         break;
+    }
+    if (!payload.empty()) {
+        DnsRecords(e, payload, !endpoint.empty() ? port : e.sk_rport, !endpoint.empty() ? endpoint : SocketAddress(e, true),
+                   call.op == Op::Read || call.op == Op::RecvFrom);
+    }
+}
+
+/* Stops tracking a process: its held repeat counts are written first; reason non-empty
+ * records why it left scope while still running. */
+void ForgetProcess(const mm_event& e, uint64_t start, const std::wstring& reason)
+{
+    WsForget(e);   /* first: its unanswered requests may still be counted as repeats */
+    FlushRepeats(e);
+    JoinForget(e, start, reason);
+    PayloadForget(e);
+    if (!reason.empty()) Record(e, MSMON_SENSOR_LINUX_EBPF_PROCESS, MsMonProcessExit, start, 1, {}, L"untracked;" + reason, 0);
+    gBpf.session->Forget(e.tgid, start);
+    ImagesForget(e.tgid);
+    for (auto it = gBpf.fds.begin(); it != gBpf.fds.end();) {
+        it = (it->first >> 32) == e.tgid ? gBpf.fds.erase(it) : std::next(it);
     }
 }
 
@@ -484,9 +929,18 @@ void OnRecord(const mm_event& e)
         uint64_t start = 0;
         ULONG flags = 0;
         if (!session.Tracked(e.tgid, start, flags)) break;
+        WsForget(e);   /* a new image: its wineserver state starts over */
         const std::wstring image = !FilePath(e).empty() ? FilePath(e) : Text(e.path_a, sizeof(e.path_a));
         Record(e, MSMON_SENSOR_LINUX_EBPF_PROCESS, MsMonProcessStart, start, 1, image,
                (e.flags & MM_F_ARGV) != 0 ? Argv(e) : ProcessCommandLine(e.tgid), flags);
+        /* A native program (xdg-open, a browser) is not the client: the kernel has stopped
+         * tracking it (wine_image in monitor.bpf.c), and it is forgotten here. */
+        const std::wstring requested = Text(e.path_a, sizeof(e.path_a));
+        if (requested.substr(requested.find_last_of(L'/') + 1).rfind(L"wine", 0) != 0 &&
+            !((e.flags & MM_F_KPATH) != 0 && session.UnderRoot(FilePath(e)))) {
+            ForgetProcess(e, start, L"native_exec");
+            break;
+        }
         ImagesScan(session, e.tgid, start);
         break;
     }
@@ -495,12 +949,9 @@ void OnRecord(const mm_event& e)
         uint64_t start = 0;
         ULONG flags = 0;
         if (!session.Tracked(e.tgid, start, flags)) break;
+        FlushRepeats(e);
         Record(e, MSMON_SENSOR_LINUX_EBPF_PROCESS, MsMonProcessExit, start, 0, {}, {}, 0);
-        session.Forget(e.tgid, start);
-        ImagesForget(e.tgid);
-        for (auto it = gBpf.fds.begin(); it != gBpf.fds.end();) {
-            it = (it->first >> 32) == e.tgid ? gBpf.fds.erase(it) : std::next(it);
-        }
+        ForgetProcess(e, start, {});
         break;
     }
     case MM_THREAD_START:
@@ -525,9 +976,33 @@ void OnRecord(const mm_event& e)
     }
 }
 
+/* Every record starts with its __u32 kind; MM_TCP and MM_WS_* are their own structs. */
 int OnRing(void*, void* data, size_t size)
 {
-    if (size >= sizeof(mm_event)) OnRecord(*static_cast<const mm_event*>(data));
+    uint32_t kind = 0;
+    if (size < sizeof(kind)) return 0;
+    std::memcpy(&kind, data, sizeof(kind));
+    switch (kind) {
+    case MM_TCP:
+        TcpRing(data, size);
+        break;
+    case MM_WS_REQUEST:
+    case MM_WS_REPLY:
+        WsRing(data, size);
+        break;
+    default:
+        if (size >= sizeof(mm_event)) {
+            OnRecord(*static_cast<const mm_event*>(data));
+        } else if (size >= MM_EVENT_SHORT) {
+            /* No PE context: the record ends before mm_event.pe. */
+            mm_event e;
+            std::memcpy(&e, data, MM_EVENT_SHORT);
+            e.pe.rip = 0;
+            e.pe.bytes = 0;
+            OnRecord(e);
+        }
+        break;
+    }
     return 0;
 }
 
@@ -537,20 +1012,77 @@ int PrintLibbpf(enum libbpf_print_level level, const char* format, va_list args)
     return vfprintf(stderr, format, args);
 }
 
+/* Opens the object with the groups in On and loads it: 0, or the negative errno of the open or load. */
+int LoadWith(const std::vector<bool>& on)
+{
+    gBpf.object = bpf_object__open_mem(kMonitorBpfObject, sizeof(kMonitorBpfObject), nullptr);
+    if (gBpf.object == nullptr) return -(errno != 0 ? errno : EINVAL);
+    bpf_program* program = nullptr;
+    bpf_object__for_each_program(program, gBpf.object) {
+        const std::string name = bpf_program__name(program);
+        for (size_t index = 0; index < std::size(gGroups); index++) {
+            if (name.rfind(gGroups[index].prefix, 0) == 0 && !on[index]) bpf_program__set_autoload(program, false);
+        }
+    }
+    PayloadPrepare(gBpf.object, gBpf.payloads);
+    PktPrepare(gBpf.object, on[FindGroup("packets") - gGroups]);
+    const int error = bpf_object__load(gBpf.object);
+    if (error != 0) {
+        bpf_object__close(gBpf.object);
+        gBpf.object = nullptr;
+    }
+    return error;
+}
+
+/* The object with every wanted group the verifier accepts: 0, or the negative errno of the core's load. */
+int LoadObject()
+{
+    const size_t count = std::size(gGroups);
+    std::vector<bool> on(count), ok(count, false);
+    bool any = false;
+    for (size_t index = 0; index < count; index++) {
+        const Group* needs = gGroups[index].needs != nullptr ? FindGroup(gGroups[index].needs) : nullptr;
+        on[index] = gGroups[index].wanted && (needs == nullptr || needs->wanted);
+        gGroups[index].state = -1;
+        any = any || on[index];
+    }
+    int error = LoadWith(on);
+    if (error == 0 || error == -EPERM || !any) {
+        for (size_t index = 0; index < count; index++) gGroups[index].state = error == 0 && on[index] ? 0 : -1;
+        return error;
+    }
+    /* Something was refused (libbpf printed the verifier log): the core alone, then each group on top. */
+    error = LoadWith(ok);
+    if (error != 0) return error;
+    for (size_t index = 0; index < count; index++) {
+        const Group* needs = gGroups[index].needs != nullptr ? FindGroup(gGroups[index].needs) : nullptr;
+        if (!on[index] || (needs != nullptr && !ok[needs - gGroups])) continue;
+        bpf_object__close(gBpf.object);
+        ok[index] = true;
+        error = LoadWith(ok);
+        if (error == 0) {
+            gGroups[index].state = 0;
+            continue;
+        }
+        ok[index] = false;
+        gGroups[index].state = -error;
+        error = LoadWith(ok);   /* back to what loaded */
+        if (error != 0) return error;
+    }
+    return 0;
+}
+
 }  // namespace
 
-/* Registration of the six sensors, as bits of MSMON_SENSOR_LINUX_EBPF_* - 48. */
-int BpfOpen(std::wstring& detail, const std::wstring& root, unsigned& registered)
+/* Registration of the six sensors, as bits of MSMON_SENSOR_LINUX_EBPF_* - 48 (and of the upgrades'
+ * sensors: MSMON_SENSOR_LINUX_EBPF_WINESERVER - 48). */
+int BpfOpen(std::wstring& detail, const std::wstring& root, bool payloads, unsigned& registered)
 {
     registered = 0;
     libbpf_set_print(PrintLibbpf);
-    gBpf.object = bpf_object__open_mem(kMonitorBpfObject, sizeof(kMonitorBpfObject), nullptr);
-    if (gBpf.object == nullptr) {
-        const int error = errno;
-        detail = L"bpf_object__open_mem failed";
-        return error != 0 ? error : EINVAL;
-    }
-    int error = bpf_object__load(gBpf.object);
+    gBpf.payloads = payloads;
+    for (Group& group : gGroups) group.wanted = std::strcmp(group.name, "packets") != 0 || PktWanted();
+    int error = LoadObject();
     if (error != 0) {
         detail = L"bpf_object__load failed (needs root, BTF and a kernel with BPF LSM); see stderr";
         BpfClose();
@@ -569,8 +1101,10 @@ int BpfOpen(std::wstring& detail, const std::wstring& root, unsigned& registered
         config.root_len = static_cast<uint32_t>(narrowRoot.size());
         std::memcpy(config.root, narrowRoot.data(), narrowRoot.size());
     }
+    config.flags = payloads ? MM_CFG_PAYLOAD : 0;
     const uint32_t zero = 0;
     bpf_map_update_elem(bpf_map__fd(bpf_object__find_map_by_name(gBpf.object, "mm_cfg")), &zero, &config, BPF_ANY);
+    WsConfigure(gBpf.object);
     gBpf.tracked = bpf_map__fd(bpf_object__find_map_by_name(gBpf.object, "tracked"));
     gBpf.drops = bpf_map__fd(bpf_object__find_map_by_name(gBpf.object, "drops"));
 
@@ -579,8 +1113,22 @@ int BpfOpen(std::wstring& detail, const std::wstring& root, unsigned& registered
     bool syscalls = true, process = true, memory = true;
     bpf_program* program = nullptr;
     bpf_object__for_each_program(program, gBpf.object) {
-        bpf_link* link = bpf_program__attach(program);
+        if (!bpf_program__autoload(program)) continue;   /* an optional group that was left out */
         const std::string name = bpf_program__name(program);
+        bpf_link* link = nullptr;
+        if (bpf_program__type(program) == BPF_PROG_TYPE_CGROUP_SKB) {
+            /* A link attach is BPF_F_ALLOW_MULTI, and the kernel detaches it when its fd closes (also
+             * when the agent is killed). */
+            const int cgroup = open("/sys/fs/cgroup", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+            if (cgroup >= 0) {
+                link = bpf_program__attach_cgroup(program, cgroup);
+                const int saved = errno;
+                close(cgroup);
+                errno = saved;
+            }
+        } else {
+            link = bpf_program__attach(program);
+        }
         if (link == nullptr) {
             failed += (failed.empty() ? L"" : L",") + LinuxWide(name) + L"=" + std::to_wstring(errno);
             if (name == "mm_sys_enter" || name == "mm_sys_exit") syscalls = false;
@@ -588,14 +1136,14 @@ int BpfOpen(std::wstring& detail, const std::wstring& root, unsigned& registered
             if (name == "mm_mmap_file" || name == "mm_file_mprotect") memory = false;
             continue;
         }
-        gBpf.links.push_back(link);
+        gBpf.links.emplace_back(name, link);
     }
     if (!syscalls && !process) {
         detail = L"no BPF program attached: " + failed;
         BpfClose();
         return EOPNOTSUPP;
     }
-    gBpf.ring = ring_buffer__new(bpf_map__fd(bpf_object__find_map_by_name(gBpf.object, "events")), OnRing, nullptr, nullptr);
+    gBpf.ring = ring_buffer__new(bpf_map__fd(bpf_object__find_map_by_name(gBpf.object, "events")), CopyEvent, nullptr, nullptr);
     if (gBpf.ring == nullptr) {
         error = errno;
         detail = L"ring_buffer__new failed";
@@ -613,35 +1161,118 @@ int BpfOpen(std::wstring& detail, const std::wstring& root, unsigned& registered
     }
     detail = L"programs=" + std::to_wstring(gBpf.links.size()) + L";syscalls=" + std::to_wstring(std::size(kSyscalls)) +
              L";stack_frames=" + std::to_wstring(MM_FRAMES) + L";path_bytes=" + std::to_wstring(MM_PATH) +
-             (failed.empty() ? L"" : L";attach_failed=" + failed);
+             (failed.empty() ? L"" : L";attach_failed=" + failed) + L";optional=";
+    for (const Group& group : gGroups) {
+        detail += std::wstring(&group == gGroups ? L"" : L",") + LinuxWide(group.name) + L":" +
+                  (group.state == 0    ? std::wstring(L"on")
+                   : group.state == -1 ? std::wstring(L"off")
+                                       : L"load_failed:" + std::to_wstring(group.state));
+    }
+    for (int (*opened)(std::wstring&, unsigned&) : {PeOpened, PayloadOpened, TcpOpened, PktOpened, WsOpened}) {
+        error = opened(detail, registered);
+        if (error != 0) {
+            BpfClose();
+            return error;
+        }
+    }
     return 0;
+}
+
+/* Copy thread: drains the rings into gCopy, one pass at a time, until the session stops. */
+void CopyRun(LinuxSession& session)
+{
+    for (bool last = false; !last;) {
+        last = session.Stopping();
+        ring_buffer__poll(gBpf.ring, last ? 0 : 10);
+        /* In ring order (events, then pkts): packets committed before an event read above are read here. */
+        ring_buffer__consume(gBpf.ring);
+        /* A call's chunks are committed before its record, so they are in payload_ring by now. */
+        if (payloadRing != nullptr) ring_buffer__consume(payloadRing);
+        Publish();
+    }
+    std::lock_guard<std::mutex> lock(gCopy.mutex);
+    gCopy.done = true;
+    gCopy.published.notify_all();
+    gCopy.flushed.notify_all();
+}
+
+/* Records the kernel could not queue, and records past the backlog cap, become one sequence gap each. */
+void NoteDrops(LinuxSession& session)
+{
+    uint64_t total = 0;
+    const int cpus = libbpf_num_possible_cpus();
+    if (cpus > 0) {
+        std::vector<uint64_t> values(static_cast<size_t>(cpus));
+        const uint32_t zero = 0;
+        if (bpf_map_lookup_elem(gBpf.drops, &zero, values.data()) == 0) {
+            for (uint64_t value : values) total += value;
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(gCopy.mutex);
+        total += gCopy.lost;
+    }
+    for (; gBpf.dropsSeen < total; gBpf.dropsSeen++) session.NoteDropped();
+}
+
+/* BpfFlush asked for the records still held to be written: once everything published by then is
+ * processed, write them (JoinFlush) here on the BPF thread, which owns that state. */
+void ServeFlush()
+{
+    {
+        std::lock_guard<std::mutex> lock(gCopy.mutex);
+        if (!gCopy.flushAsked || (gCopy.passes < gCopy.flushPass && !gCopy.done) || !gCopy.events.empty()) return;
+    }
+    PayloadPoll();
+    PktPoll();
+    JoinFlush();
+    std::lock_guard<std::mutex> lock(gCopy.mutex);
+    gCopy.flushAsked = false;
+    gCopy.flushDone = true;
+    gCopy.flushed.notify_all();
 }
 
 void BpfRun(LinuxSession& session)
 {
     gBpf.session = &session;
-    while (!session.Stopping()) {
-        ring_buffer__poll(gBpf.ring, 200);
-        /* Records the kernel could not queue become one sequence gap each. */
-        uint64_t total = 0;
-        const int cpus = libbpf_num_possible_cpus();
-        if (cpus > 0) {
-            std::vector<uint64_t> values(static_cast<size_t>(cpus));
-            const uint32_t zero = 0;
-            if (bpf_map_lookup_elem(gBpf.drops, &zero, values.data()) == 0) {
-                for (uint64_t value : values) total += value;
-            }
+    std::thread copier([&session] { CopyRun(session); });
+    for (;;) {
+        bool done = false;
+        {
+            std::unique_lock<std::mutex> lock(gCopy.mutex);
+            gCopy.published.wait_for(lock, std::chrono::milliseconds(200), [] {
+                return !gCopy.events.empty() || gCopy.done || (gCopy.flushAsked && gCopy.passes >= gCopy.flushPass);
+            });
+            done = gCopy.done;
         }
-        for (; gBpf.dropsSeen < total; gBpf.dropsSeen++) session.NoteDropped();
+        /* In slices, so packets, chunks and drops are taken up between them. */
+        std::deque<Raw> events = TakeQueued(gCopy.events, 8192);
+        for (Raw& record : events) OnRing(nullptr, record.data(), record.size());
+        PayloadPoll();
+        PktPoll();
+        NoteDrops(session);
+        ServeFlush();
+        if (done && events.empty()) {
+            std::lock_guard<std::mutex> lock(gCopy.mutex);
+            if (gCopy.events.empty()) break;
+        }
     }
-    ring_buffer__consume(gBpf.ring);
+    copier.join();
+    PayloadPoll();
+    PktPoll();
+    NoteDrops(session);
 }
 
 void BpfClose()
 {
+    PayloadClose();
+    JoinClose();
+    TcpClose();
+    PktClose();
+    WsClose();
     if (gBpf.ring != nullptr) ring_buffer__free(gBpf.ring);
     gBpf.ring = nullptr;
-    for (bpf_link* link : gBpf.links) bpf_link__destroy(link);
+    for (const auto& link : gBpf.links) bpf_link__destroy(link.second);
     gBpf.links.clear();
     if (gBpf.object != nullptr) bpf_object__close(gBpf.object);
     gBpf.object = nullptr;
@@ -675,5 +1306,30 @@ void BpfClear()
         key = next;
         bpf_map_delete_elem(gBpf.tracked, &key);
     }
+}
+
+/* Coverage notes of the upgrades (LinuxSession::Start writes them after ebpf_active). */
+std::vector<std::pair<std::wstring, std::wstring>> BpfNotes()
+{
+    Notes notes;
+    PeNotes(notes);
+    JoinNotes(notes);
+    TcpNotes(notes);
+    WsNotes(notes);
+    return notes;
+}
+
+/* Records an upgrade still holds, written before tracking stops (LinuxSession::StopTracking). */
+void BpfFlush()
+{
+    /* Main thread, before tracking stops: wait until the BPF thread has processed everything the kernel
+     * queued up to now (the backlog can be seconds deep after a burst) and written what it holds. */
+    std::unique_lock<std::mutex> lock(gCopy.mutex);
+    if (gCopy.done) return;
+    gCopy.flushPass = gCopy.passes + 2;
+    gCopy.flushDone = false;
+    gCopy.flushAsked = true;
+    gCopy.published.notify_all();
+    gCopy.flushed.wait_for(lock, std::chrono::minutes(2), [] { return gCopy.flushDone || gCopy.done; });
 }
 #endif

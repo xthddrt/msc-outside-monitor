@@ -78,10 +78,17 @@ def registry_key(key):
     return re.sub(r"ControlSet00\d", "CurrentControlSet", text, flags=re.I)
 
 
+# Linux: Wine's own PE and unix modules, the prefix's Windows directory and system libraries are never the
+# caller either (with PE frames a Wine stack reads ntdll.dll, kernelbase.dll, game.exe, ntdll.so, libc.so.6).
+SYSTEM_PATH = re.compile(r"^/(usr/)?lib(32|64)?/|/lib(32|64)?/wine/|/drive_c/windows/", re.I)
+
+
 def caller_module(event):
     """First non-Windows module on the event's stack, or a marker when there is none."""
-    names = [short_image(module) for module in event.get("modules") or []]
-    own = [name for name in names if name.lower() not in WINDOWS_MODULES]
+    modules = event.get("modules") or []
+    names = [short_image(module) for module in modules]
+    own = [name for module, name in zip(modules, names)
+           if name.lower() not in WINDOWS_MODULES and not SYSTEM_PATH.search(module)]
     if own:
         return own[0]
     if names:

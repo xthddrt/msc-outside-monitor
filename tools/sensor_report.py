@@ -77,7 +77,8 @@ def main():
         if kind == "event":
             type_id = item.get("type_id")
             attempted, dropped = counters(type_id)
-            if item["event_type"].startswith("etw_") and not manifest.get("config", {}).get("etw", True):
+            # Linux logs etw_tcp from its kernel sensors, so --no-etw does not silence it there.
+            if item["event_type"].startswith("etw_") and attempted == 0 and not manifest.get("config", {}).get("etw", True):
                 activity = "disabled"
             elif not supported:
                 activity = "unsupported" if not coverage else "not_instrumented"

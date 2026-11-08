@@ -12,7 +12,8 @@ EtwCollector::~EtwCollector()
 
 bool EtwCollector::Start(std::string& error)
 {
-    error = "ETW is a Windows facility; WMI, DNS, RPC, TCPIP and CodeIntegrity providers have no Linux source";
+    error = "ETW is a Windows facility; WMI, RPC and CodeIntegrity providers have no Linux source (DNS names and TCP"
+            " lifecycle come from linux.ebpf_net as etw_dns and etw_tcp records)";
     warnings_.push_back(L"etw_unavailable");
     return false;
 }

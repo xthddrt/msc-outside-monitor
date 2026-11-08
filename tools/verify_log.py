@@ -96,7 +96,7 @@ def verify(paths):
                         raise ValueError(f"{path}:{number}: inconsistent final-chunk marker")
                     if payload["final_chunk"] and offset + len(data) != total:
                         raise ValueError(f"{path}:{number}: final chunk does not complete the payload")
-                    if payload["kind"] not in {"registry_value", "volume_information"}:
+                    if payload["kind"] not in {"registry_value", "volume_information", "network_data"}:
                         raise ValueError(f"{path}:{number}: unsupported payload kind")
                     group = payloads.setdefault(operation, {"count": count, "chunks": {}})
                     if group["count"] != count:

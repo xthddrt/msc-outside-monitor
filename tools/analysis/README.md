@@ -20,7 +20,7 @@ Field meanings are in `docs/LOG_SCHEMA.md` and `schema/event-v1.json`. Conventio
 
 - Timestamps are UTC.
 - Paths are kernel device paths: `\Device\HarddiskVolume3\…` is `C:\…` on the original test host. `common.dos_path` converts them and replaces the user name.
-- `modules` is the requesting thread's call stack, innermost first; the first non-Windows module is the code that asked (`common.caller_module`). `stack_unresolved` counts user-mode frames in no loaded image.
+- `modules` is the requesting thread's call stack, innermost first; the first non-Windows module is the code that asked (`common.caller_module`, which on Linux also skips Wine's own modules, the prefix's `windows` directory and system libraries; Wine records list the PE frames before the unix ones). `stack_unresolved` counts user-mode frames in no loaded image.
 - `etw_tcp` events carry `event=<name>` in `detail`; see `network_timeline.py` for how to read who closed a connection.
 
 ## Scripts
@@ -43,6 +43,7 @@ The game sessions are large (hundreds of MB), so each script takes a minute or t
 
 Bundles contain the launcher login token (process command line), the Windows account SID and user
 name in paths, the local IP address, and captured registry values that include machine identifiers.
+Linux bundles also hold the client's socket bytes (`network_data` payloads: tokens, chat, MAC data).
 Make a redacted copy with `tools/redact_session.py` before handing a bundle to anyone else, or record
 with `--no-payloads`.
 

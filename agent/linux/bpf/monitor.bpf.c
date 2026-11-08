@@ -23,6 +23,13 @@ char LICENSE[] SEC("license") = "GPL";
 #define WALK_LEN 4096
 #define WALK_MASK (WALK_LEN - 1)
 #define WALK_DEPTH 64
+/* vmlinux.h has no macros; the upgrade headers use these too (do not redefine them there). */
+#define AF_INET 2
+#define AF_INET6 10
+#define AF_NETLINK 16
+#define S_IFMT 0170000
+#define S_IFSOCK 0140000
+#define TS_COMPAT 0x0002   /* arch/x86 thread_info.h: the task is in an ia32 (32-bit) syscall */
 
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
@@ -173,6 +180,8 @@ static __always_inline struct file* fd_file(struct task_struct* task, int fd)
     return file;
 }
 
+#include "payload.bpf.h"   /* sock_identity, capture_payload (payload upgrade) */
+
 /* The fd's file into kpath/mode/ino/pos. */
 static __always_inline void resolve_fd(struct mm_event* e, struct task_struct* task, int fd)
 {
@@ -181,6 +190,7 @@ static __always_inline void resolve_fd(struct mm_event* e, struct task_struct* t
     e->mode = BPF_CORE_READ(file, f_inode, i_mode);
     e->ino = BPF_CORE_READ(file, f_inode, i_ino);
     e->pos = BPF_CORE_READ(file, f_pos);
+    if ((e->mode & S_IFMT) == S_IFSOCK) sock_identity(e, file);
     int result = walk_path(__builtin_preserve_access_index(&file->f_path), e->kpath);
     if (result >= 0) e->flags |= MM_F_KPATH | (result ? MM_F_TRUNC_K : 0);
 }
@@ -265,6 +275,8 @@ static __always_inline struct mm_event* fresh_scratch(void)
     e->kpath[0] = 0;
     e->kdir_a[0] = 0;
     e->kdir_b[0] = 0;
+    e->pe.rip = 0;
+    e->pe.bytes = 0;
     return e;
 }
 
@@ -286,6 +298,39 @@ static __always_inline void read_sockaddr(struct mm_event* e, const void* pointe
     }
 }
 
+/* The peer of a sendmsg/recvmsg: msg_name and msg_namelen of the user msghdr. */
+static __always_inline void read_msg_name(struct mm_event* e, const void* msg)
+{
+    struct {
+        const void* name;
+        int length;
+    } header = {};
+    if (!msg || bpf_probe_read_user(&header, sizeof(header), msg) != 0 || header.length <= 0) return;
+    read_sockaddr(e, header.name, (__u32)header.length);
+}
+
+/* 1 when a kernel path is below the configured scope root. */
+static __always_inline int under_root(const struct mm_config* c, const char* kpath)
+{
+    __u32 rootLength = c->root_len;
+    if (rootLength == 0 || rootLength >= MM_PATH) return 0;
+    for (__u32 index = 0; index < MM_PATH; index++) {
+        if (index >= rootLength) break;
+        if (kpath[index] != c->root[index]) return 0;
+    }
+    return kpath[rootLength & (MM_PATH - 1)] == '/';
+}
+
+/* 1 when the exec'd program's basename starts with "wine" (wine, wine64, wine-preloader,
+ * wineserver). exec has already set comm to that basename; scanning the path for its last '/'
+ * instead blows the verifier's 1M-instruction budget. */
+static __always_inline int wine_image(void)
+{
+    char comm[16];
+    if (bpf_get_current_comm(comm, sizeof(comm))) return 0;
+    return comm[0] == 'w' && comm[1] == 'i' && comm[2] == 'n' && comm[3] == 'e';
+}
+
 static __always_inline void read_argv(struct mm_event* e, const char* const* argv)
 {
     e->flags |= MM_F_ARGV;
@@ -298,11 +343,22 @@ static __always_inline void read_argv(struct mm_event* e, const char* const* arg
     }
 }
 
+/* A 32-bit (ia32) syscall: its numbers and argument registers are not the x86_64 ones kSyscalls describes. */
+static __always_inline int compat_syscall(struct task_struct* task)
+{
+    return (task->thread_info.status & TS_COMPAT) != 0;
+}
+
+#include "pe.bpf.h"   /* read_pe (pecaller upgrade) */
+
 SEC("tp_btf/sys_enter")
 int BPF_PROG(mm_sys_enter, struct pt_regs* regs, long id)
 {
     if (!current_tracked()) return 0;
     if (id < 0 || id >= MM_SYSCALLS) return 0;
+    /* shortcut: ia32 syscalls (32-bit Wine processes: the Nexon launcher, grap-updater) are skipped, not
+     * decoded; add an ia32 table (numbers, args in bx/cx/dx/si/di/bp) if their syscalls are wanted. */
+    if (compat_syscall(bpf_get_current_task_btf())) return 0;
     __u32 nr = (__u32)id;
     struct mm_sysinfo* info = bpf_map_lookup_elem(&sysinfo, &nr);
     if (!info || !info->want) return 0;
@@ -325,6 +381,7 @@ int BPF_PROG(mm_sys_enter, struct pt_regs* regs, long id)
     if (info->fd) resolve_fd(e, task, (int)arg_at(e, info->fd));
     if (info->sock == MM_SOCK_IN_1) read_sockaddr(e, (const void*)e->args[1], (__u32)e->args[2]);
     else if (info->sock == MM_SOCK_IN_4) read_sockaddr(e, (const void*)e->args[4], (__u32)e->args[5]);
+    else if (info->sock == MM_SOCK_MSG_IN_1) read_msg_name(e, (const void*)e->args[1]);
     if (info->argv) read_argv(e, (const char* const*)arg_at(e, info->argv));
     __u32 tid = e->tid;
     bpf_map_update_elem(&pending, &tid, e, BPF_ANY);
@@ -361,14 +418,30 @@ int BPF_PROG(mm_sys_exit, struct pt_regs* regs, long ret)
         if (lengthPointer && bpf_probe_read_user(&length, sizeof(length), lengthPointer) == 0 && length > 0)
             read_sockaddr(p, address, (__u32)length);
     }
+    if (ret >= 0 && info->sock == MM_SOCK_MSG_OUT_1) read_msg_name(p, (const void*)p->args[1]);
+    /* Its chunks go to payload_ring before the record goes to events (the agent relies on it). */
+    capture_payload(p, info, ret);
     long bytes = bpf_get_stack(ctx, p->stack, sizeof(p->stack), BPF_F_USER_STACK);
     p->frames = bytes > 0 ? (__u32)(bytes / sizeof(__u64)) : 0;
-    struct mm_event* e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
-    if (!e) {
-        count_drop();
+    read_pe(&p->pe, task, regs);
+    /* A record without a PE context leaves out mm_event.pe (bpf.cpp OnRing). Verifier-safe: two
+     * reservations of constant size, each copied with that same constant. */
+    if (p->pe.rip) {
+        struct mm_event* e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+        if (!e) {
+            count_drop();
+        } else {
+            bpf_probe_read_kernel(e, sizeof(*e), p);
+            bpf_ringbuf_submit(e, 0);
+        }
     } else {
-        bpf_probe_read_kernel(e, sizeof(*e), p);
-        bpf_ringbuf_submit(e, 0);
+        void* e = bpf_ringbuf_reserve(&events, MM_EVENT_SHORT, 0);
+        if (!e) {
+            count_drop();
+        } else {
+            bpf_probe_read_kernel(e, MM_EVENT_SHORT, p);
+            bpf_ringbuf_submit(e, 0);
+        }
     }
     bpf_map_delete_elem(&pending, &tid);
     return 0;
@@ -462,10 +535,15 @@ int BPF_PROG(mm_exec, struct task_struct* task, pid_t old_pid, struct linux_binp
     struct mm_event* e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
     if (!e) {
         count_drop();
-        return 0;
+    } else {
+        bpf_probe_read_kernel(e, sizeof(*e), s);
+        bpf_ringbuf_submit(e, 0);
     }
-    bpf_probe_read_kernel(e, sizeof(*e), s);
-    bpf_ringbuf_submit(e, 0);
+    /* A native program (xdg-open, a browser) ends the trail: it and its children are not the
+     * client. The exec itself is recorded above; the agent forgets the process on MM_EXEC too. */
+    struct mm_config* c = cfg();
+    if (!wine_image() && !(c && (s->flags & MM_F_KPATH) && under_root(c, s->kpath)))
+        bpf_map_delete_elem(&tracked, &tgid);
     return 0;
 }
 
@@ -493,11 +571,7 @@ static __always_inline int scope_file(struct file* file)
     struct mm_event* s = fresh_scratch();
     if (!s) return 0;
     if (walk_path(__builtin_preserve_access_index(&file->f_path), s->kpath) < 0) return 0;
-    for (__u32 index = 0; index < MM_PATH; index++) {
-        if (index >= rootLength) break;
-        if (s->kpath[index] != c->root[index]) return 0;
-    }
-    if (s->kpath[rootLength & (MM_PATH - 1)] != '/') return 0;
+    if (!under_root(c, s->kpath)) return 0;
     struct task_struct* task = bpf_get_current_task_btf();
     struct mm_tracked entry = {};
     entry.start_ns = BPF_CORE_READ(task, group_leader, start_boottime);
@@ -577,3 +651,10 @@ int BPF_PROG(mm_perf, int type, int ret)
     if (!current_tracked()) return 0;
     return deny(MM_DENY_PERF, 0);
 }
+
+/* Upgrade programs, each in its own file (docs/LINUX.md "Kernel sensor upgrades"). Each group of
+ * programs is optional: bpf.cpp loads the object without a group the verifier refuses. */
+#include "socks.bpf.h"   /* mm_socks socket tags, mm_sock_* (shared by tcp and packets) */
+#include "tcp.bpf.h"     /* mm_tcp_* */
+#include "pkt.bpf.h"     /* mm_skb_* */
+#include "ws.bpf.h"      /* mm_ws_* */

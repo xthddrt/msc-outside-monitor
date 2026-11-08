@@ -13,6 +13,8 @@ sessions/
       notes.md
       events.jsonl
       events.jsonl.1
+      events.pcapng
+      events.pcapng.1
       summary.json
       coverage.json
       sensor-usage.json
@@ -21,6 +23,8 @@ sessions/
       checksums.json
       bundle.sha256
 ```
+
+`events.pcapng[.N]` (Linux, packet capture: docs/LINUX.md) holds the client's packets; each part is chained into the log by a `packet_capture_part` record with its SHA-256, first and last time, and listed in `checksums.json`. Parts rotate at the same size as the events parts but on their own byte count, so `events.pcapng.N` and `events.jsonl.N` are not paired. `redact_session.py` never copies it.
 
 `manifest.json` carries the labels, client/build fingerprints, configuration, sensitivity, parts, record count, and chain head. `checksums.json` carries per-part SHA-256 and the bundle hash. `bundle.sha256` is a convenience copy.
 
@@ -62,8 +66,11 @@ sessions/
 
 Bundles can contain registry values, hardware identifiers, paths, command lines, DNS names, and WMI query text. They are **not** uploaded automatically.
 
+Linux bundles recorded with payload capture (the default) also hold every byte the client sent and received on its network sockets: login tokens, passwords and chat sent without encryption, server addresses, and interface and MAC data from netlink replies. The agent marks them `sensitivity=secrets` (`session_meta.json`, copied into the manifest); treat them like credentials. With payloads on, records of wineserver `get_window_text` also carry window titles (`text=`: character names, chat or other windows of the prefix). `redact_session.py` drops the payloads, the DNS names and answers and the window titles, and marks the copy `sensitivity=metadata`.
+
 - Keep `sensitivity=payload` and `sensitivity=secrets` bundles in an access-controlled store.
-- `--no-payloads` produces `sensitivity=metadata`; prefer it for broad sharing.
+- `--no-payloads` produces `sensitivity=metadata` (on Linux it also stops socket byte capture); prefer it for broad sharing.
+- `events.pcapng[.N]` holds the client's packets with their full bytes (traffic in clear, credentials included): never share it; `--no-packets` or `--no-payloads` leaves it out.
 - Never record directly into a live-synced folder. Finalize locally, then copy the immutable zip.
 - Do not sync a writable catalog or a live event file between PCs.
 

@@ -169,7 +169,9 @@ def main():
 
     sensitivity = args.sensitivity
     if sensitivity is None:
-        sensitivity = "payload" if meta.get("config", {}).get("payload_mode") == "full" else "metadata"
+        # The Linux agent says "secrets" itself: its payloads are the client's socket bytes.
+        sensitivity = meta.get("sensitivity") or (
+            "payload" if meta.get("config", {}).get("payload_mode") == "full" else "metadata")
 
     coverage = directory / "coverage.json"
     if coverage.exists():

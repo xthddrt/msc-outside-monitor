@@ -505,6 +505,32 @@ int main()
                     "a size-information payload is not decoded as a volume identity");
     }
 
+    {
+        /* A Linux socket payload chunk (MsMonPayloadNetworkData) decodes and names its kind. */
+        std::vector<BYTE> record(sizeof(MSMON_EVENT_HEADER) + 8, 0);
+        MSMON_EVENT_HEADER header{};
+        header.Size = static_cast<unsigned long>(record.size());
+        header.Version = MSMON_PROTOCOL_VERSION;
+        header.Type = MsMonFileWrite;
+        header.Flags = MsMonFlagPayloadPresent | MsMonFlagPayloadPartial | MsMonFlagPayloadInput;
+        header.OperationId = 9;
+        header.PayloadTotalBytes = 9000;
+        header.PayloadChunkCount = 2;
+        header.PayloadKind = MsMonPayloadNetworkData;
+        header.PayloadOffset = sizeof(MSMON_EVENT_HEADER);
+        header.PayloadBytes = 8;
+        std::memcpy(record.data(), &header, sizeof(header));
+        std::memcpy(record.data() + sizeof(header), "msmon-ok", 8);
+        TelemetryEvent decoded;
+        DWORD consumed = 0;
+        std::string decodeError;
+        ok &= Check(DecodeDriverEvent(record.data(), static_cast<DWORD>(record.size()), decoded, consumed, decodeError) &&
+                        decoded.payload.size() == 8,
+                    "a network_data payload chunk decodes");
+        ok &= Check(TelemetryJson(decoded).find("\"kind\":\"network_data\"") != std::string::npos,
+                    "a network_data payload names its kind");
+    }
+
     JsonlWriter writer(L"build/tests/integration-events.jsonl", 0);
     ok &= Check(writer.Open(), "open JSONL output");
     ok &= Check(writer.Write(TelemetryJson(firstDecision)), "write first KFilter JSON");
