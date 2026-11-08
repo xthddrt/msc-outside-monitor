@@ -11,7 +11,8 @@ flags=(-std=c++17 -O2 -Wall -Wextra -pthread)
 shared=(agent/telemetry.cpp agent/classify.cpp agent/integrations.cpp agent/rpc_names.cpp agent/etw.cpp
         agent/linux/etw_stub.cpp agent/linux/platform.cpp)
 sensors=(agent/linux/session.cpp agent/linux/fanotify.cpp agent/linux/proc_connector.cpp
-         agent/linux/images.cpp agent/linux/net.cpp agent/linux/bpf.cpp)
+         agent/linux/images.cpp agent/linux/net.cpp agent/linux/bpf.cpp
+         agent/linux/pe.cpp agent/linux/dns.cpp agent/linux/packets.cpp agent/linux/wineserver.cpp)
 
 # eBPF preflight: clang (CLANG=), bpftool (BPFTOOL=), libbpf headers (LIBBPF_INCLUDE=) and the
 # running kernel's BTF. Without them the agent is built without its kernel sensors and falls back
@@ -47,6 +48,33 @@ fi
 python3 tools/check_sensor_map.py
 
 "$out/integration_regression"
+# Kernel-sensor upgrade checks: each upgrade adds its lines between its own two markers only.
+# >>> pecaller
+"$cxx" "${flags[@]}" -o "$out/linux_pe_test" tests/linux_pe_test.cpp agent/linux/pe.cpp && "$out/linux_pe_test"
+# <<< pecaller
+# >>> payload
+"$cxx" "${flags[@]}" -DMSMON_DNS_SELF_TEST -o build/tests/dns_self_test agent/linux/dns.cpp
+build/tests/dns_self_test
+# <<< payload
+# >>> netattr
+# Two commands, not "a && b": under set -e a failed compile inside && would not stop the build.
+"$cxx" "${flags[@]}" -o build/tests/socket_join_test tests/socket_join_test.cpp
+build/tests/socket_join_test
+# <<< netattr
+# >>> tcp
+# <<< tcp
+# >>> packets
+"$cxx" "${flags[@]}" -o "$out/linux_packets_test" tests/linux_packets_test.cpp agent/linux/packets.cpp "${shared[@]}"
+# <<< packets
+# >>> wineserver
+"$cxx" "${flags[@]}" -o "$out/wineserver_test" tests/wineserver_test.cpp agent/linux/wineserver.cpp "${shared[@]}"
+"$out/wineserver_test"
+# The fake Wine clients tests/ebpf_checks/wineserver.sh runs as root (freestanding: no 32-bit libc needed).
+fake=(-O2 -Wall -static -nostdlib -ffreestanding -fno-stack-protector -fno-pie -no-pie)
+"${CC:-gcc}" "${fake[@]}" -o "$out/ws_fake_client" tests/fixtures/ws_fake_client.c
+"${CC:-gcc}" -m32 "${fake[@]}" -o "$out/ws_fake_client32" tests/fixtures/ws_fake_client.c 2>/dev/null ||
+    { rm -f "$out/ws_fake_client32"; echo "ws_fake_client32: not built (gcc -m32 failed); the root test skips the ia32 client"; }
+# <<< wineserver
 python3 tools/analysis/identity_log.py --self-test
 for test in tests/*_test.py; do python3 "$test"; done
 

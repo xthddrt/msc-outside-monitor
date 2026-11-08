@@ -522,6 +522,7 @@ static const char* PayloadKindName(ULONG kind)
     switch (kind) {
     case MsMonPayloadRegistryValue: return "registry_value";
     case MsMonPayloadVolumeInformation: return "volume_information";
+    case MsMonPayloadNetworkData: return "network_data";
     default: return "unknown";
     }
 }
@@ -706,7 +707,8 @@ bool DecodeDriverEvent(const BYTE* data, DWORD available, TelemetryEvent& event,
     }
     if ((header.Flags & MsMonFlagPayloadPresent) != 0) {
         if ((header.Flags & MsMonFlagPayloadUnavailable) != 0 || header.OperationId == 0 ||
-            (header.PayloadKind != MsMonPayloadRegistryValue && header.PayloadKind != MsMonPayloadVolumeInformation) ||
+            (header.PayloadKind != MsMonPayloadRegistryValue && header.PayloadKind != MsMonPayloadVolumeInformation &&
+             header.PayloadKind != MsMonPayloadNetworkData) ||
             header.PayloadChunkCount == 0 || header.PayloadChunkIndex >= header.PayloadChunkCount ||
             header.PayloadBytes > MSMON_PAYLOAD_CHUNK_BYTES ||
             header.PayloadByteOffset > header.PayloadTotalBytes ||

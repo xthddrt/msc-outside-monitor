@@ -5,6 +5,12 @@
 
 /* Longest string kept per field; bounds a record below MSMON_MAX_EVENT_RECORD_BYTES. */
 static const size_t MAX_STRING_CHARS = 1024;
+/* A record that also carries a payload chunk keeps shorter strings, so it still fits. */
+static const size_t MAX_PAYLOAD_STRING_CHARS = 768;
+static_assert(sizeof(MSMON_EVENT_HEADER) + 2 * (MAX_PAYLOAD_STRING_CHARS * sizeof(wchar_t) + 7) +
+                      MSMON_MAX_STACK_FRAMES * sizeof(uint64_t) + MSMON_PAYLOAD_CHUNK_BYTES + 7 <=
+                  MSMON_MAX_EVENT_RECORD_BYTES,
+              "a payload record must fit MSMON_MAX_EVENT_RECORD_BYTES");
 static const unsigned NO_SENSOR = MSMON_SENSOR_SLOTS;
 static bool gUseEbpf = true;
 
@@ -43,6 +49,7 @@ bool LinuxSession::Start(const MSMON_SESSION_CONFIG& config)
     queuedBytes_ = 0;
     sequence_ = 0;
     dropped_ = 0;
+    operations_ = 0;
     coverage_ = {};
     tracked_.clear();
     notes_.clear();
@@ -67,14 +74,18 @@ bool LinuxSession::Start(const MSMON_SESSION_CONFIG& config)
     std::wstring detail;
     unsigned ebpf = 0;
     int error = ENOTSUP;
+    const unsigned wineserverBit = 1u << (MSMON_SENSOR_LINUX_EBPF_WINESERVER - MSMON_SENSOR_LINUX_EBPF_PROCESS);
     if (gUseEbpf) {
-        error = BpfOpen(detail, roots_.empty() ? std::wstring() : roots_.front(), ebpf);
+        error = BpfOpen(detail, roots_.empty() ? std::wstring() : roots_.front(), config.PayloadMode != 0, ebpf);
         for (unsigned index = 0; index < 6; index++) {
             const bool attached = error == 0 && (ebpf & (1u << index)) != 0;
             Registered(MSMON_SENSOR_REG_LINUX_EBPF_PROCESS + index, attached ? 0 : (error != 0 ? error : EOPNOTSUPP));
         }
+        Registered(MSMON_SENSOR_REG_LINUX_EBPF_WINESERVER,
+                   error == 0 && (ebpf & wineserverBit) != 0 ? 0 : (error != 0 ? error : EOPNOTSUPP));
         if (error == 0) {
             notes_.push_back({L"ebpf_active", detail});
+            for (const auto& note : BpfNotes()) notes_.push_back(note);
         } else {
             notes_.push_back({L"bpf_unavailable", L"errno=" + ErrnoName(error) + L";" + detail +
                               L";the fanotify, proc connector and polling sensors are used instead"});
@@ -127,9 +138,13 @@ bool LinuxSession::Start(const MSMON_SESSION_CONFIG& config)
     } else {
         notes_.push_back({L"net_poll_superseded", L"socket records come from linux.ebpf_net and linux.ebpf_ipc"});
     }
-    notes_.push_back({L"registry_unavailable",
-                      L"Wine keeps its registry in wineserver: no key-level registry_* events; the prefix's *.reg files"
-                      L" are recorded as file events and snapshotted when written"});
+    if (!ebpf_ || (ebpf & wineserverBit) == 0) {
+        notes_.push_back({L"registry_unavailable",
+                          L"Wine keeps its registry in wineserver: no key-level registry_* events; the prefix's *.reg files"
+                          L" are recorded as file events and snapshotted when written"});
+    }
+    const auto packets = PacketsNote();
+    if (!packets.first.empty()) notes_.push_back(packets);
     notes_.push_back({L"blackcat_not_applicable",
                       L"BlackCat is a Windows kernel driver: no device discovery, kernel-module attribution or"
                       L" BlackCat-initiated tracking"});
@@ -210,6 +225,8 @@ bool LinuxSession::Track(DWORD pid, uint64_t expectedStart, ULONG flags)
 
 void LinuxSession::StopTracking()
 {
+    /* Before tracking_ is cleared: Write drops records after that. */
+    if (ebpf_) BpfFlush();
     std::lock_guard<std::mutex> lock(mutex_);
     tracking_ = false;
     tracked_.clear();
@@ -309,11 +326,11 @@ bool LinuxSession::UnderRoot(const std::wstring& path) const
     return false;
 }
 
-static void AppendString(std::vector<BYTE>& record, const std::wstring& value,
+static void AppendString(std::vector<BYTE>& record, const std::wstring& value, size_t limit,
                          unsigned short& offset, unsigned short& bytes, bool& truncated)
 {
     if (value.empty()) return;
-    const size_t characters = std::min(value.size(), MAX_STRING_CHARS);
+    const size_t characters = std::min(value.size(), limit);
     truncated = characters < value.size();
     offset = static_cast<unsigned short>(record.size());
     bytes = static_cast<unsigned short>(characters * sizeof(wchar_t));
@@ -338,7 +355,24 @@ void LinuxSession::Log(unsigned sensor, ULONG type, DWORD pid, uint64_t start, U
     Write(record);
 }
 
-void LinuxSession::Write(const LinuxRecord& input)
+bool LinuxSession::WritePayloadSeries(LinuxRecord record, ULONG kind, uint64_t total, const std::vector<BYTE>& data)
+{
+    if (record.operation == 0) record.operation = NextOperation();
+    const uint64_t count = total == 0 ? 1 : (total + MSMON_PAYLOAD_CHUNK_BYTES - 1) / MSMON_PAYLOAD_CHUNK_BYTES;
+    MSMON_PAYLOAD chunk{record.operation, total, 0, 0, static_cast<unsigned long>(count), kind, nullptr, 0};
+    record.payload = &chunk;
+    if (data.empty()) return Write(record);
+    for (size_t offset = 0; offset < data.size(); offset += MSMON_PAYLOAD_CHUNK_BYTES) {
+        chunk.ByteOffset = offset;
+        chunk.ChunkIndex = static_cast<unsigned long>(offset / MSMON_PAYLOAD_CHUNK_BYTES);
+        chunk.Data = data.data() + offset;
+        chunk.ByteCount = static_cast<unsigned long>(std::min<size_t>(data.size() - offset, MSMON_PAYLOAD_CHUNK_BYTES));
+        if (!Write(record)) return false;
+    }
+    return true;
+}
+
+bool LinuxSession::Write(const LinuxRecord& input)
 {
     MSMON_EVENT_HEADER header{};
     header.Version = MSMON_PROTOCOL_VERSION;
@@ -351,15 +385,20 @@ void LinuxSession::Write(const LinuxRecord& input)
     header.TargetProcessId = input.target;
     header.ProcessStartTime = input.start;
     header.Status = input.status;
+    header.DesiredAccess = input.desiredAccess;
+    header.TargetProcessStartTime = input.targetStart;
     header.Category = MsMonCategoryUnknown;
-    header.Attribution = MsMonAttributionProcessOnly;
+    header.Attribution = (input.flags & MsMonFlagServiceCorrelated) != 0 ? MsMonAttributionServiceCorrelated
+                                                                         : MsMonAttributionProcessOnly;
     header.Value0 = input.value0;
     header.Value1 = input.value1;
+    header.OperationId = input.operation;
     std::vector<BYTE> record(sizeof(header));
     bool textTruncated = false;
     bool detailTruncated = false;
-    AppendString(record, input.text, header.TextOffset, header.TextBytes, textTruncated);
-    AppendString(record, input.detail, header.DetailOffset, header.DetailBytes, detailTruncated);
+    const size_t limit = input.payload != nullptr ? MAX_PAYLOAD_STRING_CHARS : MAX_STRING_CHARS;
+    AppendString(record, input.text, limit, header.TextOffset, header.TextBytes, textTruncated);
+    AppendString(record, input.detail, limit, header.DetailOffset, header.DetailBytes, detailTruncated);
     if (textTruncated) header.Flags |= MsMonFlagTruncatedPath;
     if (!input.stack.empty()) {
         record.resize((record.size() + 7) & ~size_t(7));
@@ -368,6 +407,26 @@ void LinuxSession::Write(const LinuxRecord& input)
         header.StackFrames = static_cast<unsigned short>(frames);
         const BYTE* data = reinterpret_cast<const BYTE*>(input.stack.data());
         record.insert(record.end(), data, data + frames * sizeof(uint64_t));
+    }
+    if (input.payload != nullptr) {
+        /* As MsMonLogEventInternal fills a payload chunk. */
+        const MSMON_PAYLOAD& chunk = *input.payload;
+        header.Flags |= MsMonFlagPayloadPresent;
+        if (chunk.ChunkIndex + 1 == chunk.ChunkCount) header.Flags |= MsMonFlagPayloadFinalChunk;
+        if (chunk.ByteOffset + chunk.ByteCount < chunk.TotalBytes) header.Flags |= MsMonFlagPayloadPartial;
+        header.OperationId = chunk.OperationId;
+        header.PayloadTotalBytes = chunk.TotalBytes;
+        header.PayloadByteOffset = chunk.ByteOffset;
+        header.PayloadChunkIndex = chunk.ChunkIndex;
+        header.PayloadChunkCount = chunk.ChunkCount;
+        header.PayloadKind = chunk.Kind;
+        header.PayloadBytes = chunk.ByteCount;
+        if (chunk.ByteCount != 0) {
+            record.resize((record.size() + 7) & ~size_t(7));
+            header.PayloadOffset = static_cast<unsigned long>(record.size());
+            const BYTE* data = static_cast<const BYTE*>(chunk.Data);
+            record.insert(record.end(), data, data + chunk.ByteCount);
+        }
     }
     /* Keep every record 8-byte aligned so the next header and its strings stay aligned. */
     record.resize((record.size() + 7) & ~size_t(7));
@@ -378,7 +437,7 @@ void LinuxSession::Write(const LinuxRecord& input)
     std::lock_guard<std::mutex> lock(mutex_);
     /* After StopTracking nothing is tracked, as in the driver; this also drops records a sensor
      * computed just before (a socket poll would otherwise report every flow closed). */
-    if (!running_ || !tracking_) return;
+    if (!running_ || !tracking_) return false;
     header.SessionId = sessionId_;
     header.Sequence = ++sequence_;
     if (type < MSMON_EVENT_SLOTS) coverage_.EventAttempted[type]++;
@@ -386,13 +445,17 @@ void LinuxSession::Write(const LinuxRecord& input)
         dropped_++;
         coverage_.QueueDrops++;
         if (type < MSMON_EVENT_SLOTS) coverage_.EventDropped[type]++;
-        return;
+        return false;
     }
     std::memcpy(record.data(), &header, sizeof(header));
     queuedBytes_ += record.size();
     queue_.push_back(std::move(record));
     if (sensor < MSMON_SENSOR_SLOTS) coverage_.SensorLogged[sensor]++;
+    if (input.payload != nullptr && input.payload->Kind < std::size(coverage_.PayloadCaptured)) {
+        coverage_.PayloadCaptured[input.payload->Kind]++;
+    }
     data_.notify_one();
+    return true;
 }
 
 void LinuxSession::Enter(unsigned sensor)

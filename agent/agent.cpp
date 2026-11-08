@@ -370,11 +370,12 @@ static std::string BuildCoverageJson(
 static std::string BuildSessionMeta(
     const SessionLabels& labels, const SessionBinaryInfo& binaries,
     const std::wstring& clientRoot, const std::wstring& scopeRoot,
-    bool payload, bool etw, uint64_t queueRecords, uint64_t queueBytes,
+    bool payload, bool secrets, bool etw, uint64_t queueRecords, uint64_t queueBytes,
     const std::wstring& outcome, const std::wstring& ended,
     uint64_t events, uint64_t dropped, uint64_t driverGaps, uint64_t etwGaps,
     uint64_t records, uint64_t bytes, unsigned parts)
 {
+    (void)secrets;   /* Linux only */
     std::ostringstream json;
     json << "{\"schema_version\":1"
          << ",\"session_uuid\":\"" << WideToUtf8(labels.uuid) << "\""
@@ -402,6 +403,11 @@ static std::string BuildSessionMeta(
          << ",\"etw\":" << (etw ? "true" : "false")
          << ",\"queue_records\":" << queueRecords
          << ",\"queue_bytes\":" << queueBytes << "}"
+#ifndef _WIN32
+         /* The Linux log holds the client's socket bytes (tokens, chat, netlink MAC data) once the eBPF
+          * net sensor or the wineserver decoder runs with payloads: docs/STORAGE.md. */
+         << ",\"sensitivity\":\"" << (secrets ? "secrets" : payload ? "payload" : "metadata") << "\""
+#endif
          << ",\"events\":" << events
          << ",\"driver_dropped_events\":" << dropped
          << ",\"driver_sequence_gaps\":" << driverGaps
@@ -973,7 +979,10 @@ static std::filesystem::path ClientExecutable(const std::wstring& scopeRoot)
     std::filesystem::path executable = std::filesystem::path(scopeRoot) / L"MapleStory.exe";
     return std::filesystem::exists(executable, error) ? executable : std::filesystem::path();
 #else
-    /* Any client: the first (by name) executable regular file directly under the scope root. */
+    /* MapleStory.exe when present (else e.g. CrashReportClient.exe sorts first); otherwise any
+       client: the first (by name) executable regular file directly under the scope root. */
+    std::filesystem::path maple = std::filesystem::path(scopeRoot) / L"MapleStory.exe";
+    if (std::filesystem::is_regular_file(maple, error)) return maple;
     std::vector<std::filesystem::path> found;
     for (const auto& entry : std::filesystem::directory_iterator(scopeRoot, error)) {
         if (entry.is_regular_file(error) && access(entry.path().c_str(), X_OK) == 0) found.push_back(entry.path());
@@ -1001,14 +1010,15 @@ static void Usage()
                  "[--wait-ms N] [--max-file-mb N] [--queue-records N] [--queue-mb N] "
                  "[--stop-file FILE] [--extra-root DIRECTORY]... [--no-etw] [--no-payloads] [--once]"
 #ifndef _WIN32
-                 " [--prefix WINEPREFIX] [--no-ebpf]"
+                 " [--prefix WINEPREFIX] [--no-ebpf] [--no-packets]"
 #endif
                  "\n"
                  "Without --extra-root, %ProgramData%\\Nexon\\NGS is added when it exists.\n"
 #ifndef _WIN32
                  "--prefix defaults to the nearest folder above --client that holds system.reg; every process\n"
                  "running with that WINEPREFIX is in scope. --no-ebpf uses fanotify, the proc connector and\n"
-                 "/proc polling instead of the kernel (eBPF) sensors.\n"
+                 "/proc polling instead of the kernel (eBPF) sensors. --no-packets writes no pcapng; --no-payloads\n"
+                 "also turns off socket byte and packet capture.\n"
 #endif
                  ;
 }
@@ -1053,6 +1063,7 @@ int wmain(int argc, wchar_t** argv)
 #ifndef _WIN32
     bool clientSet = false;
     bool useEbpf = true;
+    bool capturePackets = true;
     std::wstring prefixArg;
 #endif
 
@@ -1071,6 +1082,8 @@ int wmain(int argc, wchar_t** argv)
 #ifndef _WIN32
         } else if (argument == L"--no-ebpf") {
             useEbpf = false;
+        } else if (argument == L"--no-packets") {
+            capturePackets = false;
         } else if (index + 1 < argc && argument == L"--prefix") {
             prefixArg = argv[++index];
 #endif
@@ -1224,6 +1237,22 @@ int wmain(int argc, wchar_t** argv)
         return 1;
     }
 
+    std::wstring winePrefix;
+#ifndef _WIN32
+    if (!prefixArg.empty()) {
+        winePrefix = FullPath(prefixArg);
+    } else {
+        /* The Wine prefix is the nearest folder above the client that holds system.reg. */
+        for (std::filesystem::path folder = clientRoot; !folder.empty() && folder != folder.root_path();
+             folder = folder.parent_path()) {
+            if (std::filesystem::exists(folder / L"system.reg", fsError)) {
+                winePrefix = folder.wstring();
+                break;
+            }
+        }
+    }
+#endif
+
     /*
      * The NGS security service runs from %ProgramData%\Nexon\NGS and is
      * started by the service control manager, not by the client, so it is
@@ -1232,10 +1261,16 @@ int wmain(int argc, wchar_t** argv)
     std::vector<std::wstring> extraRoots;
     std::error_code extraRootError;
     if (extraRootArgs.empty()) {
+        std::filesystem::path programDataPath;
         wchar_t programData[MAX_PATH];
         DWORD programDataLength = GetEnvironmentVariableW(L"ProgramData", programData, MAX_PATH);
-        if (programDataLength != 0 && programDataLength < MAX_PATH) {
-            std::filesystem::path ngs = std::filesystem::path(programData) / L"Nexon" / L"NGS";
+        if (programDataLength != 0 && programDataLength < MAX_PATH) programDataPath = programData;
+#ifndef _WIN32
+        /* Under Wine, %ProgramData% is the prefix's drive_c/ProgramData. */
+        if (!winePrefix.empty()) programDataPath = std::filesystem::path(winePrefix) / L"drive_c" / L"ProgramData";
+#endif
+        if (!programDataPath.empty()) {
+            std::filesystem::path ngs = programDataPath / L"Nexon" / L"NGS";
             if (std::filesystem::is_directory(ngs, extraRootError)) extraRoots.push_back(ngs.wstring());
         }
     } else {
@@ -1261,20 +1296,7 @@ int wmain(int argc, wchar_t** argv)
     }
     std::vector<std::wstring> scopeRoots{scopeRoot};
     scopeRoots.insert(scopeRoots.end(), extraRoots.begin(), extraRoots.end());
-    std::wstring winePrefix;
 #ifndef _WIN32
-    if (!prefixArg.empty()) {
-        winePrefix = FullPath(prefixArg);
-    } else {
-        /* The Wine prefix is the nearest folder above the client that holds system.reg. */
-        for (std::filesystem::path folder = clientRoot; !folder.empty() && folder != folder.root_path();
-             folder = folder.parent_path()) {
-            if (std::filesystem::exists(folder / L"system.reg", fsError)) {
-                winePrefix = folder.wstring();
-                break;
-            }
-        }
-    }
     LinuxSessionUseEbpf(useEbpf);
 #endif
 #ifdef _WIN32
@@ -1354,9 +1376,11 @@ int wmain(int argc, wchar_t** argv)
         binaries.clientHash = Sha256File(clientExe.wstring());
     }
 
+    /* Until the sensors report (and if the agent dies first): assume the socket bytes are in the log. */
+    bool payloadSecrets = capturePayloads;
     if (!sessionDir.empty()) {
         WriteTextFile(sessionDir / L"session_meta.json",
-                      BuildSessionMeta(labels, binaries, clientRoot, scopeRoot, capturePayloads,
+                      BuildSessionMeta(labels, binaries, clientRoot, scopeRoot, capturePayloads, payloadSecrets,
                                        enableEtw, queueRecords, queueBytes, L"in_progress", L"",
                                        0, 0, 0, 0, 0, 0, 0));
     }
@@ -1375,6 +1399,13 @@ int wmain(int argc, wchar_t** argv)
         wcscpy_s(config.ExtraRoots[rootIndex], MSMON_CLIENT_PATH_CHARS, extraNt[rootIndex].c_str());
     }
 
+#ifndef _WIN32
+    /* The client's packets (pcapng) beside the events file: events.pcapng in a bundle. */
+    PacketsConfigure(capturePayloads && capturePackets
+                         ? std::filesystem::path(output).replace_extension(L".pcapng").wstring()
+                         : std::wstring(),
+                     maxFileBytes);
+#endif
     DeviceSession device;
     if (!device.Open()) {
         std::cerr << "Cannot open " MSMON_USER_DEVICE_PATH ": Win32 error " << GetLastError()
@@ -1404,7 +1435,7 @@ int wmain(int argc, wchar_t** argv)
             std::cerr << "Could not track explicit PID " << pid << ".\n";
         }
     }
-    std::cout << "Registered " << registered << " client/helper/descendant processes.\n";
+    std::cout << "Registered " << registered << " client/helper/descendant processes." << std::endl;   // tests wait for this line in a redirected log
     const unsigned initiallyTracked = registered;
     if (registered == 0) {
         std::cout << "No client process is running yet; waiting for a tracked image to start.\n";
@@ -1446,6 +1477,15 @@ int wmain(int argc, wchar_t** argv)
         event.outsideClient = false;
         return writer.Write(TelemetryJson(event));
     };
+#ifndef _WIN32
+    /* Packet capture parts closed so far (packet_capture_part) and, at the end, its totals. */
+    auto drainPackets = [&](bool final) {
+        for (const auto& note : PacketsTakeNotes(final)) {
+            if (!writeCoverage(note.first, note.second)) return false;
+        }
+        return true;
+    };
+#endif
 
     if (!writeCoverage(L"session_start", L"client_root=" + clientRoot + L";scope_root=" + scopeRoot +
                                           L";extra_roots=" + JoinRoots(extraRoots))) return 1;
@@ -1501,6 +1541,7 @@ int wmain(int argc, wchar_t** argv)
             for (unsigned index = 0; index < std::size(ebpfNames); index++) {
                 if (registrationSucceeded(MSMON_SENSOR_REG_LINUX_EBPF_PROCESS + index)) appendCallback(ebpfNames[index]);
             }
+            if (registrationSucceeded(MSMON_SENSOR_REG_LINUX_EBPF_WINESERVER)) appendCallback(L"ebpf_wineserver");
             fileRegistered = registrationSucceeded(MSMON_SENSOR_REG_FILTER_REGISTER) &&
                              registrationSucceeded(MSMON_SENSOR_REG_FILTER_START);
             if (fileRegistered) {
@@ -1528,7 +1569,8 @@ int wmain(int argc, wchar_t** argv)
             callbacks = L"unknown";
         }
         const wchar_t* fileState = !startCoverageSupported ? L"unknown" : (fileRegistered ? L"true" : L"false");
-        const wchar_t* registryState = !startCoverageSupported ? L"unknown" : (registryRegistered ? L"true" : L"false");
+        const bool registryNames = registryRegistered || registrationSucceeded(MSMON_SENSOR_REG_LINUX_EBPF_WINESERVER);
+        const wchar_t* registryState = !startCoverageSupported ? L"unknown" : (registryNames ? L"true" : L"false");
         std::wstring manifest = L"scope_root=" + scopeRoot +
                                 L";extra_roots=" + JoinRoots(extraRoots) +
                                 L";inside_root=" + clientRoot +
@@ -1551,20 +1593,49 @@ int wmain(int argc, wchar_t** argv)
         if (!writeCoverage(L"coverage_manifest", manifest)) return 1;
     }
 #ifndef _WIN32
-    if (!writeCoverage(L"payload_unavailable",
-                       L"Linux has no registry values or volume-information queries to capture; hardware identity is"
-                       L" seen as file events on /sys/class/dmi/id/*, /proc/cpuinfo and /sys/block/*/serial; file and"
-                       L" network contents are not captured")) return 1;
-    const bool ebpfFile = startCoverageSupported &&
-                          (startCoverage.RegistrationOk & (1ull << MSMON_SENSOR_REG_LINUX_EBPF_FILE)) != 0;
+    auto registeredOk = [&](unsigned slot) {
+        return startCoverageSupported && (startCoverage.RegistrationOk & (1ull << slot)) != 0;
+    };
+    const bool ebpfFile = registeredOk(MSMON_SENSOR_REG_LINUX_EBPF_FILE);
+    const bool ebpfNet = registeredOk(MSMON_SENSOR_REG_LINUX_EBPF_NET);
+    const bool wineserverDecoded = registeredOk(MSMON_SENSOR_REG_LINUX_EBPF_WINESERVER);
+    payloadSecrets = capturePayloads && (ebpfNet || wineserverDecoded);
+    const std::wstring hardware = L"hardware identity is seen as file events on /sys/class/dmi/id/*, /proc/cpuinfo and"
+                                  L" /sys/block/*/serial";
+    if (!capturePayloads) {
+        if (!writeCoverage(L"payload_capture_disabled",
+                           L"Metadata-only mode (--no-payloads): no socket bytes, DNS names, packets (pcapng), registry"
+                           L" values or volume information are captured")) return 1;
+    } else if (!ebpfNet && !wineserverDecoded) {
+        if (!writeCoverage(L"payload_unavailable",
+                           L"The kernel (eBPF) sensors are not running: socket bytes, DNS names, packets, registry values"
+                           L" and volume information are not captured; " + hardware +
+                           L"; file contents are not captured")) return 1;
+    } else if (!writeCoverage(L"payload_capture_enabled",
+                              std::wstring(L"Logs contain secrets: ") +
+                                  (ebpfNet ? L"the bytes tracked processes send and receive on INET/INET6/netlink"
+                                             L" sockets (network_data payloads on their I/O records, up to 1 MiB per"
+                                             L" call; TLS and game-encrypted traffic stays ciphertext), DNS names"
+                                             L" (etw_dns) and their packets (pcapng, see packet_capture_*)"
+                                           : L"") +
+                                  (ebpfNet && wineserverDecoded ? L"; " : L"") +
+                                  (wineserverDecoded ? L"registry values and volume information decoded from wineserver"
+                                                       L" requests (the first 8 KiB of each)"
+                                                     : L"") +
+                                  L"; not captured: file contents, AF_UNIX and pipe bytes, sendfile/splice/io_uring"
+                                  L" I/O, the ICMP echo of the client's IcmpSendEcho pings (Wine sends it from"
+                                  L" winedevice.exe, outside the tracked tree); " + hardware)) return 1;
     if (ebpfFile) {
         if (!writeCoverage(L"coverage_limit",
-                           L"eBPF records cover the recorded syscalls of tracked processes (argument values, result,"
-                           L" duration, kernel-resolved paths, 8 user frames) but not file or network contents, work"
-                           L" done inside the kernel, page faults on existing mappings or io_uring worker I/O;"
-                           L" registry is file-level (Wine *.reg files); paths over 255 bytes are truncated;"
-                           L" pre-start activity and records lost when the ring is full (sequence gaps) are not"
-                           L" guaranteed")) return 1;
+                           std::wstring(L"eBPF records cover the recorded syscalls of tracked processes (argument values,"
+                                        L" result, duration, kernel-resolved paths, 8 user frames, and PE frames on x64"
+                                        L" Wine threads) but not file contents, work done inside the kernel, page faults"
+                                        L" on existing mappings, io_uring worker I/O or the syscalls of 32-bit (ia32)"
+                                        L" processes; ") +
+                               (wineserverDecoded ? L"registry comes from wineserver requests (wineserver_requests); "
+                                                  : L"registry is file-level (Wine *.reg files); ") +
+                               L"paths over 255 bytes are truncated; pre-start activity and records lost when a ring is"
+                               L" full (sequence gaps) are not guaranteed")) return 1;
     } else if (!writeCoverage(L"coverage_limit",
                        L"fanotify file events carry no byte counts, offsets, open flags or status; sockets are polled"
                        L" from /proc/net once a second (shorter-lived sockets are missed, already-open ones are reported"
@@ -1574,6 +1645,9 @@ int wmain(int argc, wchar_t** argv)
     for (const auto& note : device.Notes()) {
         if (!writeCoverage(note.first, note.second)) return 1;
     }
+    if ((!capturePayloads || !capturePackets) &&
+        !writeCoverage(L"packet_capture_disabled", capturePayloads ? L"--no-packets" : L"--no-payloads (metadata-only mode)"))
+        return 1;
 #else
     if (!writeCoverage(capturePayloads ? L"payload_capture_enabled" : L"payload_capture_disabled",
                        capturePayloads ?
@@ -1701,7 +1775,8 @@ int wmain(int argc, wchar_t** argv)
             DWORD length = GetEnvironmentVariableW(variable, value, MAX_PATH);
             if (length != 0 && length < MAX_PATH) snapshotRoots.push_back((std::filesystem::path(value) / L"Nexon").wstring());
         }
-        /* The Wine prefix: its *.reg files are the registry wineserver saves (file-level). */
+        /* The Wine prefix (it holds drive_c, so AppData\Nexon too); its *.reg files are the
+         * registry wineserver saves (file-level). */
         if (!winePrefix.empty()) snapshotRoots.push_back(winePrefix);
         snapshotter = std::make_unique<FileSnapshotter>(sessionDir, snapshotRoots);
         if (!writeCoverage(L"file_snapshots", L"roots=" + JoinRoots(snapshotRoots) +
@@ -1837,6 +1912,12 @@ int wmain(int argc, wchar_t** argv)
             result = 1;
             break;
         }
+#ifndef _WIN32
+        if (!drainPackets(false)) {
+            result = 1;
+            break;
+        }
+#endif
         if (result != 0 || !drainKfilter() || !drainEtw()) {
             result = 1;
             break;
@@ -1931,6 +2012,9 @@ int wmain(int argc, wchar_t** argv)
     }
     if (!drainEtw()) result = 1;
     if (snapshotter && !snapshotter->Process(true, logSnapshot)) result = 1;
+#ifndef _WIN32
+    if (!drainPackets(true)) result = 1;
+#endif
     if (etw != nullptr) {
         if (!writeCoverage(L"etw_accounting",
                            L"unattributed=" + std::to_wstring(etw->UnattributedCount()) +
@@ -2017,7 +2101,7 @@ int wmain(int argc, wchar_t** argv)
     if (!outcomeOverride.empty()) outcome = outcomeOverride;
     if (!sessionDir.empty()) {
         WriteTextFile(sessionDir / L"session_meta.json",
-                      BuildSessionMeta(labels, binaries, clientRoot, scopeRoot, capturePayloads,
+                      BuildSessionMeta(labels, binaries, clientRoot, scopeRoot, capturePayloads, payloadSecrets,
                                        enableEtw, queueRecords, queueBytes, outcome, UtcStamp(Now()),
                                        totalEvents, statistics.DroppedEvents, driverGaps, etwGaps,
                                        writer.RecordCount(), writer.TotalBytes(), writer.PartCount()));

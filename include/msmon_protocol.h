@@ -94,7 +94,8 @@ typedef enum _MSMON_EVENT_FLAGS {
 typedef enum _MSMON_PAYLOAD_KIND {
     MsMonPayloadNone = 0,
     MsMonPayloadRegistryValue = 1,
-    MsMonPayloadVolumeInformation = 2
+    MsMonPayloadVolumeInformation = 2,
+    MsMonPayloadNetworkData = 3      /* bytes one send/receive call moved on a network socket (Linux) */
 } MSMON_PAYLOAD_KIND;
 
 typedef enum _MSMON_CATEGORY {

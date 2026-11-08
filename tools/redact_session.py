@@ -68,8 +68,8 @@ def redact_value(value, keep_paths):
 def redact_detail(detail):
     parts = []
     for field in detail.split(";"):
-        if field.startswith("query="):
-            parts.append("query=<redacted>")
+        if field.startswith(("query=", "answers=")):
+            parts.append(field.split("=", 1)[0] + "=<redacted>")
         else:
             parts.append(field)
     return ";".join(parts)
@@ -89,6 +89,11 @@ def redact_record(record, keep_paths, keep_commands):
         record["detail"] = redact_detail(record.get("detail", ""))
     elif record.get("type") == "etw_dns":
         record["text"] = "<redacted-dns>"
+        record["detail"] = redact_detail(record.get("detail", ""))
+    detail = record.get("detail", "")
+    if "ws=get_window_text" in detail and ";text=" in detail:
+        # Another window's title (wineserver.cpp) is the last field and may itself hold ';'.
+        record["detail"] = detail.split(";text=", 1)[0] + ";text=<redacted>"
     if not keep_paths:
         record["process_path"] = ""
         # text/detail carry the same NT/registry paths (and endpoints) the
@@ -171,6 +176,7 @@ def main():
     meta = json.loads(meta_path.read_text(encoding="utf-8"))
     meta["redacted"] = True
     meta["redaction_mode"] = "metadata"
+    meta["sensitivity"] = "metadata"   # the payloads, DNS names and window titles are gone
     meta["events"] = count
     meta["record_count"] = count
     meta_path.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")

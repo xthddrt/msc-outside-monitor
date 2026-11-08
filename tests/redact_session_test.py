@@ -110,6 +110,12 @@ def main():
             {"type": "file_read", "timestamp": "t4", "process_id": 7,
              "text": "C:\\client.exe",
              "detail": "\\Device\\HarddiskVolume3\\Users\\alice\\Documents\\notes.txt"},
+            {"type": "etw_dns", "timestamp": "t5", "process_id": 7, "text": "login.example",
+             "detail": "query_type=1;dns_id=7;rcode=0;answers=CNAME edge.secret-cdn.example|A 5.6.7.8;"
+                       "transport=udp;server=127.0.0.53:53"},
+            {"type": "file_query_information", "timestamp": "t6", "process_id": 7,
+             "text": "system:get_window_text",
+             "detail": "ws=get_window_text;handle=0x10020;text=Chat - MyCharacter;whisper"},
         ]
         with open(source / "events.jsonl", "w", encoding="utf-8") as stream:
             for record in identifying:
@@ -138,6 +144,12 @@ def main():
               kept_records[2]["text"] == identifying[2]["text"] and
               kept_records[3]["detail"] == identifying[3]["detail"],
               "--keep-paths leaves paths and endpoints intact")
+        check(kept_records[4]["text"] == "<redacted-dns>" and "secret-cdn" not in kept_text and
+              "answers=<redacted>" in kept_records[4]["detail"],
+              "DNS names and answers are redacted even with --keep-paths")
+        check(kept_records[5]["detail"] == "ws=get_window_text;handle=0x10020;text=<redacted>" and
+              "MyCharacter" not in kept_text and "whisper" not in kept_text,
+              "window titles are redacted even with --keep-paths")
     with tempfile.TemporaryDirectory() as temporary:
         root = pathlib.Path(temporary)
         source = root / "session"

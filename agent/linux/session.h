@@ -23,6 +23,10 @@ struct LinuxRecord {
     std::wstring text;
     std::wstring detail;
     std::vector<uint64_t> stack;
+    ULONG desiredAccess = 0;                  /* header DesiredAccess */
+    uint64_t targetStart = 0;                 /* header TargetProcessStartTime */
+    uint64_t operation = 0;                   /* operation_id of a record without a payload */
+    const MSMON_PAYLOAD* payload = nullptr;   /* one chunk; WritePayloadSeries fills it */
 };
 
 /* Set before LinuxSession::Start; false keeps the eBPF sensors off (--no-ebpf). */
@@ -56,7 +60,16 @@ public:
     bool UnderRoot(const std::wstring& path) const;
     void Log(unsigned sensor, ULONG type, DWORD pid, uint64_t start, ULONG flags, uint64_t value0, uint64_t value1,
              const std::wstring& text, const std::wstring& detail = {}, DWORD parent = 0);
-    void Write(const LinuxRecord& record);
+    /* false when the record was not queued (stopped, or the queue is full). MsMonFlagServiceCorrelated
+     * in its flags makes its attribution service_correlated. */
+    bool Write(const LinuxRecord& record);
+    /* MsMonLogPayloadSeries: Record once per MSMON_PAYLOAD_CHUNK_BYTES of Data, all chunks under
+     * Record.operation (0: a new one); Total above Data's size leaves the series partial, and then Data
+     * must be whole chunks (tools/verify_log.py refuses a short chunk that is not the last). Stops at the
+     * first chunk the queue refuses, so an operation never has a hole. */
+    bool WritePayloadSeries(LinuxRecord record, ULONG kind, uint64_t total, const std::vector<BYTE>& data);
+    /* A new operation_id (one counter for every sensor, as the driver's MsMonNextOperationId). */
+    uint64_t NextOperation() { return ++operations_; }
     void Enter(unsigned sensor);
     void SkipUntracked();
     /* A source lost events it cannot name: burn a sequence number so the agent logs a gap. */
@@ -76,6 +89,7 @@ private:
     uint64_t sequence_ = 0;
     uint64_t dropped_ = 0;
     uint64_t sessionId_ = 0;
+    std::atomic<uint64_t> operations_{0};
     MSMON_COVERAGE coverage_{};
     struct TrackedProcess {
         uint64_t start = 0;
@@ -147,11 +161,21 @@ void NetReset();
 /* eBPF sensors (bpf.cpp).  BpfOpen returns 0 or an errno and sets bit (slot - 48) of
  * Registered for each MSMON_SENSOR_LINUX_EBPF_* sensor that attached; Root is the scope
  * root an untracked process's executable mapping is matched against. */
-int BpfOpen(std::wstring& detail, const std::wstring& root, unsigned& registered);
+int BpfOpen(std::wstring& detail, const std::wstring& root, bool payloads, unsigned& registered);
 void BpfRun(LinuxSession& session);
 void BpfClose();
 void BpfTrack(DWORD pid, uint64_t start, ULONG flags);
 void BpfForget(DWORD pid);
 void BpfClear();
+/* Coverage notes of the kernel-sensor upgrades (after ebpf_active), and the records they still hold,
+ * written before tracking stops. */
+std::vector<std::pair<std::wstring, std::wstring>> BpfNotes();
+void BpfFlush();
+/* Packet capture to pcapng (packets.cpp). Configure before LinuxSession::Start: Path empty = off;
+ * parts rotate at MaxPartBytes (0 = never). Note: the start coverage note, {} when off. TakeNotes:
+ * coverage records to chain now (Final: the session ends; closes the last part). */
+void PacketsConfigure(const std::wstring& path, uint64_t maxPartBytes);
+std::pair<std::wstring, std::wstring> PacketsNote();
+std::vector<std::pair<std::wstring, std::wstring>> PacketsTakeNotes(bool final);
 /* "/proc/<pid>/cmdline" with NUL separators as spaces, as the Windows command line. */
 std::wstring ProcessCommandLine(DWORD pid);

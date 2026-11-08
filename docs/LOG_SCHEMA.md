@@ -29,7 +29,7 @@ Every line is one JSON object. Telemetry records carry the common fields below; 
 | `value0`, `value1` | Type-specific integers (below). |
 | `operation_id` | Links payload chunks. |
 | `text`, `detail`, `component` | Type-specific strings, detail fields, resolved component. |
-| `modules` | Resolved image paths (up to 8). |
+| `modules` | Resolved image paths in stack order, innermost first, deduplicated (up to 8). Linux: a Wine thread's syscall records list the PE (Windows-side) frames before the unix frames (`pe_frames=N` in `detail`, see docs/LINUX.md "PE frames"). |
 | `payload` | Optional Base64 chunk (below). |
 | `payload_unavailable` | Payload could not be captured safely. |
 | `record_index` | Writer order across rotated parts. |
@@ -47,7 +47,7 @@ The session UUID is **not** repeated on every line. It lives in `manifest.json` 
 | 2 | `process_exit` | — | — | start time |
 | 3 | `thread_start` | — | — | — |
 | 4 | `thread_exit` | — | — | — |
-| 5 | `image_load` | image path | — | base address / size |
+| 5 | `image_load` | image path | — | base address / size (Linux: one record per PE load, base = its header mapping, size = `SizeOfImage`) |
 | 6 | `process_handle` | target image | — | operation / granted access |
 | 7 | `thread_handle` | target image | — | operation / granted access |
 
@@ -91,7 +91,7 @@ Volume information may carry a `volume_information` payload. File contents and p
 | 25 | `registry_query` | value index/class | value type |
 | 26 | `registry_enumerate` | index/class | value type |
 
-Set/query values may carry a `registry_value` payload. Enumerated names come from the post-operation result where the layout is known.
+Set/query values may carry a `registry_value` payload. Enumerated names come from the post-operation result where the layout is known. On Linux registry_* come from wineserver requests (docs/LINUX.md "Wineserver requests").
 
 ### Network
 
@@ -102,17 +102,20 @@ Set/query values may carry a `registry_value` payload. Enumerated names come fro
 | 32 | `network_flow_established` | endpoints | protocol/local/remote | flow ID / packed ports |
 | 33 | `network_flow_close` | endpoints | protocol/local/remote | flow ID / packed ports |
 
-No packet bytes or TLS plaintext.
+No TLS plaintext. On Linux (docs/LINUX.md "Kernel sensor upgrades"): socket bytes are `network_data`
+payloads on the I/O records, DNS names are `etw_dns`, TCP lifecycle is `etw_tcp`, the client's packets
+go to `events.pcapng`, and a connection wineserver made for a Wine process is attributed to that process
+by `network_flow_established`/`network_flow_close` records flagged `service_correlated`.
 
 ### ETW
 
 | ID | Type | `text` | `detail` | `value0` / `value1` |
 |---|---|---|---|---|
 | 100 | `etw_wmi` | namespace/provider | operation/query/language | provider event ID / operation ID |
-| 101 | `etw_dns` | query name | query type/options | provider event ID |
+| 101 | `etw_dns` | query name | query type/options; Linux: `query_type`, `dns_id`, `rcode`, `answers`, `transport`, `server` | provider event ID; Linux: 3006 query sent, 3008 response received (`operation_id` = the payload parsed) |
 | 102 | `etw_rpc` | endpoint/protocol | service/interface, operation/method, raw interface UUID and opnum | provider event ID |
 | 103 | `etw_unattributed` | provider name | reason/event ID/PID | original type / original event ID |
-| 104 | `etw_tcp` | endpoints | connection event and reason | provider event ID / TCB pointer |
+| 104 | `etw_tcp` | endpoints | connection event and reason | provider event ID / TCB pointer (Linux: socket cookie; event ID 0 for `state_change` and `retransmit`, see `docs/LINUX.md`) |
 | 105 | `etw_code_integrity` | blocked or audited image path | `would_block` or `blocked`, event/policy metadata | CodeIntegrity event ID (3076/3077) |
 
 WMI query text is preserved in full-payload mode; `--no-payloads` sanitizes it. Result rows are unavailable. CodeIntegrity events are system-wide and do not establish client causality. `--no-etw` disables them with the other ETW sensors.
@@ -140,7 +143,7 @@ KFilter status coverage records include mode, generation, session tag, counters,
 | 0x00000002 | `inherited_track` | Child of a tracked process. |
 | 0x00000004 | `truncated_path` | Path was truncated. |
 | 0x00000008 | `missing_path` | Name unavailable at this IRQL/context. |
-| 0x00000010 | `service_correlated` | ETW client PID differs from the native service. |
+| 0x00000010 | `service_correlated` | ETW client PID differs from the native service; on Linux, a `network_flow_established`/`network_flow_close` for the process using a socket another tracked process (wineserver) made (docs/LINUX.md "Socket join"). |
 | 0x00000020 | `observer_record` | Agent/ETW record. |
 | 0x00000040 | `payload_present` | Payload chunk follows. |
 | 0x00000080 | `payload_unavailable` | Payload could not be captured. |
@@ -150,7 +153,9 @@ KFilter status coverage records include mode, generation, session tag, counters,
 
 ## 4. Payloads
 
-Payloads are Base64, chunked at 8 KiB. Fields: `kind`, `encoding`, `data`, `operation_id`, `total_bytes`, `byte_offset`, `chunk_index`, `chunk_count`, `final_chunk`. Kinds: `registry_value`, `volume_information`. Values above the 8-MiB protocol limit are marked unavailable; values above 64 KiB are partial.
+Payloads are Base64, chunked at 8 KiB. Fields: `kind`, `encoding`, `data`, `operation_id`, `total_bytes`, `byte_offset`, `chunk_index`, `chunk_count`, `final_chunk`. Kinds: `registry_value`, `volume_information`, `network_data`. Values above the 8-MiB protocol limit are marked unavailable; values above 64 KiB are partial.
+
+`network_data` (Linux) is what one send/receive call moved on a network socket: `total_bytes` is the call's result (one message of `sendmmsg`/`recvmmsg`, `msg=N` in the detail), each chunk record repeats the call's I/O record, and `payload_input` marks sent bytes. At most 1 MiB is captured per call; a partial series holds whole 8 KiB chunks only and its detail has `payload_missing=<bytes>;payload_stop=limit|ring_full|fault|steps|truncated|chunks_lost`. A call with no captured chunk is one record with `payload_unavailable` and its reason first in the detail; `sendmmsg`/`recvmmsg` messages after the capture stopped get one such record with `msg_missing=<first>-<last>`.
 
 Reconstruct by grouping `operation_id`, sorting `byte_offset`, and concatenating `data` until `total_bytes` is reached. A complete operation has contiguous chunks from 0 to `chunk_count - 1`.
 

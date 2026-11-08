@@ -83,6 +83,7 @@ Options:
 - `--stop-file FILE` stops tracking, drains queued events, and writes the final summary when the file appears;
 - `--no-etw` disables the private ETW session, including CodeIntegrity decisions, and records a coverage warning;
 - `--no-payloads` disables exact registry/volume payloads and restores sanitized WMI queries;
+- `--no-packets` (Linux) writes no pcapng packet capture (`events.pcapng`); `--no-payloads` turns it off too;
 - `--once` reads one driver batch and exits.
 
 KFilter collection is automatic and optional. Its absence, an ABI mismatch, or a read failure records coverage without stopping other sensors. Do not use `kfilterctl watch` or `clear` during collection because they compete for the same destructive ring. A KFilter pre-operation denial need not have a paired native monitor record. CodeIntegrity records are system-wide and do not prove client causality; enforced BlackCat policy should prevent `blackcat_loaded` and BlackCat stack attribution.
@@ -138,6 +139,7 @@ sudo build/linux/msmon-agent --client /opt/client --log-dir /var/tmp/msmon-sessi
 ```
 
 The Linux agent has no driver: fanotify, the process-events connector and `/proc` polling produce the same records and bundle format, so the Python tools work unchanged. Without root it still writes a verified log but records fanotify and the connector as unavailable. Registry, ETW and BlackCat sensors do not exist there. `driver/`, `compat/`, `tools/windows-test/` and the PowerShell tests are Windows-only. See `docs/LINUX.md` for sensors and coverage limits.
+On Linux the eBPF sensors also log every byte the client sends and receives on its network sockets (`network_data` payloads) and the DNS names in them (`etw_dns`); such logs hold secrets (`sensitivity=secrets`), and `--no-payloads` turns this off.
 
 ## Safety and privacy
 

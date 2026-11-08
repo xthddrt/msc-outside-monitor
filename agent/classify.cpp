@@ -75,7 +75,8 @@ void OutsideClassifier::Classify(TelemetryEvent& event) const
             L"harddisk", L"physicaldrive", L"scsi", L"nvme", L"volume{", L"mounteddevice"
         }) ? MsMonCategoryHardwareIdentity : event.header.Category;
     } else if (type >= MsMonFileCreate && type <= MsMonFileSetEa &&
-               (ContainsAny(text, {L"\\dmi\\id\\", L"\\proc\\cpuinfo", L"machine-id"}) ||
+               (ContainsAny(text, {L"\\dmi\\id\\", L"\\proc\\cpuinfo", L"machine-id", L"system:uname",
+                              L"system:sysinfo"}) ||
                 (StartsWith(text, L"\\sys") && text.size() > 7 &&
                  text.compare(text.size() - 7, 7, L"\\serial") == 0))) {
         /* Linux identity files.  Event paths are canonical, so /sys/class/dmi/id/... arrives as

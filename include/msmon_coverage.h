@@ -78,8 +78,12 @@ typedef enum _MSMON_SENSOR_ID {
     MSMON_SENSOR_REG_LINUX_EBPF_IPC = 57,
     MSMON_SENSOR_REG_LINUX_EBPF_DEVICE = 58,
     MSMON_SENSOR_REG_LINUX_EBPF_MEMORY = 59,
+    /* Linux wineserver-request decoder (agent/linux/bpf/ws.bpf.h, agent/linux/wineserver.cpp), then its set-up.
+     * 62 and 63 are free. */
+    MSMON_SENSOR_LINUX_EBPF_WINESERVER = 60,
+    MSMON_SENSOR_REG_LINUX_EBPF_WINESERVER = 61,
 
-    MSMON_SENSOR_MAX = 60
+    MSMON_SENSOR_MAX = 62
 } MSMON_SENSOR_ID;
 
 typedef enum _MSMON_SKIP_REASON {

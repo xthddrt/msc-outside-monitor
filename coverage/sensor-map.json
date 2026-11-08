@@ -823,11 +823,16 @@
       "sensor_id": "linux.ebpf_net",
       "kind": "callback",
       "slot": 50,
-      "implementation": "agent/linux/bpf/monitor.bpf.c::mm_sys_enter,mm_sys_exit",
+      "implementation": "agent/linux/bpf/monitor.bpf.c::mm_sys_enter,mm_sys_exit,mm_sock_*,mm_tcp_*,mm_skb_*",
       "event_types": [
         "network_connect",
         "network_accept",
-        "network_flow_close"
+        "network_flow_established",
+        "network_flow_close",
+        "file_read",
+        "file_write",
+        "etw_dns",
+        "etw_tcp"
       ],
       "expected_in": [
         "network",
@@ -875,6 +880,36 @@
         "process_handle"
       ],
       "expected_in": [
+        "gameplay"
+      ],
+      "status": "active"
+    },
+    {
+      "sensor_id": "linux.ebpf_wineserver",
+      "kind": "callback",
+      "slot": 60,
+      "implementation": "agent/linux/bpf/ws.bpf.h::mm_ws_enter,mm_ws_exit",
+      "event_types": [
+        "registry_open",
+        "registry_create",
+        "registry_set_value",
+        "registry_delete",
+        "registry_rename",
+        "registry_query",
+        "registry_enumerate",
+        "process_handle",
+        "thread_handle",
+        "file_create",
+        "file_section",
+        "file_query_volume_information",
+        "file_query_information",
+        "network_connect",
+        "network_accept",
+        "coverage"
+      ],
+      "expected_in": [
+        "registry",
+        "startup",
         "gameplay"
       ],
       "status": "active"
@@ -1133,6 +1168,16 @@
       "sensor_id": "registration.linux.ebpf_memory",
       "kind": "registration",
       "slot": 59,
+      "implementation": "agent/linux/session.cpp::LinuxSession::Start",
+      "expected_in": [
+        "startup"
+      ],
+      "status": "active"
+    },
+    {
+      "sensor_id": "registration.linux.ebpf_wineserver",
+      "kind": "registration",
+      "slot": 61,
       "implementation": "agent/linux/session.cpp::LinuxSession::Start",
       "expected_in": [
         "startup"

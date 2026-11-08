@@ -364,27 +364,27 @@ bool LinuxInScope(DWORD pid, const std::vector<std::wstring>& roots, const std::
         }
     }
     if (prefix.empty()) return false;
+    /* Only the prefix's wineserver joins by prefix: it does work for the client (process memory
+     * reads, file and registry requests). The launcher and other programs in the prefix are not
+     * the client; they join only by mapping an executable under a root, as the client does. */
+    std::wstring image;
+    uint64_t startTime = 0;
+    if (!LinuxProcessIdentity(pid, image, startTime)) return false;
+    if (image.substr(image.find_last_of(L'/') + 1).rfind(L"wineserver", 0) != 0) return false;
     /* environ is NUL-separated and readable by the owner or root. */
     std::ifstream file(base + "/environ", std::ios::binary);
     std::string environment((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
     std::string winePrefix, home;
-    bool wine = false;
     for (size_t start = 0; start < environment.size();) {
         size_t end = environment.find('\0', start);
         if (end == std::string::npos) end = environment.size();
         const std::string entry = environment.substr(start, end - start);
         if (entry.compare(0, 11, "WINEPREFIX=") == 0) winePrefix = entry.substr(11);
         if (entry.compare(0, 5, "HOME=") == 0) home = entry.substr(5);
-        if (entry.compare(0, 11, "WINELOADER=") == 0) wine = true;
         start = end + 1;
     }
     if (winePrefix.empty()) {
-        /* Without WINEPREFIX only a Wine process can be in the default prefix. */
-        std::wstring image;
-        uint64_t startTime = 0;
-        if (home.empty() || !LinuxProcessIdentity(pid, image, startTime)) return false;
-        const std::wstring name = image.substr(image.find_last_of(L'/') + 1);
-        if (!wine && name.rfind(L"wine", 0) != 0) return false;
+        if (home.empty()) return false;
         winePrefix = home + "/.wine";
     }
     return WithoutTrailingSlash(winePrefix) == WithoutTrailingSlash(LinuxNarrow(prefix));
